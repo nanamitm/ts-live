@@ -75,8 +75,8 @@ list(JOIN FFMPEG_CONFIGURE_COMMAND_LIST " " FFMPEG_CONFIGURE_COMMAND)
 include(ExternalProject)
 ExternalProject_Add(
   ffmpeg
-  GIT_REPOSITORY https://github.com/superfashi/FFmpeg.git
-  GIT_TAG tlvmmt
+  GIT_REPOSITORY https://github.com/nanamitm/FFmpeg.git
+  GIT_TAG feature/fix-mmttlv-resync
   BUILD_IN_SOURCE TRUE
   INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/install
   CONFIGURE_COMMAND bash -c "[ -e ${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-done ] || ${FFMPEG_CONFIGURE_COMMAND}"
