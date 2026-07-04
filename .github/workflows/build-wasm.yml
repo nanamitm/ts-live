@@ -33,3 +33,9 @@ jobs:
         run: yarn cmake:config
       - name: build
         run: yarn cmake:build
+
+      - name: upload wasm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-wasm
+          path: public/wasm
