@@ -47,7 +47,7 @@ set(FFMPEG_CONFIGURE_COMMAND_LIST
     --disable-programs
     --disable-doc
     --disable-avdevice
-    --disable-network
+    --enable-network
     --disable-encoders
     --disable-decoders
     --enable-decoder=aac,ac3
