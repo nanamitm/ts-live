@@ -22,6 +22,7 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
 }
 
 // tsreadex
@@ -48,6 +49,12 @@ size_t inputBufferWriteIndex = 0;
 // for libav
 AVCodecContext *videoCodecContext = nullptr;
 AVCodecContext *audioCodecContext = nullptr;
+
+// WebGPU側は 8bit yuv420p 前提のため、HEVC Main10 (yuv420p10le) 等の
+// 高ビット深度フォーマットはここで 8bit に変換してから描画キューへ渡す。
+SwsContext *videoSwsContext = nullptr;
+AVPixelFormat videoSwsSrcFormat = AV_PIX_FMT_NONE;
+int videoSwsWidth = 0, videoSwsHeight = 0;
 
 std::deque<AVFrame *> videoFrameQueue, audioFrameQueue;
 std::deque<std::pair<int64_t, std::vector<uint8_t>>> captionDataQueue;
@@ -236,6 +243,14 @@ void resetInternal() {
   audioStreamList.clear();
   captionStream = nullptr;
   videoFrameFound = false;
+
+  if (videoSwsContext != nullptr) {
+    sws_freeContext(videoSwsContext);
+    videoSwsContext = nullptr;
+  }
+  videoSwsSrcFormat = AV_PIX_FMT_NONE;
+  videoSwsWidth = 0;
+  videoSwsHeight = 0;
 }
 
 void reset() {
@@ -331,7 +346,45 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
       frame->time_base.den = videoStream->time_base.den;
       frame->time_base.num = videoStream->time_base.num;
 
-      AVFrame *cloneFrame = av_frame_clone(frame);
+      AVFrame *frameToQueue = frame;
+      AVFrame *convertedFrame = nullptr;
+      if ((AVPixelFormat)frame->format != AV_PIX_FMT_YUV420P) {
+        // WebGPU側のテクスチャ (R8Unorm x3plane) は 8bit yuv420p 前提のため、
+        // HEVC Main10 (yuv420p10le) などの高ビット深度出力はここで変換する。
+        if (videoSwsContext == nullptr ||
+            videoSwsSrcFormat != (AVPixelFormat)frame->format ||
+            videoSwsWidth != frame->width || videoSwsHeight != frame->height) {
+          if (videoSwsContext != nullptr) {
+            sws_freeContext(videoSwsContext);
+          }
+          videoSwsContext = sws_getContext(
+              frame->width, frame->height, (AVPixelFormat)frame->format,
+              frame->width, frame->height, AV_PIX_FMT_YUV420P, SWS_BILINEAR,
+              nullptr, nullptr, nullptr);
+          videoSwsSrcFormat = (AVPixelFormat)frame->format;
+          videoSwsWidth = frame->width;
+          videoSwsHeight = frame->height;
+        }
+        if (videoSwsContext == nullptr) {
+          spdlog::error("sws_getContext failed for pixfmt:{}", frame->format);
+        } else {
+          convertedFrame = av_frame_alloc();
+          convertedFrame->format = AV_PIX_FMT_YUV420P;
+          convertedFrame->width = frame->width;
+          convertedFrame->height = frame->height;
+          av_frame_get_buffer(convertedFrame, 0);
+          av_frame_copy_props(convertedFrame, frame);
+          sws_scale(videoSwsContext, frame->data, frame->linesize, 0,
+                    frame->height, convertedFrame->data,
+                    convertedFrame->linesize);
+          frameToQueue = convertedFrame;
+        }
+      }
+
+      AVFrame *cloneFrame = av_frame_clone(frameToQueue);
+      if (convertedFrame != nullptr) {
+        av_frame_free(&convertedFrame);
+      }
       {
         std::lock_guard<std::mutex> lock(videoFrameMtx);
         videoFrameFound = true;

@@ -52,6 +52,8 @@ set(FFMPEG_CONFIGURE_COMMAND_LIST
     --disable-decoders
     --enable-decoder=aac,ac3
     --enable-decoder=mpeg2video
+    --enable-decoder=hevc
+    --enable-swscale
     --disable-hwaccels
     --disable-muxers
     --disable-demuxers
@@ -59,6 +61,7 @@ set(FFMPEG_CONFIGURE_COMMAND_LIST
     --disable-parsers
     --enable-parser=aac
     --enable-parser=mpegvideo
+    --enable-parser=hevc
     --disable-bsfs
     --disable-protocols
     --disable-devices
@@ -86,6 +89,7 @@ set(FFMPEG_LIBRARIES
   ${CMAKE_BINARY_DIR}/install/lib/libavutil.a
   ${CMAKE_BINARY_DIR}/install/lib/libavfilter.a
   ${CMAKE_BINARY_DIR}/install/lib/libswresample.a
+  ${CMAKE_BINARY_DIR}/install/lib/libswscale.a
 )
 
 file(GLOB_RECURSE SOURCES src/*.cpp)
