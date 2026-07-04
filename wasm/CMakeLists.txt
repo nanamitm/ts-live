@@ -51,6 +51,7 @@ set(FFMPEG_CONFIGURE_COMMAND_LIST
     --disable-encoders
     --disable-decoders
     --enable-decoder=aac,ac3
+    --enable-decoder=aac_latm
     --enable-decoder=mpeg2video
     --enable-decoder=hevc
     --enable-swscale
@@ -58,8 +59,10 @@ set(FFMPEG_CONFIGURE_COMMAND_LIST
     --disable-muxers
     --disable-demuxers
     --enable-demuxer=mpegts
+    --enable-demuxer=mmttlv
     --disable-parsers
     --enable-parser=aac
+    --enable-parser=aac_latm
     --enable-parser=mpegvideo
     --enable-parser=hevc
     --disable-bsfs
@@ -72,8 +75,8 @@ list(JOIN FFMPEG_CONFIGURE_COMMAND_LIST " " FFMPEG_CONFIGURE_COMMAND)
 include(ExternalProject)
 ExternalProject_Add(
   ffmpeg
-  GIT_REPOSITORY https://git.ffmpeg.org/ffmpeg.git
-  GIT_TAG n7.1
+  GIT_REPOSITORY https://github.com/superfashi/FFmpeg.git
+  GIT_TAG tlvmmt
   BUILD_IN_SOURCE TRUE
   INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/install
   CONFIGURE_COMMAND bash -c "[ -e ${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-done ] || ${FFMPEG_CONFIGURE_COMMAND}"
