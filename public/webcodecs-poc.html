@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<title>WebCodecs HEVC PoC (BS4K)</title>
+<style>
+  body { font-family: monospace; background:#111; color:#ddd; margin:16px; }
+  #log { white-space: pre-wrap; font-size: 13px; line-height: 1.5; }
+  .ok { color:#7CFC00; } .ng { color:#ff6b6b; } .info{ color:#7ec8ff; }
+  canvas { border:1px solid #444; margin-top:12px; max-width:100%; height:auto; }
+</style>
+</head>
+<body>
+<h2>WebCodecs HEVC PoC — BS4K (HEVC Main10 3840x2160 L5.1)</h2>
+<div id="log"></div>
+<canvas id="cv" width="960" height="540"></canvas>
+<script type="module">
+const logEl = document.getElementById('log');
+function log(msg, cls) {
+  const span = document.createElement('span');
+  if (cls) span.className = cls;
+  span.textContent = msg + '\n';
+  logEl.appendChild(span);
+  console.log(msg);
+}
+
+// --- 1. VideoDecoder / HEVC 対応チェック ------------------------------------
+if (typeof VideoDecoder === 'undefined') {
+  log('VideoDecoder is NOT available in this browser.', 'ng');
+  throw new Error('no VideoDecoder');
+}
+log('VideoDecoder is available.', 'ok');
+
+// HEVC Main10 L5.1 の候補コーデック文字列をいくつか試す。
+const candidates = [
+  'hev1.2.4.L153.90',
+  'hev1.2.4.L153.B0',
+  'hvc1.2.4.L153.90',
+  'hvc1.2.4.L153.B0',
+  'hev1.1.6.L153.90', // Main (念のため)
+];
+let chosen = null;
+for (const codec of candidates) {
+  try {
+    const res = await VideoDecoder.isConfigSupported({ codec, codedWidth: 3840, codedHeight: 2160 });
+    log(`isConfigSupported(${codec}) => supported=${res.supported}`, res.supported ? 'ok' : 'ng');
+    if (res.supported && !chosen) chosen = codec;
+  } catch (e) {
+    log(`isConfigSupported(${codec}) threw: ${e.message}`, 'ng');
+  }
+}
+if (!chosen) {
+  log('No HEVC config supported. Hardware HEVC decode is likely unavailable here.', 'ng');
+  log('(Chrome では chrome://gpu で "Video Decode" と HEVC 対応を確認できます)', 'info');
+  throw new Error('no supported HEVC config');
+}
+log(`Using codec: ${chosen}`, 'ok');
+
+// --- 2. 実データ (bs4k-sample.hevc, Annex-B) を取得して AU に分割 -----------
+log('fetching /bs4k-sample.hevc ...', 'info');
+const buf = new Uint8Array(await (await fetch('/bs4k-sample.hevc')).arrayBuffer());
+log(`fetched ${buf.length} bytes`, 'ok');
+
+// Annex-B の開始コード位置を列挙
+function findStartCodes(data) {
+  const positions = [];
+  for (let i = 0; i + 3 < data.length; i++) {
+    if (data[i] === 0 && data[i+1] === 0 && data[i+2] === 1) {
+      positions.push({ pos: i, scLen: (i > 0 && data[i-1] === 0) ? 4 : 3 });
+    }
+  }
+  return positions;
+}
+const scs = findStartCodes(buf);
+log(`found ${scs.length} NAL start codes`, 'info');
+
+// NAL を列挙し、AUD (nal_type=35) を境界にアクセスユニットへまとめる
+const NALS = [];
+for (let i = 0; i < scs.length; i++) {
+  const start = scs[i].pos;
+  const end = (i + 1 < scs.length) ? scs[i+1].pos : buf.length;
+  const nalStart = start + scs[i].scLen;
+  const nalType = (buf[nalStart] >> 1) & 0x3f;
+  NALS.push({ start, end, nalType });
+}
+const aus = [];
+let cur = null;
+for (const nal of NALS) {
+  if (nal.nalType === 35 /* AUD */ || cur === null) {
+    if (cur) aus.push(cur);
+    cur = { begin: nal.start, end: nal.end };
+  } else {
+    cur.end = nal.end;
+  }
+}
+if (cur) aus.push(cur);
+log(`grouped into ${aus.length} access units`, 'ok');
+
+// --- 3. VideoDecoder でデコード --------------------------------------------
+const cv = document.getElementById('cv');
+const cctx = cv.getContext('2d');
+let decodedCount = 0;
+let firstDrawn = false;
+
+const decoder = new VideoDecoder({
+  output: (frame) => {
+    decodedCount++;
+    if (!firstDrawn) {
+      firstDrawn = true;
+      cctx.drawImage(frame, 0, 0, cv.width, cv.height);
+      log(`first VideoFrame: ${frame.codedWidth}x${frame.codedHeight} format=${frame.format} ts=${frame.timestamp}`, 'ok');
+    }
+    if (decodedCount % 20 === 0) log(`decoded ${decodedCount} frames...`, 'info');
+    frame.close();
+  },
+  error: (e) => log(`decoder error: ${e.message}`, 'ng'),
+});
+
+decoder.configure({ codec: chosen, codedWidth: 3840, codedHeight: 2160, optimizeForLatency: true });
+log('decoder configured. feeding chunks...', 'info');
+
+let ts = 0;
+const frameDurUs = Math.round(1000000 / 30); // 概算 (PoC 用)
+for (let i = 0; i < aus.length; i++) {
+  const au = aus[i];
+  const data = buf.subarray(au.begin, au.end);
+  const chunk = new EncodedVideoChunk({
+    type: i === 0 ? 'key' : 'delta',
+    timestamp: ts,
+    data,
+  });
+  ts += frameDurUs;
+  try {
+    decoder.decode(chunk);
+  } catch (e) {
+    log(`decode() threw at AU ${i}: ${e.message}`, 'ng');
+    break;
+  }
+}
+await decoder.flush().catch(e => log('flush error: ' + e.message, 'ng'));
+log(`DONE. total decoded frames = ${decodedCount} / ${aus.length} AUs`, decodedCount > 0 ? 'ok' : 'ng');
+if (decodedCount > 0) {
+  log('>>> WebCodecs HEVC ハードウェアデコード成功。この方式で実装可能です。', 'ok');
+} else {
+  log('>>> フレームが得られませんでした。AU分割かコーデック設定の調整が必要です。', 'ng');
+}
+</script>
+</body>
+</html>

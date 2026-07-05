@@ -87,4 +87,8 @@ EMSCRIPTEN_BINDINGS(ts_live_module) {
   emscripten::function("setBufferedAudioSamples", &setBufferedAudioSamples);
   emscripten::function("setAudioGain", &setAudioGain);
   emscripten::function("setDualMonoMode", &setDualMonoMode);
+  emscripten::function("setTlvMode", &setTlvMode);
+  emscripten::function("setWebCodecsMode", &setWebCodecsMode);
+  emscripten::function("setVideoAuCallback", &setVideoAuCallback);
+  emscripten::function("getAudioPlaybackTime", &getAudioPlaybackTime);
 }

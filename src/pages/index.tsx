@@ -46,6 +46,7 @@ const Page: NextPage = () => {
   const { debug } = router.query
 
   const [debugLog, setDebugLog] = useState<boolean>(false)
+  const [webCodecsActive, setWebCodecsActive] = useState<boolean>(false)
 
   const [drawer, setDrawer] = useState<boolean>(true)
   const [touched, setTouched] = useState<boolean>(false)
@@ -89,6 +90,133 @@ const Page: NextPage = () => {
 
   const videoCanvasRef = useRef<HTMLCanvasElement>(null)
   const captionCanvasRef = useRef<HTMLCanvasElement>(null)
+  // WebCodecs (BS4K) 用の描画 canvas と再生制御
+  const wcCanvasRef = useRef<HTMLCanvasElement>(null)
+  const webCodecsCtrlRef = useRef<{ stop: () => void } | null>(null)
+
+  // BS4K 用: JS の VideoDecoder(ハードウェア HEVC)で映像をデコードし、WASM が
+  // 保持する音声クロックに同期して canvas へ描画する。
+  const startWebCodecs = (
+    Module: WasmModule,
+    canvas: HTMLCanvasElement | null
+  ) => {
+    if (!canvas) return
+    const ctx2d = canvas.getContext('2d')
+    if (!ctx2d) return
+
+    type WCFrame = { frame: VideoFrame; ts: number }
+    let frameQueue: WCFrame[] = []
+    let gotKey = false
+    let stopped = false
+    let rafId = 0
+
+    const decoder = new VideoDecoder({
+      output: (frame: VideoFrame) => {
+        if (stopped) {
+          frame.close()
+          return
+        }
+        frameQueue.push({ frame, ts: frame.timestamp / 1e6 })
+        // 万一溜まりすぎたら古い方を捨てる
+        while (frameQueue.length > 60) {
+          frameQueue.shift()!.frame.close()
+        }
+      },
+      error: (e: DOMException) => {
+        console.error('WebCodecs VideoDecoder error:', e.message)
+      },
+    })
+    decoder.configure({
+      codec: 'hev1.2.4.L153.90',
+      codedWidth: 3840,
+      codedHeight: 2160,
+      optimizeForLatency: true,
+    })
+
+    // WASM から呼ばれる: HEVC アクセスユニット 1 個を VideoDecoder へ投入。
+    Module.setVideoAuCallback((data: Uint8Array, ptsSec: number, isKey: boolean) => {
+      if (stopped) return
+      if (!gotKey) {
+        if (!isKey) return // 最初のキーフレームが来るまで delta は捨てる
+        gotKey = true
+      }
+      // data は WASM ヒープ上のビューなのでコピーしてから渡す
+      const buf = new Uint8Array(data)
+      try {
+        decoder.decode(
+          new EncodedVideoChunk({
+            type: isKey ? 'key' : 'delta',
+            timestamp: Math.max(0, Math.round(ptsSec * 1e6)),
+            data: buf,
+          })
+        )
+      } catch (e) {
+        console.error('decode() failed:', e)
+      }
+    })
+
+    // 描画ループ: 音声再生時刻(WASM の音声クロック)に合うフレームを表示する。
+    let wallStart = 0 // 音声クロックが未確立(起動直後)の間のフォールバック用
+    let tsStart = 0
+    const render = () => {
+      if (stopped) return
+      rafId = requestAnimationFrame(render)
+      let audioTime = Module.getAudioPlaybackTime()
+      if (audioTime < 0 && frameQueue.length > 0) {
+        // 音声クロックが立ち上がるまではウォールクロックで暫定ペーシング。
+        // 音声が流れ始めれば audioTime が正の値になり音声同期へ切り替わる。
+        const nowSec = performance.now() / 1000
+        if (wallStart === 0) {
+          wallStart = nowSec
+          tsStart = frameQueue[0].ts
+        }
+        audioTime = tsStart + (nowSec - wallStart)
+      }
+      if (audioTime < 0 || frameQueue.length === 0) return
+      // ts <= audioTime の中で最新のフレームを表示、古いものは破棄。
+      let showIdx = -1
+      for (let i = 0; i < frameQueue.length; i++) {
+        if (frameQueue[i].ts <= audioTime) showIdx = i
+        else break
+      }
+      if (showIdx < 0) return
+      const target = frameQueue[showIdx]
+      // showIdx より前(古い)のフレームは閉じて捨てる
+      for (let i = 0; i < showIdx; i++) frameQueue[i].frame.close()
+      ctx2d.drawImage(target.frame, 0, 0, canvas.width, canvas.height)
+      target.frame.close()
+      frameQueue = frameQueue.slice(showIdx + 1)
+    }
+    rafId = requestAnimationFrame(render)
+
+    // AudioContext がブラウザの自動再生ポリシーで suspended のままだと音が
+    // 出ない。feedAudioData 内の resume() は非同期でジェスチャから離れており
+    // 効かないため、ユーザーの操作(クリック/キー)で確実に resume する。
+    const resumeAudio = () => {
+      const ctx = (Module as any).myAudio?.ctx as AudioContext | undefined
+      if (ctx && ctx.state === 'suspended') {
+        ctx.resume().catch(() => {})
+      }
+    }
+    document.addEventListener('pointerdown', resumeAudio)
+    document.addEventListener('keydown', resumeAudio)
+    resumeAudio()
+
+    webCodecsCtrlRef.current = {
+      stop: () => {
+        stopped = true
+        cancelAnimationFrame(rafId)
+        document.removeEventListener('pointerdown', resumeAudio)
+        document.removeEventListener('keydown', resumeAudio)
+        Module.setVideoAuCallback(null as any)
+        try {
+          decoder.close()
+        } catch (e) {}
+        for (const f of frameQueue) f.frame.close()
+        frameQueue = []
+      },
+    }
+  }
 
   const [wakeLock, setWakeLock] = useState<WakeLockSentinel>()
   const [wasmMod, setWasmMod] = useState<WasmModule | null>(null)
@@ -318,12 +446,26 @@ const Page: NextPage = () => {
       // 再生スタート
       if (playMode === 'live') {
         const ac = new AbortController()
+        const isBS4K = (activeService.channel?.type as string) === 'BS4K'
+        // BS4K は WebCodecs (ハードウェア HEVC デコード) 経路を使う。
+        const useWebCodecs = isBS4K && typeof VideoDecoder !== 'undefined'
+        if (useWebCodecs) {
+          startWebCodecs(Module, wcCanvasRef.current)
+          setWebCodecsActive(true)
+        }
         setStopFunc(() => () => {
           console.log('abort fetch')
           ac.abort()
+          if (webCodecsCtrlRef.current) {
+            webCodecsCtrlRef.current.stop()
+            webCodecsCtrlRef.current = null
+          }
+          setWebCodecsActive(false)
           Module.reset()
           console.log('abort fetch done.')
         })
+        Module.setTlvMode(isBS4K)
+        Module.setWebCodecsMode(useWebCodecs)
         const url = `${mirakurunServer}/api/services/${activeService.id}/stream?decode=1`
         console.log('start fetch', url, Module)
         fetch(url, {
@@ -759,6 +901,27 @@ const Page: NextPage = () => {
           onClick={() => setDrawer(true)}
           onContextMenu={ev => ev.preventDefault()}
           // transformはWasmが書き換えるので要素のタグに直接書くこと
+          style={{
+            transform: 'translate(-50%, -50%)',
+          }}
+        ></canvas>
+        <canvas
+          css={css`
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            max-width: 100%;
+            max-height: 100%;
+            z-index: 2;
+          `}
+          id="videoWC"
+          ref={wcCanvasRef}
+          tabIndex={-1}
+          width={3840}
+          height={2160}
+          hidden={!webCodecsActive}
+          onClick={() => setDrawer(true)}
+          onContextMenu={ev => ev.preventDefault()}
           style={{
             transform: 'translate(-50%, -50%)',
           }}
