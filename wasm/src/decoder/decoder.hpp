@@ -14,3 +14,6 @@ void reset();
 void playFile(std::string url);
 void setDualMonoMode(int mode);
 void setTlvMode(bool isTlv);
+void setWebCodecsMode(bool enabled);
+void setVideoAuCallback(emscripten::val callback);
+double getAudioPlaybackTime();

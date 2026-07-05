@@ -24,5 +24,10 @@ export declare interface WasmModule extends EmscriptenModule {
   setAudioGain(volume: number): void
   setDualMonoMode(mode: number): void
   setTlvMode(isTlv: boolean): void
+  setWebCodecsMode(enabled: boolean): void
+  setVideoAuCallback(
+    callback: ((data: Uint8Array, ptsSec: number, isKey: boolean) => void) | null
+  ): void
+  getAudioPlaybackTime(): number
 }
 export declare var Module: WasmModule

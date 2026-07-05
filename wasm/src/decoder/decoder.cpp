@@ -103,6 +103,38 @@ int64_t initPts = -1;
 
 emscripten::val captionCallback = emscripten::val::null();
 
+// WebCodecs (JS 側ハードウェア HEVC デコード) モード。true のとき映像は
+// WASM でソフトデコードせず、HEVC アクセスユニットをそのまま JS の
+// VideoDecoder へ渡す。BS4K など HEVC チャンネルで使う。
+bool webCodecsMode = false;
+emscripten::val videoAuCallback = emscripten::val::null();
+
+// WebCodecs モード用の HEVC アクセスユニットキュー。デマルチプレクスは
+// 別スレッド(Worker)で動くため、VideoDecoder(メインスレッド API)を触る
+// コールバックはここに積んでおき、メインループ(メインスレッド)で呼び出す。
+struct VideoAu {
+  double ptsSec;
+  bool key;
+  std::vector<uint8_t> data;
+};
+std::deque<VideoAu> videoAuQueue;
+std::mutex videoAuMtx;
+
+// メインループが更新する「現在の推定音声再生時刻(秒)」。JS 側の映像表示を
+// これに同期させる (音声クロック)。
+double currentAudioPlaybackTime = -1.0;
+
+void setWebCodecsMode(bool enabled) {
+  webCodecsMode = enabled;
+  spdlog::info("setWebCodecsMode: {}", enabled);
+}
+
+void setVideoAuCallback(emscripten::val callback) {
+  videoAuCallback = callback;
+}
+
+double getAudioPlaybackTime() { return currentAudioPlaybackTime; }
+
 std::string playFileUrl;
 std::thread downloaderThread;
 
@@ -290,6 +322,11 @@ void resetInternal() {
       av_frame_free(&frame);
     }
   }
+  {
+    std::lock_guard<std::mutex> lock(videoAuMtx);
+    videoAuQueue.clear();
+  }
+  currentAudioPlaybackTime = -1.0;
   {
     std::lock_guard<std::mutex> lock(videoFrameMtx);
     while (!videoFrameQueue.empty()) {
@@ -617,7 +654,11 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
         initPts = frame->pts;
       }
       frame->time_base = audioStreamList[0]->time_base;
-      if (videoFrameFound) {
+      // 通常は最初の映像フレームが出るまで音声を積まない(起動時 A/V 同期)。
+      // WebCodecs モードは映像を JS 側でデコードするため videoFrameFound が
+      // 立たない。この場合は音声がクロックの基準になるので、映像を待たずに
+      // 積む。
+      if (videoFrameFound || webCodecsMode) {
         AVFrame *cloneFrame = av_frame_clone(frame);
         std::lock_guard<std::mutex> lock(audioFrameMtx);
         audioFrameQueue.push_back(cloneFrame);
@@ -734,10 +775,16 @@ void decoderThreadFunc() {
   bool videoTerminateFlag = false;
   bool audioTerminateFlag = false;
   bool convertTerminateFlag = false;
-  std::thread videoDecoderThread =
-      std::thread([&]() { videoDecoderThreadFunc(videoTerminateFlag); });
-  std::thread videoConvertThread =
-      std::thread([&]() { videoConvertThreadFunc(convertTerminateFlag); });
+  // WebCodecs モードでは映像は JS 側でデコードするので、WASM の映像デコード/
+  // 変換スレッドは起動しない。音声スレッドは共通で起動する。
+  std::thread videoDecoderThread;
+  std::thread videoConvertThread;
+  if (!webCodecsMode) {
+    videoDecoderThread =
+        std::thread([&]() { videoDecoderThreadFunc(videoTerminateFlag); });
+    videoConvertThread =
+        std::thread([&]() { videoConvertThreadFunc(convertTerminateFlag); });
+  }
   std::thread audioDecoderThread =
       std::thread([&]() { audioDecoderThreadFunc(audioTerminateFlag); });
 
@@ -774,11 +821,31 @@ void decoderThreadFunc() {
       continue;
     }
     if (ppacket->stream_index == videoStream->index) {
-      AVPacket *clonePacket = av_packet_clone(ppacket);
-      {
-        std::lock_guard<std::mutex> lock(videoPacketMtx);
-        videoPacketQueue.push_back(clonePacket);
-        videoPacketCv.notify_all();
+      if (webCodecsMode) {
+        // WebCodecs モード: HEVC アクセスユニット(mmttlv が Annex-B 形式で
+        // 出力済み)をキューへ積む。実際に JS の VideoDecoder へ渡すのは
+        // メインループ(メインスレッド)。
+        VideoAu au;
+        au.ptsSec = (ppacket->pts == AV_NOPTS_VALUE)
+                        ? -1.0
+                        : ppacket->pts * av_q2d(videoStream->time_base);
+        au.key = (ppacket->flags & AV_PKT_FLAG_KEY) != 0;
+        au.data.assign(ppacket->data, ppacket->data + ppacket->size);
+        {
+          std::lock_guard<std::mutex> lock(videoAuMtx);
+          // 供給過多で暴走しないよう上限を設ける(古いものを捨てる)。
+          if (videoAuQueue.size() > 300) {
+            videoAuQueue.pop_front();
+          }
+          videoAuQueue.push_back(std::move(au));
+        }
+      } else {
+        AVPacket *clonePacket = av_packet_clone(ppacket);
+        {
+          std::lock_guard<std::mutex> lock(videoPacketMtx);
+          videoPacketQueue.push_back(clonePacket);
+          videoPacketCv.notify_all();
+        }
       }
     }
     if (audioStreamList.size() > 0 &&
@@ -791,7 +858,8 @@ void decoderThreadFunc() {
         audioPacketCv.notify_all();
       }
     }
-    if (ppacket->stream_index == captionStream->index) {
+    if (captionStream != nullptr &&
+        ppacket->stream_index == captionStream->index) {
       char buffer[ppacket->size + 2];
       memcpy(buffer, ppacket->data, ppacket->size);
       buffer[ppacket->size + 1] = '\0';
@@ -834,9 +902,13 @@ void decoderThreadFunc() {
     audioPacketCv.notify_all();
   }
   spdlog::debug("join to videoDecoderThread");
-  videoDecoderThread.join();
+  if (videoDecoderThread.joinable()) {
+    videoDecoderThread.join();
+  }
   spdlog::debug("join to videoConvertThread");
-  videoConvertThread.join();
+  if (videoConvertThread.joinable()) {
+    videoConvertThread.join();
+  }
   spdlog::debug("join to audioDecoderThread");
   audioDecoderThread.join();
 
@@ -878,6 +950,25 @@ void decoderMainloop() {
                 "videoPacketQueue:{} audioPacketQueue:{}",
                 videoFrameQueue.size(), audioFrameQueue.size(),
                 videoPacketQueue.size(), audioPacketQueue.size());
+
+  // WebCodecs モード: 溜まった HEVC アクセスユニットを JS の VideoDecoder へ
+  // 渡す。ここはメインスレッドなので VideoDecoder を安全に触れる。
+  if (webCodecsMode && !videoAuCallback.isNull()) {
+    for (;;) {
+      VideoAu au;
+      {
+        std::lock_guard<std::mutex> lock(videoAuMtx);
+        if (videoAuQueue.empty()) {
+          break;
+        }
+        au = std::move(videoAuQueue.front());
+        videoAuQueue.pop_front();
+      }
+      emscripten::val data(emscripten::typed_memory_view<uint8_t>(
+          au.data.size(), au.data.data()));
+      videoAuCallback(data, au.ptsSec, au.key);
+    }
+  }
 
   if (videoStream && !audioStreamList.empty() && !statsCallback.isNull()) {
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -930,6 +1021,18 @@ void decoderMainloop() {
         break;
       }
     }
+  }
+
+  // 音声クロック(推定再生時刻)を映像の有無に依らず更新する。WebCodecs モード
+  // では映像フレームが videoFrameQueue に来ない(JS 側でデコード)ため、ここで
+  // 独立に計算しておき、JS の映像表示同期に使わせる。
+  if (audioFrame && !audioStreamList.empty() &&
+      audioStreamList[0]->codecpar->sample_rate > 0) {
+    double audioPtsTimeForClock =
+        audioFrame->pts * av_q2d(audioFrame->time_base);
+    currentAudioPlaybackTime =
+        audioPtsTimeForClock - (double)bufferedAudioSamples /
+                                   audioStreamList[0]->codecpar->sample_rate;
   }
 
   if (currentFrame && audioFrame) {
