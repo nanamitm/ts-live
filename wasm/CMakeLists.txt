@@ -111,6 +111,11 @@ target_link_options(ts-live PRIVATE
   "SHELL:-s ALLOW_MEMORY_GROWTH=1"
   "SHELL:-s WASM=1"
   "SHELL:-s USE_PTHREADS=1"
+  # HEVC 4K/8K フレーム並列デコード用にワーカーを事前確保する。
+  # 既存スレッド(デマルチプレクス/音声/描画/audio worklet) + フレーム
+  # スレッド(最大8) を賄える数を確保しつつ、STRICT=0 で不足時の動的生成も許可。
+  "SHELL:-s PTHREAD_POOL_SIZE=24"
+  "SHELL:-s PTHREAD_POOL_SIZE_STRICT=0"
   "SHELL:-s USE_SDL=0"
   "SHELL:-s USE_WEBGPU=1"
   "SHELL:-s FETCH=1"

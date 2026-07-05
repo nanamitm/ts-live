@@ -324,6 +324,7 @@ const Page: NextPage = () => {
           Module.reset()
           console.log('abort fetch done.')
         })
+        Module.setTlvMode((activeService.channel?.type as string) === 'BS4K')
         const url = `${mirakurunServer}/api/services/${activeService.id}/stream?decode=1`
         console.log('start fetch', url, Module)
         fetch(url, {

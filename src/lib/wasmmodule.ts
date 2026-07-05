@@ -23,5 +23,6 @@ export declare interface WasmModule extends EmscriptenModule {
   reset(): void
   setAudioGain(volume: number): void
   setDualMonoMode(mode: number): void
+  setTlvMode(isTlv: boolean): void
 }
 export declare var Module: WasmModule
