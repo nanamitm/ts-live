@@ -101,6 +101,10 @@ std::condition_variable videoPacketCv, audioPacketCv;
 AVStream *videoStream = nullptr;
 std::vector<AVStream *> audioStreamList;
 AVStream *captionStream = nullptr;
+// 4K/8K (MMT/TLV) の字幕は ARIB-TTML (AV_CODEC_ID_TTML) で、2K の
+// ARIB STD-B24 (AV_CODEC_ID_ARIB_CAPTION) とは符号体系が異なる。現状の
+// aribb24.js は B24 専用なので、TTML のときは描画せずダンプ観測に留める。
+bool captionIsTtml = false;
 
 int64_t initPts = -1;
 
@@ -349,6 +353,7 @@ void resetInternal() {
   videoStream = nullptr;
   audioStreamList.clear();
   captionStream = nullptr;
+  captionIsTtml = false;
   videoFrameFound = false;
 
   if (videoSwsContext != nullptr) {
@@ -737,10 +742,14 @@ void decoderThreadFunc() {
       }
       if (formatContext->streams[i]->codecpar->codec_type ==
               AVMEDIA_TYPE_SUBTITLE &&
-          formatContext->streams[i]->codecpar->codec_id ==
-              AV_CODEC_ID_ARIB_CAPTION &&
+          (formatContext->streams[i]->codecpar->codec_id ==
+               AV_CODEC_ID_ARIB_CAPTION ||
+           formatContext->streams[i]->codecpar->codec_id ==
+               AV_CODEC_ID_TTML) &&
           captionStream == nullptr) {
         captionStream = formatContext->streams[i];
+        captionIsTtml = formatContext->streams[i]->codecpar->codec_id ==
+                        AV_CODEC_ID_TTML;
       }
     }
     if (videoStream == nullptr) {
@@ -769,9 +778,10 @@ void decoderThreadFunc() {
     }
 
     if (captionStream) {
-      spdlog::info("Found caption stream index:{} codecID:{}",
+      spdlog::info("Found caption stream index:{} codecID:{} ttml:{}",
                    captionStream->index,
-                   avcodec_get_name(captionStream->codecpar->codec_id));
+                   avcodec_get_name(captionStream->codecpar->codec_id),
+                   captionIsTtml);
     }
   }
 
@@ -863,24 +873,37 @@ void decoderThreadFunc() {
     }
     if (captionStream != nullptr &&
         ppacket->stream_index == captionStream->index) {
-      char buffer[ppacket->size + 2];
-      memcpy(buffer, ppacket->data, ppacket->size);
-      buffer[ppacket->size + 1] = '\0';
-      std::string str = fmt::format("{:02X}", ppacket->data[0]);
-      for (int i = 1; i < ppacket->size; i++) {
-        str += fmt::format(" {:02x}", ppacket->data[i]);
-      }
-      spdlog::debug("CaptionPacket received. size: {} data: [{}]",
-                    ppacket->size, str);
-      if (!captionCallback.isNull()) {
-        std::vector<uint8_t> buffer(ppacket->size);
-        memcpy(&buffer[0], ppacket->data, ppacket->size);
-        {
-          std::lock_guard<std::mutex> lock(captionDataMtx);
-          int64_t pts = ppacket->pts;
-          captionDataQueue.push_back(
-              std::make_pair<int64_t, std::vector<uint8_t>>(std::move(pts),
-                                                            std::move(buffer)));
+      if (captionIsTtml) {
+        // 4K/8K の ARIB-TTML 字幕。JS 側(aribb24.js)は B24 専用で描画できない
+        // ため、当面は本文をダンプして構造を観測するに留める(直前と同一なら
+        // 間引く)。TTML 本文は UTF-8 XML のはず。
+        std::string ttml(reinterpret_cast<const char *>(ppacket->data),
+                         ppacket->size);
+        static std::mutex ttmlMtx;
+        static std::string lastTtml;
+        std::lock_guard<std::mutex> lock(ttmlMtx);
+        if (ttml != lastTtml) {
+          lastTtml = ttml;
+          spdlog::info("[ttml] pts:{} size:{} body:\n{}", ppacket->pts,
+                       ppacket->size, ttml);
+        }
+      } else {
+        std::string str = fmt::format("{:02X}", ppacket->data[0]);
+        for (int i = 1; i < ppacket->size; i++) {
+          str += fmt::format(" {:02x}", ppacket->data[i]);
+        }
+        spdlog::debug("CaptionPacket received. size: {} data: [{}]",
+                      ppacket->size, str);
+        if (!captionCallback.isNull()) {
+          std::vector<uint8_t> buffer(ppacket->size);
+          memcpy(&buffer[0], ppacket->data, ppacket->size);
+          {
+            std::lock_guard<std::mutex> lock(captionDataMtx);
+            int64_t pts = ppacket->pts;
+            captionDataQueue.push_back(
+                std::make_pair<int64_t, std::vector<uint8_t>>(
+                    std::move(pts), std::move(buffer)));
+          }
         }
       }
     }
