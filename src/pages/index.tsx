@@ -50,6 +50,10 @@ const Page: NextPage = () => {
 
   const [drawer, setDrawer] = useState<boolean>(true)
   const [touched, setTouched] = useState<boolean>(false)
+  // Mirakurun 管理UIの ▷(TSPlay) ボタン等から
+  //   <playerUrl>#http://host/api/services/<id>/stream?decode=1
+  // の形で開かれたときに自動再生するための、対象サービス ID。
+  const [pendingServiceId, setPendingServiceId] = useState<number | null>(null)
 
   const [mirakurunServer, setMirakurunServer] = useLocalStorage<string>('mirakurunServer', '')
   const [mirakurunOk, setMirakurunOk] = useState<boolean>(false)
@@ -325,6 +329,32 @@ const Page: NextPage = () => {
     })
   }, [mirakurunOk, mirakurunServer])
 
+  // 起動時: URL ハッシュに stream URL があれば Mirakurun サーバーと対象
+  // サービスを取り出して自動再生の準備をする。
+  useEffect(() => {
+    const hash = decodeURIComponent(location.hash.replace(/^#/, ''))
+    if (!hash) return
+    const m = hash.match(/^(https?:\/\/[^/]+)\/api\/services\/(\d+)\/stream/)
+    if (!m) return
+    setMirakurunServer(m[1])
+    setPendingServiceId(parseInt(m[2], 10))
+    setTouched(true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // サービス一覧が揃ったら、ハッシュで指定されたサービスを選択して再生する。
+  useEffect(() => {
+    if (pendingServiceId == null) return
+    if (!tvServices || tvServices.length === 0) return
+    const svc = tvServices.find(s => s.id === pendingServiceId)
+    if (svc) {
+      setActiveService(svc)
+      setTouched(true)
+      setPendingServiceId(null)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingServiceId, tvServices])
+
   useEffect(() => {
     if (!mirakurunServer || !mirakurunOk) {
       return
@@ -468,9 +498,12 @@ const Page: NextPage = () => {
         Module.setWebCodecsMode(useWebCodecs)
         const url = `${mirakurunServer}/api/services/${activeService.id}/stream?decode=1`
         console.log('start fetch', url, Module)
+        // NOTE: カスタムヘッダーを付けると CORS preflight が必須になり、HTTPS(公開)
+        // オリジンから LAN 上の HTTP Mirakurun への Local Network Access が
+        // preflight 経路で拒否される (Chrome)。ヘッダーを付けず simple request に
+        // することで /api/services などと同じく通す。優先度は既定(0)で十分。
         fetch(url, {
           signal: ac.signal,
-          headers: { 'X-Mirakurun-Priority': '0' },
         })
           .then(async response => {
             if (!response.body) {
