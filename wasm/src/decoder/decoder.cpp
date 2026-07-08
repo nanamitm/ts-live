@@ -1143,8 +1143,9 @@ void decoderMainloop() {
         if (swr) {
           swr_free(&swr);
         }
+        AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
         swr_alloc_set_opts2(&swr,              // we're allocating a new context
-                            &frame->ch_layout, // out_ch_layout
+                            &outLayout,         // out_ch_layout (downmix to stereo)
                             AV_SAMPLE_FMT_FLTP, // out_sample_fmt
                             48000,              // out_sample_rate
                             &frame->ch_layout,  // in_ch_layout

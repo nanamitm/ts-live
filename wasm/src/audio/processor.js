@@ -66,11 +66,11 @@ class AudioFeederProcessor extends AudioWorkletProcessor {
       if (output[0].length > copySize) {
         if (this.buffers0.length > 1) {
           output[0].set(
-            buffers0[1].subarray(0, output[0].length - copySize),
+            this.buffers0[1].subarray(0, output[0].length - copySize),
             copySize
           )
           output[1].set(
-            buffers1[1].subarray(0, output[0].length - copySize),
+            this.buffers1[1].subarray(0, output[0].length - copySize),
             copySize
           )
           this.bufferedSamples -= output[0].length - copySize
