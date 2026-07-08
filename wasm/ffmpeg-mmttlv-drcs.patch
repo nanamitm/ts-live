@@ -1,0 +1,15 @@
+--- a/libavformat/mmtp.c
++++ b/libavformat/mmtp.c
+@@ -1325,7 +1325,11 @@
+     length_ext_flag          = (byte >> 3) & 1;
+     subsample_info_list_flag = (byte >> 2) & 1;
+ 
+-    if (data_type != 0b0000) return AVERROR_PATCHWELCOME;
++    /* data_type 0b0000 = TTML text, 0b0110 = subtitle resource (e.g. DRCS
++     * glyphs delivered as an SVG font). Emit both on the caption stream;
++     * downstream tells them apart by the XML root element (<tt> vs <svg>). */
++    if (data_type != 0b0000 && data_type != 0b0110)
++        return AVERROR_PATCHWELCOME;
+ 
+     if (length_ext_flag)
+         data_size = bytestream2_get_be32(gbc);

@@ -119,10 +119,51 @@ const resolveStyle = (
   return out
 }
 
+// DRCS(外字)グリフ。MMT の字幕リソース(SVGフォント)由来。unitsPerEm 座標系
+// (y-up, ベースライン=0)の SVG パスを保持する。
+type DrcsGlyph = {
+  path: Path2D
+  unitsPerEm: number
+  advance: number
+}
+
+// SVGフォント(<font><glyph unicode d>...)を解析し、コードポイント→グリフの
+// 表に登録する。TTML 本文中の PUA 文字がこの表で置換描画される。
+const registerDrcsGlyphs = (
+  svg: string,
+  map: Map<number, DrcsGlyph>
+): number => {
+  const doc = new DOMParser().parseFromString(svg, 'image/svg+xml')
+  if (doc.getElementsByTagName('parsererror').length > 0) return 0
+  const fontEl = doc.getElementsByTagName('font')[0]
+  const faceEl = doc.getElementsByTagName('font-face')[0]
+  const unitsPerEm =
+    parseFloat(faceEl?.getAttribute('units-per-em') || '') || 1000
+  const fontAdv =
+    parseFloat(fontEl?.getAttribute('horiz-adv-x') || '') || unitsPerEm
+  let n = 0
+  for (const g of Array.from(doc.getElementsByTagName('glyph'))) {
+    const uni = g.getAttribute('unicode')
+    const d = g.getAttribute('d')
+    if (!uni || !d) continue
+    const cp = uni.codePointAt(0)
+    if (cp === undefined) continue
+    const advance = parseFloat(g.getAttribute('horiz-adv-x') || '') || fontAdv
+    try {
+      map.set(cp, { path: new Path2D(d), unitsPerEm, advance })
+      n++
+    } catch {
+      // 無効なパスは無視
+    }
+  }
+  return n
+}
+
 const renderTtml = (
   ctx: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
-  xml: string
+  xml: string,
+  glyphs: Map<number, DrcsGlyph>
 ) => {
   const scaleX = canvas.width / TTML_PLANE_W
   const scaleY = canvas.height / TTML_PLANE_H
@@ -190,27 +231,57 @@ const renderTtml = (
       const fontPx = fontH * scaleY
       const sx = fontH > 0 ? fontW / fontH : 1
       const family = st.fontFamily || 'sans-serif'
+      const color = st.color || 'rgba(255,255,255,1)'
 
       ctx.font = `${fontPx}px "${family}", sans-serif`
       ctx.textBaseline = 'top'
       ctxAny.letterSpacing = `${(st.letterSpacing ?? 0) * scaleX}px`
 
-      const drawW = ctx.measureText(text).width * sx
-
-      ctx.save()
-      ctx.translate(cursorX, oy)
-      if (sx !== 1) ctx.scale(sx, 1) // 半角約物などを横方向に圧縮
-      if (st.outline) {
-        ctx.lineWidth = st.outline.width * scaleY
-        ctx.strokeStyle = st.outline.color
-        ctx.lineJoin = 'round'
-        ctx.strokeText(text, 0, 0)
+      // 本文を「通常文字の連なり」と「DRCS外字(登録済みコードポイント)」に
+      // 分割し、前者は fillText、後者は SVG グリフのパスで描く。
+      const segs: Array<{ drcs: boolean; text: string }> = []
+      for (const ch of Array.from(text)) {
+        const cp = ch.codePointAt(0)
+        const isDrcs = cp !== undefined && glyphs.has(cp)
+        const last = segs[segs.length - 1]
+        if (last && last.drcs === isDrcs) last.text += ch
+        else segs.push({ drcs: isDrcs, text: ch })
       }
-      ctx.fillStyle = st.color || 'rgba(255,255,255,1)'
-      ctx.fillText(text, 0, 0)
-      ctx.restore()
 
-      cursorX += drawW
+      for (const seg of segs) {
+        if (seg.drcs) {
+          for (const ch of Array.from(seg.text)) {
+            const g = glyphs.get(ch.codePointAt(0) as number)
+            if (!g) continue
+            const s = fontPx / g.unitsPerEm
+            ctx.save()
+            ctx.translate(cursorX, oy)
+            if (sx !== 1) ctx.scale(sx, 1)
+            // SVGフォントは y-up/ベースライン=0。セル上端に合わせて反転配置。
+            ctx.scale(s, -s)
+            ctx.translate(0, -g.unitsPerEm)
+            ctx.fillStyle = color
+            ctx.fill(g.path)
+            ctx.restore()
+            cursorX += g.advance * s * sx
+          }
+        } else {
+          const drawW = ctx.measureText(seg.text).width * sx
+          ctx.save()
+          ctx.translate(cursorX, oy)
+          if (sx !== 1) ctx.scale(sx, 1) // 半角約物などを横方向に圧縮
+          if (st.outline) {
+            ctx.lineWidth = st.outline.width * scaleY
+            ctx.strokeStyle = st.outline.color
+            ctx.lineJoin = 'round'
+            ctx.strokeText(seg.text, 0, 0)
+          }
+          ctx.fillStyle = color
+          ctx.fillText(seg.text, 0, 0)
+          ctx.restore()
+          cursorX += drawW
+        }
+      }
     }
   }
   ctxAny.letterSpacing = '0px'
@@ -267,6 +338,9 @@ const Caption: React.FC<Props> = ({
   // 現在の字幕を上書き・消去してしまうのを防ぐ(字幕が重なる/すぐ消える対策)。
   const ttmlSeqRef = useRef(0)
   const ttmlShownIdRef = useRef(-1)
+  // DRCS(外字)グリフ表: コードポイント→SVGパス。字幕リソース(SVGフォント)を
+  // 受信するたびに登録し、service 切替でクリアする。
+  const glyphMapRef = useRef<Map<number, DrcsGlyph>>(new Map())
 
   const captionCallback = useCallback(
     (pts: number, ptsTime: number, captionData: Uint8Array) => {
@@ -283,6 +357,14 @@ const Caption: React.FC<Props> = ({
           // TextDecoder は共有バッファを拒否するため、非共有バッファへコピー
           // してからデコードする。
           const xml = new TextDecoder('utf-8').decode(captionData.slice())
+
+          // DRCS 外字リソース(SVGフォント)も同じ字幕ストリームで届く。<svg> を
+          // 判別してグリフ表に登録し、字幕本文としては描画しない。
+          if (/<svg[\s>]/.test(xml.slice(0, 400))) {
+            registerDrcsGlyphs(xml, glyphMapRef.current)
+            return
+          }
+
           // OFF→ON 直後に再描画できるよう直近の TTML を保持する。
           lastTtmlRef.current = xml
 
@@ -294,7 +376,7 @@ const Caption: React.FC<Props> = ({
           const { begin, end } = parseTtmlTiming(xml)
           if (begin == null || !Number.isFinite(now)) {
             // タイミング情報が無ければ従来どおり到着時に即描画する。
-            renderTtml(context, canvas, xml)
+            renderTtml(context, canvas, xml, glyphMapRef.current)
             return
           }
 
@@ -326,7 +408,7 @@ const Caption: React.FC<Props> = ({
             // 既により新しい字幕が表示済みなら、この古い表示は描かない。
             if (id < ttmlShownIdRef.current) return
             ttmlShownIdRef.current = id
-            renderTtml(context, canvas, xml)
+            renderTtml(context, canvas, xml, glyphMapRef.current)
           }, delayShow * 1000)
           ttmlTimersRef.current.push(showTimer)
 
@@ -406,6 +488,7 @@ const Caption: React.FC<Props> = ({
     ttmlOffsetRef.current = null
     ttmlLastBeginRef.current = -1
     ttmlShownIdRef.current = -1
+    glyphMapRef.current.clear()
   }, [service])
 
   // 字幕表示が OFF→ON になったら、直近の TTML 字幕を即座に再描画する。TTML は
@@ -417,7 +500,7 @@ const Caption: React.FC<Props> = ({
     if (!canvasRef.current) return
     const context = canvasRef.current.getContext('2d')
     if (!context) return
-    renderTtml(context, canvasRef.current, lastTtmlRef.current)
+    renderTtml(context, canvasRef.current, lastTtmlRef.current, glyphMapRef.current)
   }, [show])
 
   return (

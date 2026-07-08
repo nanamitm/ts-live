@@ -82,7 +82,10 @@ ExternalProject_Add(
   CONFIGURE_COMMAND bash -c "[ -e ${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-done ] || ${FFMPEG_CONFIGURE_COMMAND}"
   BUILD_COMMAND ${CMAKE_COMMAND} -E env emmake make -j24
   INSTALL_COMMAND bash -c "[ -e ${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-done ] || make install"
-  # PATCH_COMMAND patch -p1 < ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-wasm.patch
+  # ffmpeg-wasm.patch は既に fork(feature/fix-mmttlv-resync)へ取り込み済みのため
+  # 適用不要。DRCS 字幕リソース(MMT data_type=6)を字幕ストリームへ流すための
+  # 追加パッチのみを当てる。
+  PATCH_COMMAND patch -p1 < ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-drcs.patch
 )
 
 
