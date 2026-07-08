@@ -224,6 +224,12 @@ const renderTtml = (
       ctx.fillRect(ox, oy, region.ew * scaleX, region.eh * scaleY)
     }
 
+    // region(背景帯)の高さに対して本文はベースライン top で上寄せになるため、
+    // 行の高さ(そのpの最大フォントセル高)を使い region 内で縦方向にセンタリング
+    // する。extent が本文より低い/未指定の場合はオフセットしない。
+    const lineH = Math.max(...items.map(i => i.st.fontH ?? 128))
+    const baseY = region.eh > lineH ? oy + ((region.eh - lineH) / 2) * scaleY : oy
+
     let cursorX = ox
     for (const { text, st } of items) {
       const fontH = st.fontH ?? 128
@@ -255,7 +261,7 @@ const renderTtml = (
             if (!g) continue
             const s = fontPx / g.unitsPerEm
             ctx.save()
-            ctx.translate(cursorX, oy)
+            ctx.translate(cursorX, baseY)
             if (sx !== 1) ctx.scale(sx, 1)
             // SVGフォントは y-up/ベースライン=0。セル上端に合わせて反転配置。
             ctx.scale(s, -s)
@@ -268,7 +274,7 @@ const renderTtml = (
         } else {
           const drawW = ctx.measureText(seg.text).width * sx
           ctx.save()
-          ctx.translate(cursorX, oy)
+          ctx.translate(cursorX, baseY)
           if (sx !== 1) ctx.scale(sx, 1) // 半角約物などを横方向に圧縮
           if (st.outline) {
             ctx.lineWidth = st.outline.width * scaleY

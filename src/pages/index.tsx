@@ -74,6 +74,15 @@ const Page: NextPage = () => {
   const [epgStationVersion, setEpgStationVersion] = useState<string>('unknown')
   const [epgRecordedFiles, setEpgRecordedFiles] = useState<Array<EpgRecordedFile>>()
   const [activeRecordedFileId, setActiveRecordedFileId] = useState<number>()
+  // ローカルファイル(デバッグ用)再生の選択状態。BS4K の TLV/HEVC を既定にする。
+  const localFileInputRef = useRef<HTMLInputElement>(null)
+  const [localFileName, setLocalFileName] = useState<string>('')
+  const [localTlvMode, setLocalTlvMode] = useLocalStorage<boolean>('tsplayerLocalTlvMode', true)
+  // 直近に開いたローカルファイル(最初から再生/ループ用)と、ループ設定。
+  // ループ判定は実行中の非同期フィードから参照するため ref に同期する。
+  const lastLocalFileRef = useRef<File | null>(null)
+  const [localLoop, setLocalLoop] = useLocalStorage<boolean>('tsplayerLocalLoop', false)
+  const localLoopRef = useRef<boolean>(false)
   const [playMode, setPlayMode] = useState<string>('live')
   const [dualMonoMode, setDualMonoMode] = useLocalStorage<number>('tsplayerDualMonoMode', 0)
   const [volume, setVolume] = useLocalStorage<number>('tsplayerVolume', 1.0)
@@ -559,6 +568,119 @@ const Page: NextPage = () => {
     wasmMod,
   ])
 
+  // ローカルに保存した TS/TLV ファイルを再生する(字幕デバッグ用)。ライブ視聴と
+  // 同じ push 入力経路(getNextInputBuffer/commitInputData)へ File を流し込むので
+  // サーバー不要で、デコード・字幕経路もライブと完全に同一になる。
+  useEffect(() => {
+    localLoopRef.current = !!localLoop
+  }, [localLoop])
+
+  const playLocalFile = (file: File) => {
+    if (!wasmMod) {
+      console.error('WasmModule not loaded')
+      return
+    }
+    const Module = wasmMod
+    lastLocalFileRef.current = file
+    setLocalFileName(file.name)
+    setPlayMode('localfile')
+    // 現在の再生を止める
+    stopFunc()
+    setDrawer(false)
+
+    // 視聴中のスリープを避ける
+    if (!wakeLock) {
+      navigator.wakeLock.request('screen').then(lock => setWakeLock(lock)).catch(() => {})
+    }
+
+    if (showCharts) {
+      Module.setStatsCallback(statsCallback)
+    } else {
+      Module.setStatsCallback(null)
+    }
+
+    setTimeout(() => {
+      const useWebCodecs = !!localTlvMode && typeof VideoDecoder !== 'undefined'
+      if (useWebCodecs) {
+        startWebCodecs(Module, wcCanvasRef.current)
+        setWebCodecsActive(true)
+      }
+      let aborted = false
+      setStopFunc(() => () => {
+        console.log('abort local file')
+        aborted = true
+        if (webCodecsCtrlRef.current) {
+          webCodecsCtrlRef.current.stop()
+          webCodecsCtrlRef.current = null
+        }
+        setWebCodecsActive(false)
+        Module.reset()
+      })
+      Module.setTlvMode(!!localTlvMode)
+      Module.setWebCodecsMode(useWebCodecs)
+
+      const sleep = (msec: number) => new Promise(resolve => setTimeout(resolve, msec))
+      console.log('start local file', file.name, file.size)
+      ;(async () => {
+        const reader = file.stream().getReader()
+        let ret = await reader.read()
+        while (!ret.done) {
+          if (aborted) {
+            reader.cancel().catch(() => {})
+            break
+          }
+          if (ret.value) {
+            try {
+              while (true) {
+                if (aborted) break
+                const buffer = Module.getNextInputBuffer(ret.value.length)
+                if (!buffer) {
+                  // バッファ満杯: ライブと同じくデコード側が消費するまで待つ
+                  await sleep(100)
+                  continue
+                }
+                buffer.set(ret.value)
+                Module.commitInputData(ret.value.length)
+                break
+              }
+            } catch (ex) {
+              if (typeof ex === 'number') {
+                console.error(Module.getExceptionMsg(ex))
+                throw ex
+              }
+            }
+          }
+          ret = await reader.read()
+        }
+        console.log('local file feed done.', file.name)
+
+        // ループ再生: フィード完了後もバッファ(最大48MB)分は再生が続くため、音声
+        // クロックが進まなくなった=バッファ枯渇を待ってから頭出しし直す。
+        if (!aborted && localLoopRef.current) {
+          let last = -999
+          let stable = 0
+          while (!aborted && localLoopRef.current) {
+            await sleep(500)
+            const t = Module.getAudioPlaybackTime()
+            if (t >= 0 && Math.abs(t - last) < 0.05) {
+              // 約1秒(2回連続)進捗が無ければ枯渇とみなす
+              if (++stable >= 2) break
+            } else {
+              stable = 0
+            }
+            last = t
+          }
+          if (!aborted && localLoopRef.current) {
+            console.log('local file loop: restart', file.name)
+            playLocalFile(file)
+          }
+        }
+      })().catch(ex => {
+        console.log('local file read ex:', ex)
+      })
+    }, 500)
+  }
+
   useKey(
     'F2',
     () => {
@@ -870,8 +992,78 @@ const Page: NextPage = () => {
                     {activeRecordedFileId !== undefined && (
                       <MenuItem value="file">ファイル再生</MenuItem>
                     )}
+                    {localFileName && (
+                      <MenuItem value="localfile">ローカルファイル</MenuItem>
+                    )}
                   </Select>
                 </FormControl>
+              </FormGroup>
+              <Divider
+                css={css`
+                  margin: 16px 0px 8px;
+                `}
+              ></Divider>
+              <FormGroup>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={!!localTlvMode}
+                      onChange={ev => setLocalTlvMode(ev.target.checked)}
+                    ></Checkbox>
+                  }
+                  label="BS4K(TLV/HEVC) として再生"
+                ></FormControlLabel>
+                <input
+                  ref={localFileInputRef}
+                  type="file"
+                  accept=".ts,.m2ts,.tlv,.mmts,application/octet-stream"
+                  hidden
+                  onChange={ev => {
+                    const file = ev.target.files?.[0]
+                    if (file) playLocalFile(file)
+                    // 同じファイルを再選択しても onChange が発火するようクリア
+                    ev.target.value = ''
+                  }}
+                />
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={!!localLoop}
+                      onChange={ev => setLocalLoop(ev.target.checked)}
+                    ></Checkbox>
+                  }
+                  label="ループ再生"
+                ></FormControlLabel>
+                <Stack spacing={1} direction="row" css={css`margin-top: 8px;`}>
+                  <Button
+                    variant="outlined"
+                    css={css`flex: 1;`}
+                    onClick={() => localFileInputRef.current?.click()}
+                  >
+                    ファイルを開く
+                  </Button>
+                  <Button
+                    variant="outlined"
+                    css={css`flex: 1;`}
+                    disabled={!localFileName}
+                    onClick={() => {
+                      if (lastLocalFileRef.current) playLocalFile(lastLocalFileRef.current)
+                    }}
+                  >
+                    最初から再生
+                  </Button>
+                </Stack>
+                {localFileName && (
+                  <div
+                    css={css`
+                      margin-top: 8px;
+                      font-size: 12px;
+                      word-break: break-all;
+                    `}
+                  >
+                    {`再生中: ${localFileName}`}
+                  </div>
+                )}
               </FormGroup>
               <FormGroup>
                 <FormControlLabel
