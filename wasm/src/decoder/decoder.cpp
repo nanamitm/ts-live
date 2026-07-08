@@ -874,18 +874,29 @@ void decoderThreadFunc() {
     if (captionStream != nullptr &&
         ppacket->stream_index == captionStream->index) {
       if (captionIsTtml) {
-        // 4K/8K の ARIB-TTML 字幕。JS 側(aribb24.js)は B24 専用で描画できない
-        // ため、当面は本文をダンプして構造を観測するに留める(直前と同一なら
-        // 間引く)。TTML 本文は UTF-8 XML のはず。
+        // 4K/8K の ARIB-TTML 字幕。PTS を持たない(AV_NOPTS_VALUE)ため 0 を
+        // 積み、表示タイミングは当面 JS 側で到着時に描画する(精密な
+        // begin/end 同期は後段で対応)。放送は同一 TTML を繰り返し送るので
+        // 直前と同一のものは間引く。
         std::string ttml(reinterpret_cast<const char *>(ppacket->data),
                          ppacket->size);
         static std::mutex ttmlMtx;
         static std::string lastTtml;
-        std::lock_guard<std::mutex> lock(ttmlMtx);
-        if (ttml != lastTtml) {
-          lastTtml = ttml;
-          spdlog::info("[ttml] pts:{} size:{} body:\n{}", ppacket->pts,
-                       ppacket->size, ttml);
+        bool changed = false;
+        {
+          std::lock_guard<std::mutex> lock(ttmlMtx);
+          if (ttml != lastTtml) {
+            lastTtml = ttml;
+            changed = true;
+          }
+        }
+        if (changed && !captionCallback.isNull()) {
+          std::vector<uint8_t> buffer(ppacket->size);
+          memcpy(&buffer[0], ppacket->data, ppacket->size);
+          std::lock_guard<std::mutex> lock(captionDataMtx);
+          captionDataQueue.push_back(
+              std::make_pair<int64_t, std::vector<uint8_t>>(0,
+                                                            std::move(buffer)));
         }
       } else {
         std::string str = fmt::format("{:02X}", ppacket->data[0]);
