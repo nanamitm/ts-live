@@ -170,6 +170,29 @@ const renderTtml = (
     ctx.fillText(text, x, y)
   }
 }
+
+// TTML の begin/end は clock-time(HH:MM:SS(.mmm))。秒に変換する。
+const parseClock = (v: string): number | null => {
+  const m = v.match(/^(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$/)
+  if (!m) return null
+  const h = parseInt(m[1], 10)
+  const mi = parseInt(m[2], 10)
+  const s = parseInt(m[3], 10)
+  const frac = m[4] ? parseInt(m[4].padEnd(3, '0'), 10) / 1000 : 0
+  return h * 3600 + mi * 60 + s + frac
+}
+
+// 先頭 <div> の begin/end を秒で取り出す。
+const parseTtmlTiming = (
+  xml: string
+): { begin: number | null; end: number | null } => {
+  const bm = xml.match(/<div\b[^>]*\bbegin="([^"]+)"/)
+  const em = xml.match(/<div\b[^>]*\bend="([^"]+)"/)
+  return {
+    begin: bm ? parseClock(bm[1]) : null,
+    end: em ? parseClock(em[1]) : null,
+  }
+}
 // ---------------------------------------------------------------------------
 
 const Caption: React.FC<Props> = ({
@@ -188,6 +211,17 @@ const Caption: React.FC<Props> = ({
   const [clearTimeoutId, setClearTimeoutId] = useState(setTimeout(() => {}, 0))
 
   const lastTtmlRef = useRef<string | null>(null)
+  // TTML begin/end 同期用の状態。offset は「TTML 時刻 → 再生メディア時刻」の
+  // 差分(秒)で、最初のキュー観測時に確定し番組境界で取り直す。timers は表示/
+  // 消去の予約(setTimeout)一覧で service 切替時にまとめて解除する。
+  const ttmlOffsetRef = useRef<number | null>(null)
+  const ttmlLastBeginRef = useRef<number>(-1)
+  const ttmlTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([])
+  // 世代トークン。各キューに単調増加 id を振り、「今表示中の id」を追跡する。
+  // これにより、後続キューに置き換わった古いキューの表示/消去タイマーが
+  // 現在の字幕を上書き・消去してしまうのを防ぐ(字幕が重なる/すぐ消える対策)。
+  const ttmlSeqRef = useRef(0)
+  const ttmlShownIdRef = useRef(-1)
 
   const captionCallback = useCallback(
     (pts: number, ptsTime: number, captionData: Uint8Array) => {
@@ -206,7 +240,62 @@ const Caption: React.FC<Props> = ({
           const xml = new TextDecoder('utf-8').decode(captionData.slice())
           // OFF→ON 直後に再描画できるよう直近の TTML を保持する。
           lastTtmlRef.current = xml
-          renderTtml(context, canvas, xml)
+
+          // TTML は PTS を持たず、表示時刻は begin/end(clock-time)で表す。WASM
+          // からは ptsTime に現在の再生メディア時刻(秒)が渡ってくるので、最初の
+          // キューで offset=begin-now を確定し、以後は begin-offset の時刻に表示
+          // する(SubtitleTimingResolver の簡約版)。
+          const now = ptsTime
+          const { begin, end } = parseTtmlTiming(xml)
+          if (begin == null || !Number.isFinite(now)) {
+            // タイミング情報が無ければ従来どおり到着時に即描画する。
+            renderTtml(context, canvas, xml)
+            return
+          }
+
+          const ROLLBACK_TOL = 5 // 秒。begin の巻き戻り=番組境界とみなす閾値
+          const MAX_LEAD = 30 // 秒。offset 破綻時のフェイルセーフ
+          if (
+            ttmlOffsetRef.current == null ||
+            begin + ROLLBACK_TOL < ttmlLastBeginRef.current
+          ) {
+            // 初回、または番組境界: offset を取り直し予約済みの表示を破棄する。
+            ttmlOffsetRef.current = begin - now
+            for (const t of ttmlTimersRef.current) clearTimeout(t)
+            ttmlTimersRef.current = []
+          }
+          ttmlLastBeginRef.current = begin
+
+          let delayShow = begin - ttmlOffsetRef.current - now
+          if (delayShow < 0) delayShow = 0
+          if (delayShow > MAX_LEAD) {
+            // offset がずれている可能性。再校正して即時表示。
+            ttmlOffsetRef.current = begin - now
+            delayShow = 0
+          }
+
+          ttmlSeqRef.current += 1
+          const id = ttmlSeqRef.current
+
+          const showTimer = setTimeout(() => {
+            // 既により新しい字幕が表示済みなら、この古い表示は描かない。
+            if (id < ttmlShownIdRef.current) return
+            ttmlShownIdRef.current = id
+            renderTtml(context, canvas, xml)
+          }, delayShow * 1000)
+          ttmlTimersRef.current.push(showTimer)
+
+          if (end != null) {
+            const delayClear = end - ttmlOffsetRef.current - now
+            if (delayClear > delayShow) {
+              const clearTimer = setTimeout(() => {
+                // 後続字幕に置き換わっていれば消去しない(現在の字幕を守る)。
+                if (ttmlShownIdRef.current !== id) return
+                context.clearRect(0, 0, canvas.width, canvas.height)
+              }, delayClear * 1000)
+              ttmlTimersRef.current.push(clearTimer)
+            }
+          }
         } catch (e) {
           console.error('TTML render error', e)
         }
@@ -266,6 +355,12 @@ const Caption: React.FC<Props> = ({
     context.clearRect(0, 0, canvas.width, canvas.height)
     clearTimeout(renderTimeoutId)
     clearTimeout(clearTimeoutId)
+    // TTML 同期状態も番組切替でリセットする。
+    for (const t of ttmlTimersRef.current) clearTimeout(t)
+    ttmlTimersRef.current = []
+    ttmlOffsetRef.current = null
+    ttmlLastBeginRef.current = -1
+    ttmlShownIdRef.current = -1
   }, [service])
 
   // 字幕表示が OFF→ON になったら、直近の TTML 字幕を即座に再描画する。TTML は

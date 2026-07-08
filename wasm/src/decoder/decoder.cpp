@@ -1219,7 +1219,14 @@ void decoderMainloop() {
 
       auto data = emscripten::val(
           emscripten::typed_memory_view<uint8_t>(buffer.size(), &buffer[0]));
-      captionCallback(pts, ptsTime - estimatedAudioPlayTime, data);
+      if (captionIsTtml) {
+        // TTML(4K/8K)は PTS を持たず、表示時刻は TTML 内の begin/end で表現
+        // される。JS 側で同期できるよう、ここでは現在の再生メディア時刻
+        // (音声再生時刻・秒)を ptsTime として渡す。
+        captionCallback((double)0, estimatedAudioPlayTime, data);
+      } else {
+        captionCallback(pts, ptsTime - estimatedAudioPlayTime, data);
+      }
     }
   }
 
