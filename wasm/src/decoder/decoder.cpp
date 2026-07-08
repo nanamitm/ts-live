@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
+#include <cstring>
 #include <deque>
 #include <emscripten/bind.h>
 #include <emscripten/emscripten.h>
@@ -21,6 +23,7 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/log.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
@@ -922,7 +925,74 @@ void decoderThreadFunc() {
 
 std::thread decoderThread;
 
+// FFmpeg のログを spdlog 経由(=stdout)に集約する。既定の av_log は stderr へ
+// 出力され、ブラウザのコンソールでは全て赤いエラー扱いになるため、ARIB の
+// 5.1ch AAC が毎フレーム吐く "audio config changed" などが大量のエラーに
+// 見えてしまう。レベルを spdlog にマッピングしつつ、直前と同一のメッセージは
+// 間引いてノイズを抑える。
+static void tsLiveAvLogCallback(void *avcl, int level, const char *fmt,
+                                va_list vl) {
+  if (level > av_log_get_level()) {
+    return;
+  }
+  char line[1024];
+  int printPrefix = 1;
+  int ret = av_log_format_line2(avcl, level, fmt, vl, line, sizeof(line),
+                                &printPrefix);
+  if (ret <= 0) {
+    return;
+  }
+  // 末尾の改行を除去
+  size_t len = strlen(line);
+  while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+    line[--len] = '\0';
+  }
+  if (len == 0) {
+    return;
+  }
+
+  // 毎フレーム繰り返される同一メッセージ(例: aac_latm の "audio config
+  // changed")を間引く。連続で同一の場合は 500 回に 1 回だけ出力する。
+  static std::mutex logMtx;
+  static std::string lastLine;
+  static long repeatCount = 0;
+  {
+    std::lock_guard<std::mutex> lock(logMtx);
+    if (lastLine == line) {
+      if (++repeatCount % 500 != 0) {
+        return;
+      }
+    } else {
+      lastLine = line;
+      repeatCount = 0;
+    }
+  }
+
+  switch (level) {
+  case AV_LOG_PANIC:
+  case AV_LOG_FATAL:
+    spdlog::critical("[ffmpeg] {}", line);
+    break;
+  case AV_LOG_ERROR:
+    // stderr の赤エラー表示を避けるため warning に格下げして出す。
+    spdlog::warn("[ffmpeg] {}", line);
+    break;
+  case AV_LOG_WARNING:
+    spdlog::warn("[ffmpeg] {}", line);
+    break;
+  case AV_LOG_INFO:
+    spdlog::info("[ffmpeg] {}", line);
+    break;
+  default:
+    spdlog::debug("[ffmpeg] {}", line);
+    break;
+  }
+}
+
 void initDecoder() {
+  // FFmpeg ログを spdlog に集約(コンソールの赤エラー抑制 + 繰り返し間引き)
+  av_log_set_callback(tsLiveAvLogCallback);
+
   // デコーダスレッド起動
   spdlog::info("Starting decoder thread.");
   decoderThread = std::thread([]() {
