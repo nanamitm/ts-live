@@ -966,6 +966,7 @@ const Page: NextPage = () => {
             canvasRef={captionCanvasRef}
             width={1920}
             height={1080}
+            show={showCaption}
           ></Caption>
         </div>
         <div

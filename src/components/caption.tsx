@@ -18,6 +18,9 @@ type Props = {
   width?: number
   height?: number
   service: Service | undefined
+  // 字幕表示ON/OFF。TTML は同一内容が間引かれ再送されないため、OFF→ON した
+  // 瞬間に直近の字幕を再描画するのに使う。
+  show?: boolean
 }
 
 // --- ARIB-TTML (4K/8K MMT 字幕) レンダラ -----------------------------------
@@ -174,7 +177,8 @@ const Caption: React.FC<Props> = ({
   wasmModule,
   width,
   height,
-  service
+  service,
+  show
 }) => {
   // const canvasRef = useRef<HTMLCanvasElement>(null)
   // const [currentSubtitle, setCurrentSubtitle] = useState<number>()
@@ -182,6 +186,8 @@ const Caption: React.FC<Props> = ({
     setTimeout(() => {}, 0)
   )
   const [clearTimeoutId, setClearTimeoutId] = useState(setTimeout(() => {}, 0))
+
+  const lastTtmlRef = useRef<string | null>(null)
 
   const captionCallback = useCallback(
     (pts: number, ptsTime: number, captionData: Uint8Array) => {
@@ -198,6 +204,8 @@ const Caption: React.FC<Props> = ({
           // TextDecoder は共有バッファを拒否するため、非共有バッファへコピー
           // してからデコードする。
           const xml = new TextDecoder('utf-8').decode(captionData.slice())
+          // OFF→ON 直後に再描画できるよう直近の TTML を保持する。
+          lastTtmlRef.current = xml
           renderTtml(context, canvas, xml)
         } catch (e) {
           console.error('TTML render error', e)
@@ -243,8 +251,11 @@ const Caption: React.FC<Props> = ({
 
   useEffect(() => {
     if (!wasmModule) return
+    // wasmModule ロード完了時だけでなく、再生対象(service)が変わったときも
+    // 張り直す。自動再生などで登録と再生開始が競合してもコールバックが確実に
+    // セットされるようにする(字幕トグルを OFF→ON しないと出ない事象の対策)。
     wasmModule.setCaptionCallback(captionCallback)
-  }, [wasmModule])
+  }, [wasmModule, captionCallback, service])
 
   useEffect(() => {
     if (!service) return
@@ -256,6 +267,18 @@ const Caption: React.FC<Props> = ({
     clearTimeout(renderTimeoutId)
     clearTimeout(clearTimeoutId)
   }, [service])
+
+  // 字幕表示が OFF→ON になったら、直近の TTML 字幕を即座に再描画する。TTML は
+  // 同一内容が間引かれ再送されないため、これが無いと ON にしても次に内容が
+  // 変わるまで何も表示されない。
+  useEffect(() => {
+    if (!show) return
+    if (!lastTtmlRef.current) return
+    if (!canvasRef.current) return
+    const context = canvasRef.current.getContext('2d')
+    if (!context) return
+    renderTtml(context, canvasRef.current, lastTtmlRef.current)
+  }, [show])
 
   return (
     <canvas
