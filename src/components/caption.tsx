@@ -44,13 +44,6 @@ const parsePair = (v: string | null | undefined): [number, number] => {
   return [parseFloat(nums[0]), parseFloat(nums[1])]
 }
 
-// TTML の fontSize は "横px 縦px" の2値。描画には縦(2つ目)を用いる。
-const parseFontSize = (v: string | null | undefined): number => {
-  const nums = v ? v.match(/-?\d+(?:\.\d+)?/g) : null
-  if (!nums || nums.length === 0) return 120
-  return parseFloat(nums[nums.length - 1])
-}
-
 // TTML の色は #RRGGBB または #RRGGBBAA。Canvas 用の rgba() へ変換する。
 const cssColor = (v: string | null | undefined): string | null => {
   if (!v) return null
@@ -74,14 +67,56 @@ const parseOutline = (
   }
 }
 
-type TtmlStyle = {
-  fontFamily: string
-  fontSize: number
-  color: string
-  background: string | null
-  lineHeight: number
-  outline: { color: string; width: number } | null
-  letterSpacing: number
+// <style> 1個から、定義されているプロパティだけを取り出した部分スタイル。
+// span の style 属性は複数 id の空白区切りで、これらを合成して使う。
+type TtmlStyleProps = {
+  fontFamily?: string
+  fontW?: number // fontSize の横px(セル幅)
+  fontH?: number // fontSize の縦px(セル高=描画サイズ)
+  color?: string
+  background?: string | null
+  lineHeight?: number
+  outline?: { color: string; width: number } | null
+  letterSpacing?: number
+}
+
+const parseStyleProps = (el: Element): TtmlStyleProps => {
+  const p: TtmlStyleProps = {}
+  const ff = el.getAttribute('tts:fontFamily')
+  if (ff) p.fontFamily = ff
+  const fs = el.getAttribute('tts:fontSize')
+  if (fs) {
+    const [w, h] = parsePair(fs)
+    if (h > 0) {
+      p.fontH = h
+      p.fontW = w > 0 ? w : h
+    }
+  }
+  const c = el.getAttribute('tts:color')
+  if (c) p.color = cssColor(c) || undefined
+  const bg = el.getAttribute('tts:backgroundColor')
+  if (bg) p.background = cssColor(bg)
+  const lh = el.getAttribute('tts:lineHeight')
+  if (lh) p.lineHeight = parsePx(lh)
+  const ol = el.getAttribute('tts:textOutline')
+  if (ol) p.outline = parseOutline(ol)
+  const ls = el.getAttribute('arib-tt:letter-spacing')
+  if (ls) p.letterSpacing = parsePx(ls)
+  return p
+}
+
+// span/p の style 属性(空白区切りの id リスト)を解決して合成する。
+const resolveStyle = (
+  ids: string | null,
+  table: Record<string, TtmlStyleProps>
+): TtmlStyleProps => {
+  const out: TtmlStyleProps = {}
+  if (!ids) return out
+  for (const id of ids.trim().split(/\s+/)) {
+    const s = table[id]
+    if (s) Object.assign(out, s)
+  }
+  return out
 }
 
 const renderTtml = (
@@ -96,19 +131,10 @@ const renderTtml = (
   const doc = new DOMParser().parseFromString(xml, 'application/xml')
   if (doc.getElementsByTagName('parsererror').length > 0) return
 
-  const styles: Record<string, TtmlStyle> = {}
+  const styleTable: Record<string, TtmlStyleProps> = {}
   for (const s of Array.from(doc.getElementsByTagName('style'))) {
     const id = s.getAttribute('xml:id')
-    if (!id) continue
-    styles[id] = {
-      fontFamily: s.getAttribute('tts:fontFamily') || 'sans-serif',
-      fontSize: parseFontSize(s.getAttribute('tts:fontSize')),
-      color: cssColor(s.getAttribute('tts:color')) || 'rgba(255,255,255,1)',
-      background: cssColor(s.getAttribute('tts:backgroundColor')),
-      lineHeight: parsePx(s.getAttribute('tts:lineHeight')),
-      outline: parseOutline(s.getAttribute('tts:textOutline')),
-      letterSpacing: parsePx(s.getAttribute('arib-tt:letter-spacing')),
-    }
+    if (id) styleTable[id] = parseStyleProps(s)
   }
 
   const regions: Record<
@@ -123,52 +149,71 @@ const renderTtml = (
     regions[id] = { ox, oy, ew, eh }
   }
 
-  const fallbackStyle = Object.values(styles)[0]
+  const ctxAny = ctx as CanvasRenderingContext2D & { letterSpacing?: string }
 
+  // ルビは「小さいフォントの別 <p>」で、専用 region が本文の上に配置されている。
+  // 各 <p> をその region 原点から span 単位で順に描くことで、ルビ・本文・半角
+  // 約物(横幅が縦幅より小さい fontSize)を正しく配置できる。
   for (const p of Array.from(doc.getElementsByTagName('p'))) {
     const regId = p.getAttribute('region')
     const region = regId ? regions[regId] : undefined
     if (!region) continue
 
-    let text = ''
-    let style: TtmlStyle | undefined
-    const spans = Array.from(p.getElementsByTagName('span'))
-    if (spans.length > 0) {
-      for (const span of spans) {
-        const stId = span.getAttribute('style')
-        if (stId && styles[stId]) style = styles[stId]
-        text += span.textContent || ''
+    const spanEls = Array.from(p.getElementsByTagName('span'))
+    const items: Array<{ text: string; st: TtmlStyleProps }> = []
+    if (spanEls.length > 0) {
+      for (const span of spanEls) {
+        const text = span.textContent || ''
+        if (!text) continue
+        items.push({ text, st: resolveStyle(span.getAttribute('style'), styleTable) })
       }
     } else {
-      text = p.textContent || ''
+      const text = p.textContent || ''
+      if (text) items.push({ text, st: resolveStyle(p.getAttribute('style'), styleTable) })
     }
-    if (!style) style = fallbackStyle
-    if (!text.trim() || !style) continue
+    if (items.length === 0) continue
 
-    const x = region.ox * scaleX
-    const y = region.oy * scaleY
-    const fontPx = style.fontSize * scaleY
+    const ox = region.ox * scaleX
+    const oy = region.oy * scaleY
 
-    ctx.font = `${fontPx}px "${style.fontFamily}", sans-serif`
-    ctx.textBaseline = 'top'
-    // letterSpacing は Chrome 99+ で Canvas に対応。
-    ;(ctx as CanvasRenderingContext2D & { letterSpacing?: string }).letterSpacing = `${
-      style.letterSpacing * scaleX
-    }px`
-
-    if (style.background && region.ew > 0 && region.eh > 0) {
-      ctx.fillStyle = style.background
-      ctx.fillRect(x, y, region.ew * scaleX, region.eh * scaleY)
+    // 背景(あれば region の extent 全体を塗る)
+    const bg = items.find(i => i.st.background)?.st.background
+    if (bg && region.ew > 0 && region.eh > 0) {
+      ctx.fillStyle = bg
+      ctx.fillRect(ox, oy, region.ew * scaleX, region.eh * scaleY)
     }
-    if (style.outline) {
-      ctx.lineWidth = style.outline.width * scaleY
-      ctx.strokeStyle = style.outline.color
-      ctx.lineJoin = 'round'
-      ctx.strokeText(text, x, y)
+
+    let cursorX = ox
+    for (const { text, st } of items) {
+      const fontH = st.fontH ?? 128
+      const fontW = st.fontW ?? fontH
+      const fontPx = fontH * scaleY
+      const sx = fontH > 0 ? fontW / fontH : 1
+      const family = st.fontFamily || 'sans-serif'
+
+      ctx.font = `${fontPx}px "${family}", sans-serif`
+      ctx.textBaseline = 'top'
+      ctxAny.letterSpacing = `${(st.letterSpacing ?? 0) * scaleX}px`
+
+      const drawW = ctx.measureText(text).width * sx
+
+      ctx.save()
+      ctx.translate(cursorX, oy)
+      if (sx !== 1) ctx.scale(sx, 1) // 半角約物などを横方向に圧縮
+      if (st.outline) {
+        ctx.lineWidth = st.outline.width * scaleY
+        ctx.strokeStyle = st.outline.color
+        ctx.lineJoin = 'round'
+        ctx.strokeText(text, 0, 0)
+      }
+      ctx.fillStyle = st.color || 'rgba(255,255,255,1)'
+      ctx.fillText(text, 0, 0)
+      ctx.restore()
+
+      cursorX += drawW
     }
-    ctx.fillStyle = style.color
-    ctx.fillText(text, x, y)
   }
+  ctxAny.letterSpacing = '0px'
 }
 
 // TTML の begin/end は clock-time(HH:MM:SS(.mmm))。秒に変換する。
