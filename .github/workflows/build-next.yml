@@ -1,4 +1,4 @@
-name: Wasm
+name: Next
 
 on:
   push:
@@ -12,6 +12,7 @@ on:
 
 jobs:
   build-next:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
