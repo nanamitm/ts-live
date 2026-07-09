@@ -83,6 +83,9 @@ const Page: NextPage = () => {
   const lastLocalFileRef = useRef<File | null>(null)
   const [localLoop, setLocalLoop] = useLocalStorage<boolean>('tsplayerLocalLoop', false)
   const localLoopRef = useRef<boolean>(false)
+  // ローカル再生のコンテナ種別。'auto'=先頭バイトで TS(2K)/TLV(BS4K)を自動判定、
+  // 'ts'=2K(通常TS)固定、'tlv'=BS4K(TLV/HEVC)固定。
+  const [localMode, setLocalMode] = useLocalStorage<string>('tsplayerLocalMode', 'auto')
   const [playMode, setPlayMode] = useState<string>('live')
   const [dualMonoMode, setDualMonoMode] = useLocalStorage<number>('tsplayerDualMonoMode', 0)
   const [volume, setVolume] = useLocalStorage<number>('tsplayerVolume', 1.0)
@@ -575,6 +578,23 @@ const Page: NextPage = () => {
     localLoopRef.current = !!localLoop
   }, [localLoop])
 
+  // ファイル先頭を読み、MPEG-TS(同期バイト 0x47 が 188/192 バイト間隔で並ぶ)なら
+  // 2K(TS)=false、それ以外は BS4K TLV とみなす。'auto' モードで使う。
+  const detectTlvFromHeader = async (file: File): Promise<boolean> => {
+    const buf = new Uint8Array(await file.slice(0, 192 * 24).arrayBuffer())
+    const looksTs = (start: number, stride: number) => {
+      let hit = 0
+      for (let i = 0; i < 8; i++) {
+        const pos = start + i * stride
+        if (pos < buf.length && buf[pos] === 0x47) hit++
+      }
+      return hit >= 6
+    }
+    // 188=通常TS, 192(offset4)=M2TS(4バイトタイムスタンプ付), 192(offset0)も一応
+    const isTs = looksTs(0, 188) || looksTs(4, 192) || looksTs(0, 192)
+    return !isTs
+  }
+
   const playLocalFile = (file: File) => {
     if (!wasmMod) {
       console.error('WasmModule not loaded')
@@ -599,8 +619,16 @@ const Page: NextPage = () => {
       Module.setStatsCallback(null)
     }
 
-    setTimeout(() => {
-      const useWebCodecs = !!localTlvMode && typeof VideoDecoder !== 'undefined'
+    const sleep = (msec: number) => new Promise(resolve => setTimeout(resolve, msec))
+    ;(async () => {
+      // 再生モード(TLV=BS4K / TS=2K)を確定する。auto は先頭バイトで判定。
+      const tlv =
+        localMode === 'tlv' ? true : localMode === 'ts' ? false : await detectTlvFromHeader(file)
+      console.log('local file mode', file.name, { localMode, tlv })
+      // 直前の再生停止(reset)が落ち着くまで少し待つ
+      await sleep(500)
+
+      const useWebCodecs = tlv && typeof VideoDecoder !== 'undefined'
       if (useWebCodecs) {
         startWebCodecs(Module, wcCanvasRef.current)
         setWebCodecsActive(true)
@@ -616,12 +644,11 @@ const Page: NextPage = () => {
         setWebCodecsActive(false)
         Module.reset()
       })
-      Module.setTlvMode(!!localTlvMode)
+      Module.setTlvMode(tlv)
       Module.setWebCodecsMode(useWebCodecs)
 
-      const sleep = (msec: number) => new Promise(resolve => setTimeout(resolve, msec))
       console.log('start local file', file.name, file.size)
-      ;(async () => {
+      {
         const reader = file.stream().getReader()
         let ret = await reader.read()
         while (!ret.done) {
@@ -675,10 +702,10 @@ const Page: NextPage = () => {
             playLocalFile(file)
           }
         }
-      })().catch(ex => {
-        console.log('local file read ex:', ex)
-      })
-    }, 500)
+      }
+    })().catch(ex => {
+      console.log('local file read ex:', ex)
+    })
   }
 
   useKey(
@@ -1004,15 +1031,29 @@ const Page: NextPage = () => {
                 `}
               ></Divider>
               <FormGroup>
-                <FormControlLabel
-                  control={
-                    <Checkbox
-                      checked={!!localTlvMode}
-                      onChange={ev => setLocalTlvMode(ev.target.checked)}
-                    ></Checkbox>
-                  }
-                  label="BS4K(TLV/HEVC) として再生"
-                ></FormControlLabel>
+                <FormControl
+                  fullWidth
+                  css={css`
+                    width: 100%;
+                  `}
+                >
+                  <InputLabel id="localmode-label">ローカル再生の種別</InputLabel>
+                  <Select
+                    css={css`
+                      width: 100%;
+                    `}
+                    label="ローカル再生の種別"
+                    labelId="localmode-label"
+                    value={localMode}
+                    onChange={ev => {
+                      if (typeof ev.target.value === 'string') setLocalMode(ev.target.value)
+                    }}
+                  >
+                    <MenuItem value="auto">自動判定</MenuItem>
+                    <MenuItem value="ts">2K (TS)</MenuItem>
+                    <MenuItem value="tlv">BS4K (TLV/HEVC)</MenuItem>
+                  </Select>
+                </FormControl>
                 <input
                   ref={localFileInputRef}
                   type="file"
