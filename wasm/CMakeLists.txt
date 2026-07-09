@@ -77,6 +77,9 @@ ExternalProject_Add(
   ffmpeg
   GIT_REPOSITORY https://github.com/nanamitm/FFmpeg.git
   GIT_TAG feature/fix-mmttlv-resync
+  # 初回clone後は update(git reset)を再実行しない。再コンフィグのたびにソースが
+  # reset されて mtime が変わり ffmpeg 全体が無駄に再コンパイルされるのを防ぐ。
+  UPDATE_DISCONNECTED TRUE
   BUILD_IN_SOURCE TRUE
   INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/install
   CONFIGURE_COMMAND bash -c "[ -e ${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-done ] || ${FFMPEG_CONFIGURE_COMMAND}"
@@ -85,7 +88,10 @@ ExternalProject_Add(
   # ffmpeg-wasm.patch は既に fork(feature/fix-mmttlv-resync)へ取り込み済みのため
   # 適用不要。DRCS 字幕リソース(MMT data_type=6)を字幕ストリームへ流すための
   # 追加パッチのみを当てる。
-  PATCH_COMMAND patch -p1 < ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-drcs.patch
+  # 再ビルド/フレッシュclone のどちらでも失敗しないよう冪等に当てる。fork tip が
+  # 既に同変更を含む場合は -N で適用済みとみなしスキップし(.rej も作らず)、|| true
+  # で PATCH ステップを成功扱いにする。
+  PATCH_COMMAND patch -p1 -N -r - < ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-drcs.patch || true
 )
 
 
