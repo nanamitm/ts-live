@@ -812,15 +812,27 @@ void decoderThreadFunc() {
                    captionIsTtml);
     }
 
-    // WebCodecs が使えるのは H.264/HEVC のみ。それ以外(地デジ/BS 2K の MPEG-2
-    // 等)が要求された場合はソフトデコードへフォールバックする。判定はスレッド
-    // 起動前に行うため、以降の挙動は最初から webCodecsMode=false と同じになる。
-    if (webCodecsMode && videoStream->codecpar->codec_id != AV_CODEC_ID_HEVC &&
-        videoStream->codecpar->codec_id != AV_CODEC_ID_H264) {
-      spdlog::info("WebCodecs unsupported for codec {}. fallback to software "
-                   "decode.",
-                   avcodec_get_name(videoStream->codecpar->codec_id));
-      webCodecsMode = false;
+    // WebCodecs を使うのは HEVC (BS4K/8K) と「プログレッシブの」H.264 のみ。
+    //  - MPEG-2 (地デジ/BS 2K) はブラウザの WebCodecs が非対応。
+    //  - 放送の 1080i H.264 (スカパープレミアム等) は、Chrome のハードウェア
+    //    デコーダがインターレースを受け付けず(Decoding error)、ソフトウェア
+    //    指定でもフィールド対の扱いで出力が得られない。WASM ソフトデコード
+    //    なら WebGPU の yadif デインターレースも効くため、そちらへ回す。
+    // 判定はスレッド起動前に行うため、以降の挙動は最初から
+    // webCodecsMode=false と同じになる。
+    if (webCodecsMode) {
+      bool h264Progressive =
+          videoStream->codecpar->codec_id == AV_CODEC_ID_H264 &&
+          videoStream->codecpar->field_order == AV_FIELD_PROGRESSIVE;
+      bool supported = videoStream->codecpar->codec_id == AV_CODEC_ID_HEVC ||
+                       h264Progressive;
+      if (!supported) {
+        spdlog::info("WebCodecs unsupported for codec {} field_order {}. "
+                     "fallback to software decode.",
+                     avcodec_get_name(videoStream->codecpar->codec_id),
+                     (int)videoStream->codecpar->field_order);
+        webCodecsMode = false;
+      }
     }
     // JS へ通知する映像ストリーム情報を積む(メインループが1回だけ届ける)。
     {
