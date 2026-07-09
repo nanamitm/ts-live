@@ -1,0 +1,22 @@
+diff --git a/libavformat/mmttlv.c b/libavformat/mmttlv.c
+index 800a476..ae76a6b 100644
+--- a/libavformat/mmttlv.c
++++ b/libavformat/mmttlv.c
+@@ -331,7 +331,16 @@ static int mmttlv_read_packet(AVFormatContext *s, AVPacket *pkt)
+     case HEADER_COMPRESSED_IP_PACKET:
+         return mmttlv_read_compressed_ip_packet(ctx, s, pkt, ctx->buf, size);
+     default:
+-        return AVERROR_PATCHWELCOME;
++        /* Unhandled TLV packet types (e.g. 0xFE TRANSMISSION_CONTROL / TLV-SI
++         * signalling, or bare IPv4) carry nothing needed for A/V + caption
++         * playback. The payload has already been consumed above, so just skip
++         * it instead of aborting the whole demux with AVERROR_PATCHWELCOME.
++         * Aborting per packet floods the log and, because a returned error
++         * interrupts demuxing, drops the low-rate caption (TTML) MFUs while
++         * the higher-rate, key-frame-redundant A/V survives. */
++        av_log(s, AV_LOG_DEBUG,
++               "mmttlv: skipping unhandled TLV packet type 0x%02x\n", header[1]);
++        return pkt == NULL ? 0 : FFERROR_REDO;
+     }
+ }
+ 

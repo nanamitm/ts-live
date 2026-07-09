@@ -91,7 +91,10 @@ ExternalProject_Add(
   # 再ビルド/フレッシュclone のどちらでも失敗しないよう冪等に当てる。fork tip が
   # 既に同変更を含む場合は -N で適用済みとみなしスキップし(.rej も作らず)、|| true
   # で PATCH ステップを成功扱いにする。
-  PATCH_COMMAND patch -p1 -N -r - < ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-drcs.patch || true
+  #  - drcs: 字幕リソース(DRCS/SVGフォント, data_type=6)も字幕ストリームへ流す
+  #  - skip-tlv: 未対応 TLV パケット種別(0xFE TLV-SI 等)を PATCHWELCOME で中断せず
+  #    スキップする(ログ洪水と低頻度な字幕 MFU 取りこぼしの解消)
+  PATCH_COMMAND bash -c "patch -p1 -N -r - < ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-drcs.patch || true; patch -p1 -N -r - < ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-skip-tlv.patch || true"
 )
 
 
