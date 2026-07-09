@@ -90,5 +90,7 @@ EMSCRIPTEN_BINDINGS(ts_live_module) {
   emscripten::function("setTlvMode", &setTlvMode);
   emscripten::function("setWebCodecsMode", &setWebCodecsMode);
   emscripten::function("setVideoAuCallback", &setVideoAuCallback);
+  emscripten::function("setVideoStreamInfoCallback",
+                       &setVideoStreamInfoCallback);
   emscripten::function("getAudioPlaybackTime", &getAudioPlaybackTime);
 }

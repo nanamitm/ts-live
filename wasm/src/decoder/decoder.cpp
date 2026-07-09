@@ -110,11 +110,29 @@ int64_t initPts = -1;
 
 emscripten::val captionCallback = emscripten::val::null();
 
-// WebCodecs (JS 側ハードウェア HEVC デコード) モード。true のとき映像は
-// WASM でソフトデコードせず、HEVC アクセスユニットをそのまま JS の
-// VideoDecoder へ渡す。BS4K など HEVC チャンネルで使う。
+// WebCodecs (JS 側ハードウェアデコード) モード。true のとき映像は WASM で
+// ソフトデコードせず、アクセスユニットをそのまま JS の VideoDecoder へ渡す。
+// 対応コーデックは HEVC (BS4K/8K) と H.264 (スカパープレミアム等)。probe の
+// 結果が非対応コーデック(MPEG-2 等)だった場合はソフトデコードへ自動で
+// フォールバックし、下の videoStreamInfoCallback で JS に通知する。
 bool webCodecsMode = false;
 emscripten::val videoAuCallback = emscripten::val::null();
+
+// probe 完了後に映像ストリーム情報(コーデック/解像度/profile/level/SAR と
+// WebCodecs を実際に使うか)を JS へ 1 回通知するコールバック。JS はこれを
+// 見て VideoDecoder の構成を決める。通知はメインループで AU の受け渡しより
+// 先に行うので、JS は最初の AU が届く前に必ず構成できる。
+emscripten::val videoStreamInfoCallback = emscripten::val::null();
+struct VideoStreamInfo {
+  std::string codecName;
+  int width, height;
+  int profile, level;
+  int sarNum, sarDen;
+  bool webCodecs;
+};
+VideoStreamInfo pendingVideoStreamInfo;
+std::mutex videoStreamInfoMtx;
+bool videoStreamInfoPending = false;
 
 // WebCodecs モード用の HEVC アクセスユニットキュー。デマルチプレクスは
 // 別スレッド(Worker)で動くため、VideoDecoder(メインスレッド API)を触る
@@ -138,6 +156,10 @@ void setWebCodecsMode(bool enabled) {
 
 void setVideoAuCallback(emscripten::val callback) {
   videoAuCallback = callback;
+}
+
+void setVideoStreamInfoCallback(emscripten::val callback) {
+  videoStreamInfoCallback = callback;
 }
 
 double getAudioPlaybackTime() { return currentAudioPlaybackTime; }
@@ -358,6 +380,10 @@ void resetInternal() {
   captionStream = nullptr;
   captionIsTtml = false;
   videoFrameFound = false;
+  {
+    std::lock_guard<std::mutex> lock(videoStreamInfoMtx);
+    videoStreamInfoPending = false;
+  }
 
   if (videoSwsContext != nullptr) {
     sws_freeContext(videoSwsContext);
@@ -785,6 +811,33 @@ void decoderThreadFunc() {
                    avcodec_get_name(captionStream->codecpar->codec_id),
                    captionIsTtml);
     }
+
+    // WebCodecs が使えるのは H.264/HEVC のみ。それ以外(地デジ/BS 2K の MPEG-2
+    // 等)が要求された場合はソフトデコードへフォールバックする。判定はスレッド
+    // 起動前に行うため、以降の挙動は最初から webCodecsMode=false と同じになる。
+    if (webCodecsMode && videoStream->codecpar->codec_id != AV_CODEC_ID_HEVC &&
+        videoStream->codecpar->codec_id != AV_CODEC_ID_H264) {
+      spdlog::info("WebCodecs unsupported for codec {}. fallback to software "
+                   "decode.",
+                   avcodec_get_name(videoStream->codecpar->codec_id));
+      webCodecsMode = false;
+    }
+    // JS へ通知する映像ストリーム情報を積む(メインループが1回だけ届ける)。
+    {
+      std::lock_guard<std::mutex> lock(videoStreamInfoMtx);
+      pendingVideoStreamInfo.codecName =
+          avcodec_get_name(videoStream->codecpar->codec_id);
+      pendingVideoStreamInfo.width = videoStream->codecpar->width;
+      pendingVideoStreamInfo.height = videoStream->codecpar->height;
+      pendingVideoStreamInfo.profile = videoStream->codecpar->profile;
+      pendingVideoStreamInfo.level = videoStream->codecpar->level;
+      pendingVideoStreamInfo.sarNum =
+          videoStream->codecpar->sample_aspect_ratio.num;
+      pendingVideoStreamInfo.sarDen =
+          videoStream->codecpar->sample_aspect_ratio.den;
+      pendingVideoStreamInfo.webCodecs = webCodecsMode;
+      videoStreamInfoPending = true;
+    }
   }
 
   bool videoTerminateFlag = false;
@@ -1073,8 +1126,30 @@ void decoderMainloop() {
                 videoFrameQueue.size(), audioFrameQueue.size(),
                 videoPacketQueue.size(), audioPacketQueue.size());
 
-  // WebCodecs モード: 溜まった HEVC アクセスユニットを JS の VideoDecoder へ
-  // 渡す。ここはメインスレッドなので VideoDecoder を安全に触れる。
+  // probe 済みの映像ストリーム情報を JS へ通知する(1回)。JS はこれを見て
+  // VideoDecoder を構成するため、下の AU 受け渡しより必ず先に届ける。
+  if (videoStreamInfoPending && !videoStreamInfoCallback.isNull()) {
+    VideoStreamInfo info;
+    {
+      std::lock_guard<std::mutex> lock(videoStreamInfoMtx);
+      info = pendingVideoStreamInfo;
+      videoStreamInfoPending = false;
+    }
+    auto obj = emscripten::val::object();
+    obj.set("codec", info.codecName);
+    obj.set("width", info.width);
+    obj.set("height", info.height);
+    obj.set("profile", info.profile);
+    obj.set("level", info.level);
+    obj.set("sarNum", info.sarNum);
+    obj.set("sarDen", info.sarDen);
+    obj.set("webCodecs", info.webCodecs);
+    videoStreamInfoCallback(obj);
+  }
+
+  // WebCodecs モード: 溜まったアクセスユニット(HEVC/H.264)を JS の
+  // VideoDecoder へ渡す。ここはメインスレッドなので VideoDecoder を安全に
+  // 触れる。
   if (webCodecsMode && !videoAuCallback.isNull()) {
     for (;;) {
       VideoAu au;

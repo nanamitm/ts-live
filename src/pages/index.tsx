@@ -24,7 +24,7 @@ import {
 import { VolumeMute, VolumeUp } from '@mui/icons-material'
 import { CartesianGrid, LineChart, XAxis, YAxis, Line, Legend } from 'recharts'
 import Head from 'next/head'
-import { WasmModule, StatsData } from '../lib/wasmmodule'
+import { WasmModule, StatsData, VideoStreamInfo } from '../lib/wasmmodule'
 import dayjs from 'dayjs'
 
 import { Program, Service } from 'mirakurun/api'
@@ -113,13 +113,73 @@ const Page: NextPage = () => {
   const wcCanvasRef = useRef<HTMLCanvasElement>(null)
   const webCodecsCtrlRef = useRef<{ stop: () => void } | null>(null)
 
-  // BS4K 用: JS の VideoDecoder(ハードウェア HEVC)で映像をデコードし、WASM が
-  // 保持する音声クロックに同期して canvas へ描画する。
+  // WebCodecs 用: JS の VideoDecoder(ハードウェアデコード)で映像をデコードし、
+  // WASM が保持する音声クロックに同期して canvas へ描画する。対象コーデックは
+  // HEVC (BS4K/8K) と H.264 (スカパープレミアム等)。構成は WASM の probe が
+  // 通知してくるストリーム情報(info)から決める。
+  const buildWebCodecsConfig = (
+    info: VideoStreamInfo
+  ): VideoDecoderConfig | null => {
+    if (info.codec === 'hevc') {
+      // BS4K 実績のある Main10 L5.1 固定(プロファイル情報が取れないファイルが
+      // あるため info からは組み立てない)
+      const config: VideoDecoderConfig = {
+        codec: 'hev1.2.4.L153.90',
+        optimizeForLatency: true,
+      }
+      if (info.width > 0 && info.height > 0) {
+        config.codedWidth = info.width
+        config.codedHeight = info.height
+      }
+      return config
+    }
+    if (info.codec === 'h264') {
+      // Annex-B (description なし)。codec 文字列は profile/level から生成し、
+      // 不明時は High@L4.0 にフォールバックする。
+      const profile = info.profile > 0 ? info.profile : 100
+      const level = info.level > 0 ? info.level : 40
+      const prefix =
+        profile === 66
+          ? '42C0'
+          : profile === 77
+          ? '4D40'
+          : profile === 100
+          ? '6400'
+          : profile.toString(16).padStart(2, '0').toUpperCase() + '00'
+      const config: VideoDecoderConfig = {
+        codec: `avc1.${prefix}${level.toString(16).padStart(2, '0').toUpperCase()}`,
+        optimizeForLatency: true,
+      }
+      if (info.width > 0 && info.height > 0) {
+        config.codedWidth = info.width
+        config.codedHeight = info.height
+      }
+      return config
+    }
+    return null
+  }
+
   const startWebCodecs = (
     Module: WasmModule,
-    canvas: HTMLCanvasElement | null
+    canvas: HTMLCanvasElement | null,
+    info: VideoStreamInfo
   ) => {
     if (!canvas) return
+    const config = buildWebCodecsConfig(info)
+    if (!config) {
+      console.error('WebCodecs: unsupported codec', info.codec)
+      return
+    }
+    // canvas を表示解像度に合わせる。1440x1080 (SAR 4:3) のような非正方画素は
+    // 横方向へ引き伸ばして描画する(drawImage が canvas サイズへスケール)。
+    const width = info.width > 0 ? info.width : info.codec === 'hevc' ? 3840 : 1920
+    const height = info.height > 0 ? info.height : info.codec === 'hevc' ? 2160 : 1080
+    const displayWidth =
+      info.sarNum > 0 && info.sarDen > 0
+        ? Math.round((width * info.sarNum) / info.sarDen)
+        : width
+    canvas.width = displayWidth
+    canvas.height = height
     const ctx2d = canvas.getContext('2d')
     if (!ctx2d) return
 
@@ -128,6 +188,7 @@ const Page: NextPage = () => {
     let gotKey = false
     let stopped = false
     let rafId = 0
+    let droppedBeforeKey = 0
 
     const decoder = new VideoDecoder({
       output: (frame: VideoFrame) => {
@@ -145,18 +206,25 @@ const Page: NextPage = () => {
         console.error('WebCodecs VideoDecoder error:', e.message)
       },
     })
-    decoder.configure({
-      codec: 'hev1.2.4.L153.90',
-      codedWidth: 3840,
-      codedHeight: 2160,
-      optimizeForLatency: true,
-    })
+    console.log('WebCodecs configure:', config, 'display:', displayWidth, height)
+    decoder.configure(config)
 
-    // WASM から呼ばれる: HEVC アクセスユニット 1 個を VideoDecoder へ投入。
+    // WASM から呼ばれる: アクセスユニット 1 個を VideoDecoder へ投入。
     Module.setVideoAuCallback((data: Uint8Array, ptsSec: number, isKey: boolean) => {
       if (stopped) return
       if (!gotKey) {
-        if (!isKey) return // 最初のキーフレームが来るまで delta は捨てる
+        if (!isKey) {
+          // 最初のキーフレームが来るまで delta は捨てる。長時間キーが来ない
+          // 場合はキー判定(AV_PKT_FLAG_KEY)がストリームと合っていない可能性が
+          // 高いので診断用に警告する。
+          droppedBeforeKey++
+          if (droppedBeforeKey === 300) {
+            console.warn(
+              'WebCodecs: no key frame in first 300 AUs — key detection may be failing for this stream'
+            )
+          }
+          return
+        }
         gotKey = true
       }
       // data は WASM ヒープ上のビューなのでコピーしてから渡す
@@ -494,16 +562,29 @@ const Page: NextPage = () => {
       // 再生スタート
       if (playMode === 'live') {
         const ac = new AbortController()
-        const isBS4K = (activeService.channel?.type as string) === 'BS4K'
-        // BS4K は WebCodecs (ハードウェア HEVC デコード) 経路を使う。
-        const useWebCodecs = isBS4K && typeof VideoDecoder !== 'undefined'
-        if (useWebCodecs) {
-          startWebCodecs(Module, wcCanvasRef.current)
-          setWebCodecsActive(true)
+        const channelType = activeService.channel?.type as string
+        const isBS4K = channelType === 'BS4K'
+        // WebCodecs (ハードウェアデコード) を試みる対象: BS4K (HEVC) と
+        // SKY=スカパープレミアム (H.264)。実際に使うかは WASM が probe 後に
+        // コーデックを見て決め、videoStreamInfo で通知してくる(非対応コーデック
+        // は WASM ソフトデコードへ自動フォールバック)。
+        const wantWebCodecs =
+          (isBS4K || channelType === 'SKY') && typeof VideoDecoder !== 'undefined'
+        if (wantWebCodecs) {
+          Module.setVideoStreamInfoCallback((info: VideoStreamInfo) => {
+            console.log('videoStreamInfo:', info)
+            if (info.webCodecs) {
+              startWebCodecs(Module, wcCanvasRef.current, info)
+              setWebCodecsActive(true)
+            }
+          })
+        } else {
+          Module.setVideoStreamInfoCallback(null as any)
         }
         setStopFunc(() => () => {
           console.log('abort fetch')
           ac.abort()
+          Module.setVideoStreamInfoCallback(null as any)
           if (webCodecsCtrlRef.current) {
             webCodecsCtrlRef.current.stop()
             webCodecsCtrlRef.current = null
@@ -513,7 +594,7 @@ const Page: NextPage = () => {
           console.log('abort fetch done.')
         })
         Module.setTlvMode(isBS4K)
-        Module.setWebCodecsMode(useWebCodecs)
+        Module.setWebCodecsMode(wantWebCodecs)
         const url = `${mirakurunServer}/api/services/${activeService.id}/stream?decode=1`
         console.log('start fetch', url, Module)
         // NOTE: カスタムヘッダーを付けると CORS preflight が必須になり、HTTPS(公開)
@@ -563,6 +644,11 @@ const Page: NextPage = () => {
         setStopFunc(() => () => {
           Module.reset()
         })
+        // 直前の再生のモードが残らないよう明示的にリセットする(EPGStation の
+        // 録画は 2K TS 前提で WASM ソフトデコード)。
+        Module.setVideoStreamInfoCallback(null as any)
+        Module.setTlvMode(false)
+        Module.setWebCodecsMode(false)
         const url = `${epgStationServer}/api/videos/${activeRecordedFileId}`
         Module.playFile(url)
       }
@@ -636,15 +722,26 @@ const Page: NextPage = () => {
       // 直前の再生停止(reset)が落ち着くまで少し待つ
       await sleep(500)
 
-      const useWebCodecs = tlv && typeof VideoDecoder !== 'undefined'
-      if (useWebCodecs) {
-        startWebCodecs(Module, wcCanvasRef.current)
-        setWebCodecsActive(true)
+      // ローカルファイルは常に WebCodecs を試みる。実際に使うかは WASM が
+      // probe 後にコーデックで決める(HEVC/H.264 なら WebCodecs、MPEG-2 等は
+      // WASM ソフトデコードへ自動フォールバック)。
+      const wantWebCodecs = typeof VideoDecoder !== 'undefined'
+      if (wantWebCodecs) {
+        Module.setVideoStreamInfoCallback((info: VideoStreamInfo) => {
+          console.log('videoStreamInfo:', info)
+          if (info.webCodecs) {
+            startWebCodecs(Module, wcCanvasRef.current, info)
+            setWebCodecsActive(true)
+          }
+        })
+      } else {
+        Module.setVideoStreamInfoCallback(null as any)
       }
       let aborted = false
       setStopFunc(() => () => {
         console.log('abort local file')
         aborted = true
+        Module.setVideoStreamInfoCallback(null as any)
         if (webCodecsCtrlRef.current) {
           webCodecsCtrlRef.current.stop()
           webCodecsCtrlRef.current = null
@@ -653,7 +750,7 @@ const Page: NextPage = () => {
         Module.reset()
       })
       Module.setTlvMode(tlv)
-      Module.setWebCodecsMode(useWebCodecs)
+      Module.setWebCodecsMode(wantWebCodecs)
 
       console.log('start local file', file.name, file.size)
       {

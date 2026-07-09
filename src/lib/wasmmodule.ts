@@ -6,6 +6,19 @@ export declare interface StatsData {
   InputBufferSize: number
 }
 
+// probe 後に WASM から通知される映像ストリーム情報。webCodecs は「実際に
+// WebCodecs 経路を使うか」(非対応コーデックはソフトデコードへフォールバック)。
+export declare interface VideoStreamInfo {
+  codec: string
+  width: number
+  height: number
+  profile: number
+  level: number
+  sarNum: number
+  sarDen: number
+  webCodecs: boolean
+}
+
 export declare interface WasmModule extends EmscriptenModule {
   getExceptionMsg(ex: number): string
   setLogLevelDebug(): void
@@ -27,6 +40,9 @@ export declare interface WasmModule extends EmscriptenModule {
   setWebCodecsMode(enabled: boolean): void
   setVideoAuCallback(
     callback: ((data: Uint8Array, ptsSec: number, isKey: boolean) => void) | null
+  ): void
+  setVideoStreamInfoCallback(
+    callback: ((info: VideoStreamInfo) => void) | null
   ): void
   getAudioPlaybackTime(): number
 }
