@@ -65,6 +65,11 @@ set(FFMPEG_CONFIGURE_COMMAND_LIST
     --enable-parser=aac_latm
     --enable-parser=mpegvideo
     --enable-parser=hevc
+    # H.264 (スカパープレミアム等の 2K TS)。デコーダは WebCodecs (JS 側 HW
+    # デコード) を使うため不要だが、パーサが無いと mpegts からのアクセス
+    # ユニット組み立て・キーフレーム判定・SPS 由来の解像度/profile 取得が
+    # できず再生できない。
+    --enable-parser=h264
     --disable-bsfs
     --disable-protocols
     --disable-devices
