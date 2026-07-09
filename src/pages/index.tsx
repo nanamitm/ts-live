@@ -189,8 +189,10 @@ const Page: NextPage = () => {
     let stopped = false
     let rafId = 0
     let droppedBeforeKey = 0
+    let triedSoftware = false
+    let decoder: VideoDecoder
 
-    const decoder = new VideoDecoder({
+    const decoderInit: VideoDecoderInit = {
       output: (frame: VideoFrame) => {
         if (stopped) {
           frame.close()
@@ -204,8 +206,30 @@ const Page: NextPage = () => {
       },
       error: (e: DOMException) => {
         console.error('WebCodecs VideoDecoder error:', e.message)
+        // 放送の 1080i H.264 など、ハードウェアデコーダが受け付けない
+        // ストリームは Decoding error になる(WebCodecs は自動フォールバック
+        // しない)。一度だけソフトウェアデコード指定で作り直し、次のキー
+        // フレームから再開する。
+        if (!stopped && !triedSoftware) {
+          triedSoftware = true
+          console.warn(
+            'WebCodecs: retrying with hardwareAcceleration=prefer-software'
+          )
+          try {
+            decoder.close()
+          } catch (err) {}
+          decoder = new VideoDecoder(decoderInit)
+          decoder.configure({
+            ...config,
+            hardwareAcceleration: 'prefer-software',
+          })
+          gotKey = false
+          for (const f of frameQueue) f.frame.close()
+          frameQueue = []
+        }
       },
-    })
+    }
+    decoder = new VideoDecoder(decoderInit)
     console.log('WebCodecs configure:', config, 'display:', displayWidth, height)
     decoder.configure(config)
 
@@ -270,6 +294,17 @@ const Page: NextPage = () => {
       const target = frameQueue[showIdx]
       // showIdx より前(古い)のフレームは閉じて捨てる
       for (let i = 0; i < showIdx; i++) frameQueue[i].frame.close()
+      // SAR(非正方画素)はデコード済み VideoFrame の displayWidth/Height に
+      // 反映される(SPS 由来)。probe の codecpar で SAR が取れないストリームが
+      // あるため、実フレームの表示解像度に canvas を合わせる
+      // (例: 1440x1080 SAR4:3 → 1920x1080)。
+      const dw = target.frame.displayWidth
+      const dh = target.frame.displayHeight
+      if (dw > 0 && dh > 0 && (canvas.width !== dw || canvas.height !== dh)) {
+        console.log('WebCodecs canvas resize:', dw, dh)
+        canvas.width = dw
+        canvas.height = dh
+      }
       ctx2d.drawImage(target.frame, 0, 0, canvas.width, canvas.height)
       target.frame.close()
       frameQueue = frameQueue.slice(showIdx + 1)
