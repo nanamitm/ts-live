@@ -103,6 +103,9 @@ const Page: NextPage = () => {
   ])
   const [showCharts, setShowCharts] = useState<boolean>(false)
   const [showCaption, setShowCaption] = useLocalStorage<boolean>('tsplayerShowCaption', false)
+  // 再生を切り替えるたびに加算し、Caption に字幕クリアを促すトークン。ローカル
+  // ファイル切替のように service が変わらないケースで前ファイルの字幕を消す。
+  const [captionResetToken, setCaptionResetToken] = useState<number>(0)
 
   const videoCanvasRef = useRef<HTMLCanvasElement>(null)
   const captionCanvasRef = useRef<HTMLCanvasElement>(null)
@@ -466,6 +469,9 @@ const Page: NextPage = () => {
     const Module = wasmMod
     // 現在の再生中を止める（or 何もしない）
     stopFunc()
+    // 再生開始のたびに前の字幕を消す(同一 service の再選択や EPGStation ファイル
+    // 切替では service が変わらないため、token で明示的にクリアする)
+    setCaptionResetToken(t => t + 1)
 
     // 視聴中のスリープを避ける
     if (!wakeLock) {
@@ -606,6 +612,8 @@ const Page: NextPage = () => {
     setPlayMode('localfile')
     // 現在の再生を止める
     stopFunc()
+    // 前ファイルの字幕を消す(service が変わらないので token で明示的にクリア)
+    setCaptionResetToken(t => t + 1)
     setDrawer(false)
 
     // 視聴中のスリープを避ける
@@ -1202,6 +1210,7 @@ const Page: NextPage = () => {
             width={1920}
             height={1080}
             show={showCaption}
+            resetToken={captionResetToken}
           ></Caption>
         </div>
         <div

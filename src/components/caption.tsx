@@ -21,6 +21,9 @@ type Props = {
   // 字幕表示ON/OFF。TTML は同一内容が間引かれ再送されないため、OFF→ON した
   // 瞬間に直近の字幕を再描画するのに使う。
   show?: boolean
+  // 再生を切り替えるたびに親が加算するトークン。service が変わらない
+  // ローカルファイルの切替でも字幕(canvas と同期状態)をクリアするのに使う。
+  resetToken?: number
 }
 
 // --- ARIB-TTML (4K/8K MMT 字幕) レンダラ -----------------------------------
@@ -323,7 +326,8 @@ const Caption: React.FC<Props> = ({
   width,
   height,
   service,
-  show
+  show,
+  resetToken
 }) => {
   // const canvasRef = useRef<HTMLCanvasElement>(null)
   // const [currentSubtitle, setCurrentSubtitle] = useState<number>()
@@ -492,7 +496,9 @@ const Caption: React.FC<Props> = ({
   useEffect(() => {
     // captionCallback(deps 空)から参照する現在 service を常に最新へ。
     serviceRef.current = service
-    if (!service) return
+    // 番組切替(service 変化)に加え、resetToken 変化(ローカルファイル切替など
+    // service が変わらない再生の開始)でも字幕をクリアする。service 未定義でも
+    // クリアが必要なので早期 return しない。
     if (!canvasRef.current) return
     const canvas = canvasRef.current
     const context = canvas.getContext('2d')
@@ -500,8 +506,8 @@ const Caption: React.FC<Props> = ({
     context.clearRect(0, 0, canvas.width, canvas.height)
     clearTimeout(renderTimeoutId)
     clearTimeout(clearTimeoutId)
-    // TTML 同期状態も番組切替でリセットする。直近 TTML キャッシュも破棄し、
-    // 切替後に OFF→ON しても前番組(4K)の字幕が復活しないようにする。
+    // TTML 同期状態もリセットする。直近 TTML キャッシュも破棄し、切替後に
+    // OFF→ON しても前番組(4K)の字幕が復活しないようにする。
     for (const t of ttmlTimersRef.current) clearTimeout(t)
     ttmlTimersRef.current = []
     ttmlOffsetRef.current = null
@@ -509,7 +515,7 @@ const Caption: React.FC<Props> = ({
     ttmlShownIdRef.current = -1
     lastTtmlRef.current = null
     glyphMapRef.current.clear()
-  }, [service])
+  }, [service, resetToken])
 
   // 字幕表示が OFF→ON になったら、直近の TTML 字幕を即座に再描画する。TTML は
   // 同一内容が間引かれ再送されないため、これが無いと ON にしても次に内容が
