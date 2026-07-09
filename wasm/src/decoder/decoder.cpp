@@ -421,8 +421,8 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
     }
     videoCodecContext->thread_count = threadCount;
     videoCodecContext->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-    spdlog::info("video decoder thread_count={} (logical cores={})", threadCount,
-                 cores);
+    spdlog::info("video decoder thread_count={} (logical cores={})",
+                 threadCount, cores);
   }
   // BS4K (HEVC 4K) のソフトウェアデコードはリアルタイム余裕が薄く、少しの
   // 遅延でフレームバッファが枯渇して映像/音声が途切れる。デコード時間の
@@ -567,10 +567,10 @@ void videoConvertThreadFunc(bool &terminateFlag) {
         if (videoSwsContext != nullptr) {
           sws_freeContext(videoSwsContext);
         }
-        videoSwsContext = sws_getContext(
-            raw->width, raw->height, (AVPixelFormat)raw->format, raw->width,
-            raw->height, AV_PIX_FMT_YUV420P, SWS_POINT, nullptr, nullptr,
-            nullptr);
+        videoSwsContext =
+            sws_getContext(raw->width, raw->height, (AVPixelFormat)raw->format,
+                           raw->width, raw->height, AV_PIX_FMT_YUV420P,
+                           SWS_POINT, nullptr, nullptr, nullptr);
         videoSwsSrcFormat = (AVPixelFormat)raw->format;
         videoSwsWidth = raw->width;
         videoSwsHeight = raw->height;
@@ -747,12 +747,11 @@ void decoderThreadFunc() {
               AVMEDIA_TYPE_SUBTITLE &&
           (formatContext->streams[i]->codecpar->codec_id ==
                AV_CODEC_ID_ARIB_CAPTION ||
-           formatContext->streams[i]->codecpar->codec_id ==
-               AV_CODEC_ID_TTML) &&
+           formatContext->streams[i]->codecpar->codec_id == AV_CODEC_ID_TTML) &&
           captionStream == nullptr) {
         captionStream = formatContext->streams[i];
-        captionIsTtml = formatContext->streams[i]->codecpar->codec_id ==
-                        AV_CODEC_ID_TTML;
+        captionIsTtml =
+            formatContext->streams[i]->codecpar->codec_id == AV_CODEC_ID_TTML;
       }
     }
     if (videoStream == nullptr) {
@@ -876,7 +875,8 @@ void decoderThreadFunc() {
     }
     // [解][字] など複数の字幕アセットを持つ放送では、開始時のストリーム走査で
     // 最初に見つかる字幕ストリームが実データを運ばず(後から別の字幕ストリームが
-    // 出現しそちらに字幕が流れる)、固定選択だと字幕が出ない。到着パケットの codec
+    // 出現しそちらに字幕が流れる)、固定選択だと字幕が出ない。到着パケットの
+    // codec
     // で字幕を判定し、実際に届いたストリームを字幕として扱う(必要なら乗り換える)。
     AVStream *pktCapStream = formatContext->streams[ppacket->stream_index];
     bool pktIsCaption =
@@ -888,8 +888,7 @@ void decoderThreadFunc() {
       if (captionStream != pktCapStream) {
         captionStream = pktCapStream;
         captionIsTtml = pktIsTtml;
-        spdlog::info("Caption stream -> index:{} codec:{}",
-                     pktCapStream->index,
+        spdlog::info("Caption stream -> index:{} codec:{}", pktCapStream->index,
                      avcodec_get_name(pktCapStream->codecpar->codec_id));
       }
       if (pktIsTtml) {
@@ -1274,8 +1273,8 @@ void decoderMainloop() {
           swr_free(&swr);
         }
         AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
-        swr_alloc_set_opts2(&swr,              // we're allocating a new context
-                            &outLayout,         // out_ch_layout (downmix to stereo)
+        swr_alloc_set_opts2(&swr,       // we're allocating a new context
+                            &outLayout, // out_ch_layout (downmix to stereo)
                             AV_SAMPLE_FMT_FLTP, // out_sample_fmt
                             48000,              // out_sample_rate
                             &frame->ch_layout,  // in_ch_layout
