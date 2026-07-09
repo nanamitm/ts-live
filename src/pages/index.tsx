@@ -83,6 +83,9 @@ const Page: NextPage = () => {
   const lastLocalFileRef = useRef<File | null>(null)
   const [localLoop, setLocalLoop] = useLocalStorage<boolean>('tsplayerLocalLoop', false)
   const localLoopRef = useRef<boolean>(false)
+  // WebCodecs で再生不能だったとき true にして WASM ソフトデコードで再生し直す
+  // (ループ/最初から再生でも維持)。新しいファイルを開いたらリセットする。
+  const localForceSoftwareRef = useRef<boolean>(false)
   // ローカル再生のコンテナ種別。'auto'=先頭バイトで TS(2K)/TLV(BS4K)を自動判定、
   // 'ts'=2K(通常TS)固定、'tlv'=BS4K(TLV/HEVC)固定。
   const [localMode, setLocalMode] = useLocalStorage<string>('tsplayerLocalMode', 'auto')
@@ -136,6 +139,9 @@ const Page: NextPage = () => {
     if (info.codec === 'h264') {
       // Annex-B (description なし)。codec 文字列は profile/level から生成し、
       // 不明時は High@L4.0 にフォールバックする。
+      // NOTE: optimizeForLatency は付けない。Chrome はこれで FFmpeg デコーダを
+      // low-delay にするが、B フレームを含む放送 H.264 では最初の I ピクチャの
+      // 直後に Decoding error になる。
       const profile = info.profile > 0 ? info.profile : 100
       const level = info.level > 0 ? info.level : 40
       const prefix =
@@ -148,7 +154,6 @@ const Page: NextPage = () => {
           : profile.toString(16).padStart(2, '0').toUpperCase() + '00'
       const config: VideoDecoderConfig = {
         codec: `avc1.${prefix}${level.toString(16).padStart(2, '0').toUpperCase()}`,
-        optimizeForLatency: true,
       }
       if (info.width > 0 && info.height > 0) {
         config.codedWidth = info.width
@@ -162,7 +167,10 @@ const Page: NextPage = () => {
   const startWebCodecs = (
     Module: WasmModule,
     canvas: HTMLCanvasElement | null,
-    info: VideoStreamInfo
+    info: VideoStreamInfo,
+    // WebCodecs で再生不能(HW/SW とも Decoding error)なとき呼ばれる。呼び出し
+    // 側はこれを受けて WASM ソフトデコードで再生し直すなどの回復を行う。
+    onFatal?: () => void
   ) => {
     if (!canvas) return
     const config = buildWebCodecsConfig(info)
@@ -190,6 +198,7 @@ const Page: NextPage = () => {
     let rafId = 0
     let droppedBeforeKey = 0
     let triedSoftware = false
+    let fatalCalled = false
     let decoder: VideoDecoder
 
     const decoderInit: VideoDecoderInit = {
@@ -206,11 +215,13 @@ const Page: NextPage = () => {
       },
       error: (e: DOMException) => {
         console.error('WebCodecs VideoDecoder error:', e.message)
+        if (stopped) return
         // 放送の 1080i H.264 など、ハードウェアデコーダが受け付けない
         // ストリームは Decoding error になる(WebCodecs は自動フォールバック
         // しない)。一度だけソフトウェアデコード指定で作り直し、次のキー
-        // フレームから再開する。
-        if (!stopped && !triedSoftware) {
+        // フレームから再開する。それでも失敗する場合は onFatal に委ねる
+        // (WASM ソフトデコードでの再生し直し)。
+        if (!triedSoftware) {
           triedSoftware = true
           console.warn(
             'WebCodecs: retrying with hardwareAcceleration=prefer-software'
@@ -226,6 +237,12 @@ const Page: NextPage = () => {
           gotKey = false
           for (const f of frameQueue) f.frame.close()
           frameQueue = []
+        } else if (onFatal && !fatalCalled) {
+          fatalCalled = true
+          console.warn(
+            'WebCodecs: giving up — falling back to WASM software decode'
+          )
+          onFatal()
         }
       },
     }
@@ -234,8 +251,11 @@ const Page: NextPage = () => {
     decoder.configure(config)
 
     // WASM から呼ばれる: アクセスユニット 1 個を VideoDecoder へ投入。
+    let lastTsUs = 0
     Module.setVideoAuCallback((data: Uint8Array, ptsSec: number, isKey: boolean) => {
       if (stopped) return
+      // エラー後(closed)は捨てる。リトライ中の decode() 例外スパムを防ぐ。
+      if (decoder.state !== 'configured') return
       if (!gotKey) {
         if (!isKey) {
           // 最初のキーフレームが来るまで delta は捨てる。長時間キーが来ない
@@ -251,13 +271,19 @@ const Page: NextPage = () => {
         }
         gotKey = true
       }
+      // PTS の無い AU(インターレースの第2フィールド等)は 0 に潰さず直前の
+      // タイムスタンプから外挿する。同一 timestamp のチャンク連発は Chrome の
+      // デコーダの出力照合を壊し Decoding error の原因になる。
+      const tsUs =
+        ptsSec >= 0 ? Math.round(ptsSec * 1e6) : lastTsUs + 16683 // +1/59.94s
+      lastTsUs = tsUs
       // data は WASM ヒープ上のビューなのでコピーしてから渡す
       const buf = new Uint8Array(data)
       try {
         decoder.decode(
           new EncodedVideoChunk({
             type: isKey ? 'key' : 'delta',
-            timestamp: Math.max(0, Math.round(ptsSec * 1e6)),
+            timestamp: tsUs,
             data: buf,
           })
         )
@@ -759,13 +785,18 @@ const Page: NextPage = () => {
 
       // ローカルファイルは常に WebCodecs を試みる。実際に使うかは WASM が
       // probe 後にコーデックで決める(HEVC/H.264 なら WebCodecs、MPEG-2 等は
-      // WASM ソフトデコードへ自動フォールバック)。
-      const wantWebCodecs = typeof VideoDecoder !== 'undefined'
+      // WASM ソフトデコードへ自動フォールバック)。WebCodecs がデコードエラーで
+      // 全滅した場合は forceSoftware を立てて WASM ソフトデコードで再生し直す。
+      const wantWebCodecs =
+        typeof VideoDecoder !== 'undefined' && !localForceSoftwareRef.current
       if (wantWebCodecs) {
         Module.setVideoStreamInfoCallback((info: VideoStreamInfo) => {
           console.log('videoStreamInfo:', info)
           if (info.webCodecs) {
-            startWebCodecs(Module, wcCanvasRef.current, info)
+            startWebCodecs(Module, wcCanvasRef.current, info, () => {
+              localForceSoftwareRef.current = true
+              playLocalFile(file)
+            })
             setWebCodecsActive(true)
           }
         })
@@ -1203,7 +1234,11 @@ const Page: NextPage = () => {
                   hidden
                   onChange={ev => {
                     const file = ev.target.files?.[0]
-                    if (file) playLocalFile(file)
+                    if (file) {
+                      // 新しいファイルではまず WebCodecs から試し直す
+                      localForceSoftwareRef.current = false
+                      playLocalFile(file)
+                    }
                     // 同じファイルを再選択しても onChange が発火するようクリア
                     ev.target.value = ''
                   }}

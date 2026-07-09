@@ -54,6 +54,10 @@ set(FFMPEG_CONFIGURE_COMMAND_LIST
     --enable-decoder=aac_latm
     --enable-decoder=mpeg2video
     --enable-decoder=hevc
+    # H.264 ソフトデコード(スカパープレミアム等の 2K TS)。基本は WebCodecs で
+    # ハードウェアデコードするが、放送の 1080i など WebCodecs が受け付けない
+    # ストリームの最終フォールバックとして使う(yadif デインターレースも効く)。
+    --enable-decoder=h264
     --enable-swscale
     --disable-hwaccels
     --disable-muxers
