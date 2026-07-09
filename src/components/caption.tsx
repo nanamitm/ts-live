@@ -347,6 +347,9 @@ const Caption: React.FC<Props> = ({
   // DRCS(外字)グリフ表: コードポイント→SVGパス。字幕リソース(SVGフォント)を
   // 受信するたびに登録し、service 切替でクリアする。
   const glyphMapRef = useRef<Map<number, DrcsGlyph>>(new Map())
+  // 現在の service を captionCallback(deps 空)から参照するための ref。4K→2K
+  // 切替後に遅れて届く 4K(TTML)字幕を破棄する判定に使う。
+  const serviceRef = useRef<Service | undefined>(undefined)
 
   const captionCallback = useCallback(
     (pts: number, ptsTime: number, captionData: Uint8Array) => {
@@ -358,6 +361,13 @@ const Caption: React.FC<Props> = ({
       // 4K/8K MMT 字幕(TTML)は UTF-8 XML なので先頭が '<'(0x3C)。2K の B24 は
       // 該当しないため、先頭バイトで判別して TTML は専用レンダラで描画する。
       if (captionData.length > 0 && captionData[0] === 0x3c) {
+        // 4K→2K 切替直後に WASM キューから遅れて届く 4K(TTML)字幕を破棄する。
+        // service が非 BS4K(=2K 等)のときは TTML を描かない。service 未定義
+        // (ローカルファイル再生のデバッグ)のときは従来どおり描画する。
+        const svc = serviceRef.current
+        if (svc && (svc.channel?.type as string) !== 'BS4K') {
+          return
+        }
         try {
           // captionData は WASM の共有メモリ(SharedArrayBuffer)上のビューで、
           // TextDecoder は共有バッファを拒否するため、非共有バッファへコピー
@@ -480,6 +490,8 @@ const Caption: React.FC<Props> = ({
   }, [wasmModule, captionCallback, service])
 
   useEffect(() => {
+    // captionCallback(deps 空)から参照する現在 service を常に最新へ。
+    serviceRef.current = service
     if (!service) return
     if (!canvasRef.current) return
     const canvas = canvasRef.current
@@ -488,12 +500,14 @@ const Caption: React.FC<Props> = ({
     context.clearRect(0, 0, canvas.width, canvas.height)
     clearTimeout(renderTimeoutId)
     clearTimeout(clearTimeoutId)
-    // TTML 同期状態も番組切替でリセットする。
+    // TTML 同期状態も番組切替でリセットする。直近 TTML キャッシュも破棄し、
+    // 切替後に OFF→ON しても前番組(4K)の字幕が復活しないようにする。
     for (const t of ttmlTimersRef.current) clearTimeout(t)
     ttmlTimersRef.current = []
     ttmlOffsetRef.current = null
     ttmlLastBeginRef.current = -1
     ttmlShownIdRef.current = -1
+    lastTtmlRef.current = null
     glyphMapRef.current.clear()
   }, [service])
 
