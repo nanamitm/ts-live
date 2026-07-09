@@ -874,9 +874,25 @@ void decoderThreadFunc() {
         audioPacketCv.notify_all();
       }
     }
-    if (captionStream != nullptr &&
-        ppacket->stream_index == captionStream->index) {
-      if (captionIsTtml) {
+    // [解][字] など複数の字幕アセットを持つ放送では、開始時のストリーム走査で
+    // 最初に見つかる字幕ストリームが実データを運ばず(後から別の字幕ストリームが
+    // 出現しそちらに字幕が流れる)、固定選択だと字幕が出ない。到着パケットの codec
+    // で字幕を判定し、実際に届いたストリームを字幕として扱う(必要なら乗り換える)。
+    AVStream *pktCapStream = formatContext->streams[ppacket->stream_index];
+    bool pktIsCaption =
+        pktCapStream->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE &&
+        (pktCapStream->codecpar->codec_id == AV_CODEC_ID_ARIB_CAPTION ||
+         pktCapStream->codecpar->codec_id == AV_CODEC_ID_TTML);
+    if (pktIsCaption) {
+      bool pktIsTtml = pktCapStream->codecpar->codec_id == AV_CODEC_ID_TTML;
+      if (captionStream != pktCapStream) {
+        captionStream = pktCapStream;
+        captionIsTtml = pktIsTtml;
+        spdlog::info("Caption stream -> index:{} codec:{}",
+                     pktCapStream->index,
+                     avcodec_get_name(pktCapStream->codecpar->codec_id));
+      }
+      if (pktIsTtml) {
         // 4K/8K の ARIB-TTML 字幕。PTS を持たない(AV_NOPTS_VALUE)ため 0 を
         // 積み、表示タイミングは当面 JS 側で到着時に描画する(精密な
         // begin/end 同期は後段で対応)。放送は同一 TTML を繰り返し送るので
