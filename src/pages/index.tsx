@@ -790,7 +790,9 @@ const Page: NextPage = () => {
         anchor="left"
         open={drawer}
         onClose={() => {
-          if (mirakurunOk) {
+          // Mirakurun 接続時に加え、ローカルファイル再生中も背景クリック/Escape で
+          // 閉じられるようにする(未接続だと閉じられず操作不能になる不具合の対策)。
+          if (mirakurunOk || localFileName) {
             setTouched(true)
             setDrawer(false)
           }
