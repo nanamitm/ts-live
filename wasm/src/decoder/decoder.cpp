@@ -183,7 +183,10 @@ emscripten::val getNextInputBuffer(size_t nextSize) {
     inputBufferWriteIndex = remainSize;
   }
   if (inputBufferWriteIndex + nextSize >= MAX_INPUT_BUFFER) {
-    spdlog::error("Buffer overflow");
+    // 入力リングバッファが満杯。JS 側へ null を返して投入を待たせるための
+    // 正常なバックプレッシャであり(特にローカルファイル再生では常時満杯に
+    // なりやすい)、エラーではないので debug レベルで記録する。
+    spdlog::debug("input buffer full (backpressure)");
     return emscripten::val::null();
   }
   auto retVal = emscripten::val(emscripten::typed_memory_view<uint8_t>(
