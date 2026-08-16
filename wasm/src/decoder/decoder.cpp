@@ -375,6 +375,14 @@ void resetInternal() {
       av_frame_free(&frame);
     }
   }
+  {
+    // captionStream を捨てる前にキューも空にする。字幕キューは排出側
+    // (mainloop) が captionStream->time_base を無条件に参照するので、前番組の
+    // キューを残したまま captionStream を nullptr にすると null 参照になる。
+    // クラッシュを免れても、切替後に前番組の字幕が 1 枚描かれてしまう。
+    std::lock_guard<std::mutex> lock(captionDataMtx);
+    captionDataQueue.clear();
+  }
   videoStream = nullptr;
   audioStreamList.clear();
   captionStream = nullptr;
@@ -1296,7 +1304,10 @@ void decoderMainloop() {
     }
   }
 
-  if (!captionCallback.isNull() && audioFrame) {
+  // captionStream は resetInternal() で nullptr に戻る一方、字幕パケットは
+  // デコーダースレッドが積むので、リセットと入れ違いにキューが再び埋まりうる。
+  // time_base を参照する前にここでも見張っておく。
+  if (!captionCallback.isNull() && audioFrame && captionStream) {
     while (captionDataQueue.size() > 0) {
       std::pair<int64_t, std::vector<uint8_t>> p;
       {
