@@ -348,6 +348,10 @@ const Caption: React.FC<Props> = ({
   // 現在の字幕を上書き・消去してしまうのを防ぐ(字幕が重なる/すぐ消える対策)。
   const ttmlSeqRef = useRef(0)
   const ttmlShownIdRef = useRef(-1)
+  // 直前に字幕が届いたアセットの stream index。番組境界で放送局が字幕アセット
+  // を別のソースへ引き継ぐことがあり、そのソースは自前の時間軸を持つので
+  // offset を取り直す必要がある。
+  const ttmlStreamRef = useRef<number>(-1)
   // DRCS(外字)グリフ表: コードポイント→SVGパス。字幕リソース(SVGフォント)を
   // 受信するたびに登録し、service 切替でクリアする。
   const glyphMapRef = useRef<Map<number, DrcsGlyph>>(new Map())
@@ -356,7 +360,12 @@ const Caption: React.FC<Props> = ({
   const serviceRef = useRef<Service | undefined>(undefined)
 
   const captionCallback = useCallback(
-    (pts: number, ptsTime: number, captionData: Uint8Array) => {
+    (
+      pts: number,
+      ptsTime: number,
+      captionData: Uint8Array,
+      streamIndex: number
+    ) => {
       const canvas = canvasRef.current
       if (!canvas) return
       const context = canvas.getContext('2d')
@@ -402,11 +411,19 @@ const Caption: React.FC<Props> = ({
 
           const ROLLBACK_TOL = 5 // 秒。begin の巻き戻り=番組境界とみなす閾値
           const MAX_LEAD = 30 // 秒。offset 破綻時のフェイルセーフ
+          // 別アセットは別の字幕ソース、つまり別の時間軸でありうる。巻き戻りの
+          // 閾値と MAX_LEAD の間(=数秒〜30秒の食い違い)はどちらの再校正にも
+          // 引っかからないので、アセットの乗り換えそのものを契機にする。
+          const streamChanged =
+            ttmlStreamRef.current >= 0 && streamIndex !== ttmlStreamRef.current
+          ttmlStreamRef.current = streamIndex
           if (
             ttmlOffsetRef.current == null ||
+            streamChanged ||
             begin + ROLLBACK_TOL < ttmlLastBeginRef.current
           ) {
-            // 初回、または番組境界: offset を取り直し予約済みの表示を破棄する。
+            // 初回、番組境界、またはアセット乗り換え: offset を取り直し
+            // 予約済みの表示を破棄する。
             ttmlOffsetRef.current = begin - now
             for (const t of ttmlTimersRef.current) clearTimeout(t)
             ttmlTimersRef.current = []
@@ -512,6 +529,7 @@ const Caption: React.FC<Props> = ({
     ttmlTimersRef.current = []
     ttmlOffsetRef.current = null
     ttmlLastBeginRef.current = -1
+    ttmlStreamRef.current = -1
     ttmlShownIdRef.current = -1
     lastTtmlRef.current = null
     glyphMapRef.current.clear()

@@ -81,7 +81,14 @@ int videoSwsWidth = 0, videoSwsHeight = 0;
 AVFrame *conversionFrame = nullptr; // 8bit 変換先 (使い回し)
 
 std::deque<AVFrame *> videoFrameQueue, audioFrameQueue;
-std::deque<std::pair<int64_t, std::vector<uint8_t>>> captionDataQueue;
+// 字幕キューの 1 件。streamIndex は届いた字幕アセットの AVStream index で、
+// 番組内でアセットが乗り換わったことを JS 側が検出するために添えて渡す。
+struct CaptionData {
+  int64_t pts = 0;
+  int streamIndex = -1;
+  std::vector<uint8_t> data;
+};
+std::deque<CaptionData> captionDataQueue;
 std::mutex videoFrameMtx, audioFrameMtx, captionDataMtx;
 
 // 直前に送出した TTML 字幕。放送は同一内容を繰り返し送るため間引きに使う。
@@ -997,8 +1004,7 @@ void decoderThreadFunc() {
           memcpy(&buffer[0], ppacket->data, ppacket->size);
           std::lock_guard<std::mutex> lock(captionDataMtx);
           captionDataQueue.push_back(
-              std::make_pair<int64_t, std::vector<uint8_t>>(0,
-                                                            std::move(buffer)));
+              CaptionData{0, pktCapStream->index, std::move(buffer)});
         }
       } else {
         std::string str = fmt::format("{:02X}", ppacket->data[0]);
@@ -1012,10 +1018,8 @@ void decoderThreadFunc() {
           memcpy(&buffer[0], ppacket->data, ppacket->size);
           {
             std::lock_guard<std::mutex> lock(captionDataMtx);
-            int64_t pts = ppacket->pts;
-            captionDataQueue.push_back(
-                std::make_pair<int64_t, std::vector<uint8_t>>(
-                    std::move(pts), std::move(buffer)));
+            captionDataQueue.push_back(CaptionData{
+                ppacket->pts, pktCapStream->index, std::move(buffer)});
           }
         }
       }
@@ -1320,14 +1324,14 @@ void decoderMainloop() {
   // time_base を参照する前にここでも見張っておく。
   if (!captionCallback.isNull() && audioFrame && captionStream) {
     while (captionDataQueue.size() > 0) {
-      std::pair<int64_t, std::vector<uint8_t>> p;
+      CaptionData p;
       {
         std::lock_guard<std::mutex> lock(captionDataMtx);
         p = std::move(captionDataQueue.front());
         captionDataQueue.pop_front();
       }
-      double pts = (double)p.first;
-      std::vector<uint8_t> &buffer = p.second;
+      double pts = (double)p.pts;
+      std::vector<uint8_t> &buffer = p.data;
       double ptsTime = pts * av_q2d(captionStream->time_base);
 
       // AudioFrameは完全に見るだけ
@@ -1349,10 +1353,13 @@ void decoderMainloop() {
       if (captionIsTtml) {
         // TTML(4K/8K)は PTS を持たず、表示時刻は TTML 内の begin/end で表現
         // される。JS 側で同期できるよう、ここでは現在の再生メディア時刻
-        // (音声再生時刻・秒)を ptsTime として渡す。
-        captionCallback((double)0, estimatedAudioPlayTime, data);
+        // (音声再生時刻・秒)を ptsTime として渡す。あわせて字幕アセットの
+        // stream index を渡し、JS 側が時間軸の乗り換えを検出できるようにする。
+        captionCallback((double)0, estimatedAudioPlayTime, data,
+                        p.streamIndex);
       } else {
-        captionCallback(pts, ptsTime - estimatedAudioPlayTime, data);
+        captionCallback(pts, ptsTime - estimatedAudioPlayTime, data,
+                        p.streamIndex);
       }
     }
   }

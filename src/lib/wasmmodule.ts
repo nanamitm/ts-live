@@ -25,7 +25,14 @@ export declare interface WasmModule extends EmscriptenModule {
   setLogLevelInfo(): void
   showVersionInfo(): void
   setCaptionCallback(
-    callback: (pts: number, ptsTime: number, captionData: Uint8Array) => void
+    callback: (
+      pts: number,
+      ptsTime: number,
+      captionData: Uint8Array,
+      // 字幕が届いたアセットの stream index。番組内で字幕アセットが乗り換わる
+      // (=時間軸が変わりうる)ことの検出に使う。
+      streamIndex: number
+    ) => void
   ): void
   setStatsCallback(
     callback: ((statsDataList: Array<StatsData>) => void) | null
