@@ -1355,8 +1355,7 @@ void decoderMainloop() {
         // される。JS 側で同期できるよう、ここでは現在の再生メディア時刻
         // (音声再生時刻・秒)を ptsTime として渡す。あわせて字幕アセットの
         // stream index を渡し、JS 側が時間軸の乗り換えを検出できるようにする。
-        captionCallback((double)0, estimatedAudioPlayTime, data,
-                        p.streamIndex);
+        captionCallback((double)0, estimatedAudioPlayTime, data, p.streamIndex);
       } else {
         captionCallback(pts, ptsTime - estimatedAudioPlayTime, data,
                         p.streamIndex);
