@@ -83,6 +83,12 @@ AVFrame *conversionFrame = nullptr; // 8bit 変換先 (使い回し)
 std::deque<AVFrame *> videoFrameQueue, audioFrameQueue;
 std::deque<std::pair<int64_t, std::vector<uint8_t>>> captionDataQueue;
 std::mutex videoFrameMtx, audioFrameMtx, captionDataMtx;
+
+// 直前に送出した TTML 字幕。放送は同一内容を繰り返し送るため間引きに使う。
+// リセット(サービス/ファイル切替)のたびに捨てる必要があるので、間引き処理の
+// 関数ローカル static ではなくここに置く。
+std::mutex ttmlMtx;
+std::string lastTtml;
 bool videoFrameFound = false;
 
 // 10bit→8bit 変換を専用スレッドに分離するための中間キュー。
@@ -382,6 +388,13 @@ void resetInternal() {
     // クラッシュを免れても、切替後に前番組の字幕が 1 枚描かれてしまう。
     std::lock_guard<std::mutex> lock(captionDataMtx);
     captionDataQueue.clear();
+  }
+  {
+    // 間引き用の直前 TTML も捨てる。JS 側は切替で canvas と直近字幕の
+    // キャッシュを消すので、これを持ち越すと「同じ番組に戻ったとき、放送中の
+    // TTML が直前と同一内容だと間引かれ、内容が変わるまで字幕が出ない」。
+    std::lock_guard<std::mutex> lock(ttmlMtx);
+    lastTtml.clear();
   }
   videoStream = nullptr;
   audioStreamList.clear();
@@ -971,8 +984,6 @@ void decoderThreadFunc() {
         // 直前と同一のものは間引く。
         std::string ttml(reinterpret_cast<const char *>(ppacket->data),
                          ppacket->size);
-        static std::mutex ttmlMtx;
-        static std::string lastTtml;
         bool changed = false;
         {
           std::lock_guard<std::mutex> lock(ttmlMtx);
