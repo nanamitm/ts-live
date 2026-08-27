@@ -94,7 +94,12 @@ const Page: NextPage = () => {
   const [volume, setVolume] = useLocalStorage<number>('tsplayerVolume', 1.0)
   const [mute, setMute] = useLocalStorage<boolean>('tsplayerMute', false)
 
-  const [stopFunc, setStopFunc] = useState(() => () => {})
+  const stopFuncRef = useRef<() => void>(() => {})
+  const stopPlayback = useCallback(() => {
+    const stop = stopFuncRef.current
+    stopFuncRef.current = () => {}
+    stop()
+  }, [])
   const [chartData, setChartData] = useState<Array<StatsData>>([
     {
       time: 0,
@@ -115,6 +120,10 @@ const Page: NextPage = () => {
   // WebCodecs (BS4K) 用の描画 canvas と再生制御
   const wcCanvasRef = useRef<HTMLCanvasElement>(null)
   const webCodecsCtrlRef = useRef<{ stop: () => void } | null>(null)
+  // WebCodecs が利用可能でも対象サービスの codec をデコードできない場合は、
+  // 同じサービスを WASM ソフトウェアデコードで再起動する。
+  const liveForceSoftwareServiceRef = useRef<number | null>(null)
+  const [webCodecsRetryToken, setWebCodecsRetryToken] = useState(0)
 
   // WebCodecs 用: JS の VideoDecoder(ハードウェアデコード)で映像をデコードし、
   // WASM が保持する音声クロックに同期して canvas へ描画する。対象コーデックは
@@ -201,6 +210,13 @@ const Page: NextPage = () => {
     let fatalCalled = false
     let decoder: VideoDecoder
 
+    const failFatal = () => {
+      if (!onFatal || fatalCalled) return
+      fatalCalled = true
+      console.warn('WebCodecs: giving up — falling back to WASM software decode')
+      onFatal()
+    }
+
     const decoderInit: VideoDecoderInit = {
       output: (frame: VideoFrame) => {
         if (stopped) {
@@ -229,26 +245,37 @@ const Page: NextPage = () => {
           try {
             decoder.close()
           } catch (err) {}
-          decoder = new VideoDecoder(decoderInit)
-          decoder.configure({
-            ...config,
-            hardwareAcceleration: 'prefer-software',
-          })
+          try {
+            decoder = new VideoDecoder(decoderInit)
+            decoder.configure({
+              ...config,
+              hardwareAcceleration: 'prefer-software',
+            })
+          } catch (err) {
+            console.error('WebCodecs software configure failed:', err)
+            failFatal()
+            return
+          }
           gotKey = false
           for (const f of frameQueue) f.frame.close()
           frameQueue = []
-        } else if (onFatal && !fatalCalled) {
-          fatalCalled = true
-          console.warn(
-            'WebCodecs: giving up — falling back to WASM software decode'
-          )
-          onFatal()
+        } else {
+          failFatal()
         }
       },
     }
     decoder = new VideoDecoder(decoderInit)
     console.log('WebCodecs configure:', config, 'display:', displayWidth, height)
-    decoder.configure(config)
+    try {
+      decoder.configure(config)
+    } catch (err) {
+      console.error('WebCodecs configure failed:', err)
+      try {
+        decoder.close()
+      } catch (closeErr) {}
+      failFatal()
+      return
+    }
 
     // WASM から呼ばれる: アクセスユニット 1 個を VideoDecoder へ投入。
     let lastTsUs = 0
@@ -587,6 +614,9 @@ const Page: NextPage = () => {
       console.log('not touched')
       return
     }
+    // ローカルファイル再生は playLocalFile() がライフサイクルを管理する。
+    // playMode の更新でこの effect が再実行されても、新しいローカル再生を止めない。
+    if (playMode === 'localfile') return
     if (!mirakurunOk || !mirakurunServer || !activeService) {
       console.log('mirakurunServer or activeService', mirakurunOk, mirakurunServer, activeService)
       return
@@ -597,7 +627,7 @@ const Page: NextPage = () => {
     }
     const Module = wasmMod
     // 現在の再生中を止める（or 何もしない）
-    stopFunc()
+    stopPlayback()
     // 再生開始のたびに前の字幕を消す(同一 service の再選択や EPGStation ファイル
     // 切替では service が変わらないため、token で明示的にクリアする)
     setCaptionResetToken(t => t + 1)
@@ -618,11 +648,31 @@ const Page: NextPage = () => {
       Module.setStatsCallback(null)
     }
 
-    // 0.2秒遅らす
-    setTimeout(() => {
+    let stopped = false
+    let ac: AbortController | null = null
+    let startTimer: ReturnType<typeof setTimeout> | null = null
+    const stop = () => {
+      if (stopped) return
+      stopped = true
+      if (startTimer !== null) clearTimeout(startTimer)
+      ac?.abort()
+      Module.setVideoStreamInfoCallback(null as any)
+      if (webCodecsCtrlRef.current) {
+        webCodecsCtrlRef.current.stop()
+        webCodecsCtrlRef.current = null
+      }
+      setWebCodecsActive(false)
+      Module.reset()
+    }
+    // 待機中の切替でも古い開始処理を止められるよう、タイマー登録前に停止関数を公開する。
+    stopFuncRef.current = stop
+
+    // 直前の reset が落ち着くまで 0.5 秒待つ。
+    startTimer = setTimeout(() => {
+      if (stopped) return
       // 再生スタート
       if (playMode === 'live') {
-        const ac = new AbortController()
+        ac = new AbortController()
         const channelType = activeService.channel?.type as string
         const isBS4K = channelType === 'BS4K'
         // WebCodecs (ハードウェアデコード) を試みる対象: BS4K (HEVC) と
@@ -630,30 +680,25 @@ const Page: NextPage = () => {
         // コーデックを見て決め、videoStreamInfo で通知してくる(非対応コーデック
         // は WASM ソフトデコードへ自動フォールバック)。
         const wantWebCodecs =
-          (isBS4K || channelType === 'SKY') && typeof VideoDecoder !== 'undefined'
+          (isBS4K || channelType === 'SKY') &&
+          typeof VideoDecoder !== 'undefined' &&
+          liveForceSoftwareServiceRef.current !== activeService.id
         if (wantWebCodecs) {
           Module.setVideoStreamInfoCallback((info: VideoStreamInfo) => {
             console.log('videoStreamInfo:', info)
             if (info.webCodecs) {
-              startWebCodecs(Module, wcCanvasRef.current, info)
+              startWebCodecs(Module, wcCanvasRef.current, info, () => {
+                // 現在の effect の cleanup がストリームを停止・reset し、同じ
+                // service を WASM ソフトウェアデコードで再起動する。
+                liveForceSoftwareServiceRef.current = activeService.id
+                setWebCodecsRetryToken(t => t + 1)
+              })
               setWebCodecsActive(true)
             }
           })
         } else {
           Module.setVideoStreamInfoCallback(null as any)
         }
-        setStopFunc(() => () => {
-          console.log('abort fetch')
-          ac.abort()
-          Module.setVideoStreamInfoCallback(null as any)
-          if (webCodecsCtrlRef.current) {
-            webCodecsCtrlRef.current.stop()
-            webCodecsCtrlRef.current = null
-          }
-          setWebCodecsActive(false)
-          Module.reset()
-          console.log('abort fetch done.')
-        })
         Module.setTlvMode(isBS4K)
         Module.setWebCodecsMode(wantWebCodecs)
         const url = `${mirakurunServer}/api/services/${activeService.id}/stream?decode=1`
@@ -674,9 +719,14 @@ const Page: NextPage = () => {
             const reader = response.body.getReader()
             let ret = await reader.read()
             while (!ret.done) {
+              if (stopped) {
+                reader.cancel().catch(() => {})
+                return
+              }
               if (ret.value) {
                 try {
                   while (true) {
+                    if (stopped) return
                     const buffer = Module.getNextInputBuffer(ret.value.length)
                     if (!buffer) {
                       await sleep(100)
@@ -699,12 +749,9 @@ const Page: NextPage = () => {
             }
           })
           .catch(ex => {
-            console.log('fetch aborted ex:', ex)
+            if (!stopped) console.error('stream fetch failed:', ex)
           })
       } else if (playMode === 'file') {
-        setStopFunc(() => () => {
-          Module.reset()
-        })
         // 直前の再生のモードが残らないよう明示的にリセットする(EPGStation の
         // 録画は 2K TS 前提で WASM ソフトデコード)。
         Module.setVideoStreamInfoCallback(null as any)
@@ -714,6 +761,11 @@ const Page: NextPage = () => {
         Module.playFile(url)
       }
     }, 500)
+
+    return () => {
+      if (stopFuncRef.current === stop) stopFuncRef.current = () => {}
+      stop()
+    }
   }, [
     touched,
     mirakurunOk,
@@ -722,6 +774,8 @@ const Page: NextPage = () => {
     activeRecordedFileId,
     playMode,
     wasmMod,
+    webCodecsRetryToken,
+    stopPlayback,
   ])
 
   // ローカルに保存した TS/TLV ファイルを再生する(字幕デバッグ用)。ライブ視聴と
@@ -758,7 +812,7 @@ const Page: NextPage = () => {
     setLocalFileName(file.name)
     setPlayMode('localfile')
     // 現在の再生を止める
-    stopFunc()
+    stopPlayback()
     // 前ファイルの字幕を消す(service が変わらないので token で明示的にクリア)
     setCaptionResetToken(t => t + 1)
     setDrawer(false)
@@ -775,6 +829,20 @@ const Page: NextPage = () => {
     }
 
     const sleep = (msec: number) => new Promise(resolve => setTimeout(resolve, msec))
+    let aborted = false
+    const stop = () => {
+      if (aborted) return
+      aborted = true
+      Module.setVideoStreamInfoCallback(null as any)
+      if (webCodecsCtrlRef.current) {
+        webCodecsCtrlRef.current.stop()
+        webCodecsCtrlRef.current = null
+      }
+      setWebCodecsActive(false)
+      Module.reset()
+    }
+    // 500ms の開始待ち中に別ファイルが選ばれても、この処理を中止できるようにする。
+    stopFuncRef.current = stop
     ;(async () => {
       // 再生モード(TLV=BS4K / TS=2K)を確定する。auto は先頭バイトで判定。
       const tlv =
@@ -782,6 +850,7 @@ const Page: NextPage = () => {
       console.log('local file mode', file.name, { localMode, tlv })
       // 直前の再生停止(reset)が落ち着くまで少し待つ
       await sleep(500)
+      if (aborted) return
 
       // ローカルファイルは常に WebCodecs を試みる。実際に使うかは WASM が
       // probe 後にコーデックで決める(HEVC/H.264 なら WebCodecs、MPEG-2 等は
@@ -803,18 +872,6 @@ const Page: NextPage = () => {
       } else {
         Module.setVideoStreamInfoCallback(null as any)
       }
-      let aborted = false
-      setStopFunc(() => () => {
-        console.log('abort local file')
-        aborted = true
-        Module.setVideoStreamInfoCallback(null as any)
-        if (webCodecsCtrlRef.current) {
-          webCodecsCtrlRef.current.stop()
-          webCodecsCtrlRef.current = null
-        }
-        setWebCodecsActive(false)
-        Module.reset()
-      })
       Module.setTlvMode(tlv)
       Module.setWebCodecsMode(wantWebCodecs)
 
