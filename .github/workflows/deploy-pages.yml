@@ -1,0 +1,87 @@
+name: Deploy Cloudflare Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/deploy-pages.yml'
+      - 'next.config.js'
+      - 'package.json'
+      - 'public/**'
+      - 'scripts/**'
+      - 'src/**'
+      - 'tsconfig.json'
+      - 'wasm/**'
+      - 'yarn.lock'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-pages-webcodecs
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: yarn
+
+      - name: Install JavaScript dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Check C/C++ formatting
+        uses: jidicula/clang-format-action@v4.14.0
+        with:
+          clang-format-version: '10'
+          check-path: ./wasm
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.74
+          actions-cache-folder: emsdk-cache
+
+      - name: Configure WASM build
+        run: yarn cmake:config
+
+      - name: Build and install WASM
+        run: yarn cmake:build
+
+      - name: Lint frontend
+        run: yarn lint
+
+      - name: Build frontend
+        run: yarn build
+
+      - name: Export static site
+        run: yarn export
+
+      - name: Verify deployment assets
+        shell: bash
+        run: |
+          test -s out/index.html
+          test -s out/_headers
+          test -s out/wasm/ts-live.js
+          test -s out/wasm/ts-live.wasm
+
+      - name: Deploy webcodecs preview
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: >-
+            pages deploy out
+            --project-name=ts-live-hevc-4k
+            --branch=webcodecs
+            --commit-hash=${{ github.sha }}
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
