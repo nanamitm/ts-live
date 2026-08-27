@@ -86,6 +86,8 @@ std::deque<AVFrame *> videoFrameQueue, audioFrameQueue;
 struct CaptionData {
   int64_t pts = 0;
   int streamIndex = -1;
+  AVRational timeBase = {0, 1};
+  bool isTtml = false;
   std::vector<uint8_t> data;
 };
 std::deque<CaptionData> captionDataQueue;
@@ -96,6 +98,7 @@ std::mutex videoFrameMtx, audioFrameMtx, captionDataMtx;
 // 関数ローカル static ではなくここに置く。
 std::mutex ttmlMtx;
 std::string lastTtml;
+int lastTtmlStreamIndex = -1;
 bool videoFrameFound = false;
 
 // 10bit→8bit 変換を専用スレッドに分離するための中間キュー。
@@ -389,10 +392,8 @@ void resetInternal() {
     }
   }
   {
-    // captionStream を捨てる前にキューも空にする。字幕キューは排出側
-    // (mainloop) が captionStream->time_base を無条件に参照するので、前番組の
-    // キューを残したまま captionStream を nullptr にすると null 参照になる。
-    // クラッシュを免れても、切替後に前番組の字幕が 1 枚描かれてしまう。
+    // 再生切替後に前番組の字幕が排出されないよう、stream を捨てる前に
+    // キューも空にする。
     std::lock_guard<std::mutex> lock(captionDataMtx);
     captionDataQueue.clear();
   }
@@ -402,6 +403,7 @@ void resetInternal() {
     // TTML が直前と同一内容だと間引かれ、内容が変わるまで字幕が出ない」。
     std::lock_guard<std::mutex> lock(ttmlMtx);
     lastTtml.clear();
+    lastTtmlStreamIndex = -1;
   }
   videoStream = nullptr;
   audioStreamList.clear();
@@ -911,8 +913,19 @@ void decoderThreadFunc() {
     //    する (過去の不具合)。
     // パケットキューの上限は暴走防止の安全弁として高めに残す。
     const int audioBufferTarget = 48000; // 約1秒 @48kHz
-    if (bufferedAudioSamples > audioBufferTarget ||
-        videoPacketQueue.size() > 600 || audioPacketQueue.size() > 600) {
+    size_t videoPacketQueueSize;
+    size_t audioPacketQueueSize;
+    {
+      std::lock_guard<std::mutex> lock(videoPacketMtx);
+      videoPacketQueueSize = videoPacketQueue.size();
+    }
+    {
+      std::lock_guard<std::mutex> lock(audioPacketMtx);
+      audioPacketQueueSize = audioPacketQueue.size();
+    }
+    if (bufferedAudioSamples.load(std::memory_order_relaxed) >
+            audioBufferTarget ||
+        videoPacketQueueSize > 600 || audioPacketQueueSize > 600) {
       std::this_thread::sleep_for(std::chrono::milliseconds(3));
       continue;
     }
@@ -979,6 +992,13 @@ void decoderThreadFunc() {
     if (pktIsCaption) {
       bool pktIsTtml = pktCapStream->codecpar->codec_id == AV_CODEC_ID_TTML;
       if (captionStream != pktCapStream) {
+        // 同じ stream index に戻るケースも含め、アセット乗り換え後の最初の
+        // TTML は必ず JS へ届ける。
+        {
+          std::lock_guard<std::mutex> lock(ttmlMtx);
+          lastTtml.clear();
+          lastTtmlStreamIndex = -1;
+        }
         captionStream = pktCapStream;
         captionIsTtml = pktIsTtml;
         spdlog::info("Caption stream -> index:{} codec:{}", pktCapStream->index,
@@ -994,8 +1014,11 @@ void decoderThreadFunc() {
         bool changed = false;
         {
           std::lock_guard<std::mutex> lock(ttmlMtx);
-          if (ttml != lastTtml) {
+          // 同じ本文でも字幕アセットが変われば、JS 側へ streamIndex を通知して
+          // 時刻オフセットを再校正する必要がある。
+          if (ttml != lastTtml || pktCapStream->index != lastTtmlStreamIndex) {
             lastTtml = ttml;
+            lastTtmlStreamIndex = pktCapStream->index;
             changed = true;
           }
         }
@@ -1003,8 +1026,9 @@ void decoderThreadFunc() {
           std::vector<uint8_t> buffer(ppacket->size);
           memcpy(&buffer[0], ppacket->data, ppacket->size);
           std::lock_guard<std::mutex> lock(captionDataMtx);
-          captionDataQueue.push_back(
-              CaptionData{0, pktCapStream->index, std::move(buffer)});
+          captionDataQueue.push_back(CaptionData{0, pktCapStream->index,
+                                                 pktCapStream->time_base, true,
+                                                 std::move(buffer)});
         }
       } else {
         std::string str = fmt::format("{:02X}", ppacket->data[0]);
@@ -1018,8 +1042,9 @@ void decoderThreadFunc() {
           memcpy(&buffer[0], ppacket->data, ppacket->size);
           {
             std::lock_guard<std::mutex> lock(captionDataMtx);
-            captionDataQueue.push_back(CaptionData{
-                ppacket->pts, pktCapStream->index, std::move(buffer)});
+            captionDataQueue.push_back(
+                CaptionData{ppacket->pts, pktCapStream->index,
+                            pktCapStream->time_base, false, std::move(buffer)});
           }
         }
       }
@@ -1156,10 +1181,32 @@ int channel_layout = 0;
 int sample_rate = 0;
 
 void decoderMainloop() {
+  const int currentBufferedAudioSamples =
+      bufferedAudioSamples.load(std::memory_order_relaxed);
+  size_t videoFrameQueueSize;
+  size_t audioFrameQueueSize;
+  size_t videoPacketQueueSize;
+  size_t audioPacketQueueSize;
+  {
+    std::lock_guard<std::mutex> lock(videoFrameMtx);
+    videoFrameQueueSize = videoFrameQueue.size();
+  }
+  {
+    std::lock_guard<std::mutex> lock(audioFrameMtx);
+    audioFrameQueueSize = audioFrameQueue.size();
+  }
+  {
+    std::lock_guard<std::mutex> lock(videoPacketMtx);
+    videoPacketQueueSize = videoPacketQueue.size();
+  }
+  {
+    std::lock_guard<std::mutex> lock(audioPacketMtx);
+    audioPacketQueueSize = audioPacketQueue.size();
+  }
   spdlog::debug("decoderMainloop videoFrameQueue:{} audioFrameQueue:{} "
                 "videoPacketQueue:{} audioPacketQueue:{}",
-                videoFrameQueue.size(), audioFrameQueue.size(),
-                videoPacketQueue.size(), audioPacketQueue.size());
+                videoFrameQueueSize, audioFrameQueueSize, videoPacketQueueSize,
+                audioPacketQueueSize);
 
   // probe 済みの映像ストリーム情報を JS へ通知する(1回)。JS はこれを見て
   // VideoDecoder を構成するため、下の AU 受け渡しより必ず先に届ける。
@@ -1207,13 +1254,21 @@ void decoderMainloop() {
         std::chrono::system_clock::now() - startTime);
     auto data = emscripten::val::object();
     data.set("time", duration.count() / 1000.0);
-    data.set("VideoFrameQueueSize", videoFrameQueue.size());
-    data.set("AudioFrameQueueSize", audioFrameQueue.size());
-    data.set("AudioWorkletBufferSize", bufferedAudioSamples);
-    data.set("InputBufferSize",
-             (inputBufferWriteIndex - inputBufferReadIndex) / 1000000.0);
-    data.set("CaptionDataQueueSize",
-             captionStream ? captionDataQueue.size() : 0);
+    data.set("VideoFrameQueueSize", videoFrameQueueSize);
+    data.set("AudioFrameQueueSize", audioFrameQueueSize);
+    data.set("AudioWorkletBufferSize", currentBufferedAudioSamples);
+    size_t inputBufferSize;
+    {
+      std::lock_guard<std::mutex> lock(inputBufferMtx);
+      inputBufferSize = inputBufferWriteIndex - inputBufferReadIndex;
+    }
+    data.set("InputBufferSize", inputBufferSize / 1000000.0);
+    size_t captionDataQueueSize;
+    {
+      std::lock_guard<std::mutex> lock(captionDataMtx);
+      captionDataQueueSize = captionDataQueue.size();
+    }
+    data.set("CaptionDataQueueSize", captionDataQueueSize);
     statsBuffer.push_back(std::move(data));
     if (statsBuffer.size() >= 6) {
       auto statsArray = emscripten::val::array();
@@ -1263,7 +1318,7 @@ void decoderMainloop() {
     double audioPtsTimeForClock =
         audioFrame->pts * av_q2d(audioFrame->time_base);
     currentAudioPlaybackTime =
-        audioPtsTimeForClock - (double)bufferedAudioSamples /
+        audioPtsTimeForClock - (double)currentBufferedAudioSamples /
                                    audioStreamList[0]->codecpar->sample_rate;
   }
 
@@ -1273,11 +1328,16 @@ void decoderMainloop() {
     // spdlog::info("found Current Frame {}x{} bufferSize:{}",
     // currentFrame->width,
     //              currentFrame->height, bufferSize);
+    size_t queuedAudioFrames;
+    {
+      std::lock_guard<std::mutex> lock(audioFrameMtx);
+      queuedAudioFrames = audioFrameQueue.size();
+    }
     spdlog::debug(
         "VideoFrame@mainloop pts:{} time_base:{} {}/{} AudioQueueSize:{}",
         currentFrame->pts, av_q2d(currentFrame->time_base),
         currentFrame->time_base.num, currentFrame->time_base.den,
-        audioFrameQueue.size());
+        queuedAudioFrames);
 
     // WindowSize確認＆リサイズ
     // TODO:
@@ -1295,7 +1355,7 @@ void decoderMainloop() {
     // double estimatedAudioPlayTime =
     //     audioPtsTime - (double)queuedSize / ctx.openedAudioSpec.freq;
     double estimatedAudioPlayTime =
-        audioPtsTime - (double)bufferedAudioSamples /
+        audioPtsTime - (double)currentBufferedAudioSamples /
                            audioStreamList[0]->codecpar->sample_rate;
 
     // 1フレーム分くらいはズレてもいいからこれでいいか。フレーム真面目に考えると良くわからない。
@@ -1319,20 +1379,22 @@ void decoderMainloop() {
     }
   }
 
-  // captionStream は resetInternal() で nullptr に戻る一方、字幕パケットは
-  // デコーダースレッドが積むので、リセットと入れ違いにキューが再び埋まりうる。
-  // time_base を参照する前にここでも見張っておく。
-  if (!captionCallback.isNull() && audioFrame && captionStream) {
-    while (captionDataQueue.size() > 0) {
+  // 字幕項目は stream 固有の time_base/codec 種別を保持する。キュー滞留中に
+  // 字幕アセットが乗り換わっても、最新のグローバル状態で誤処理しない。
+  if (!captionCallback.isNull() && audioFrame) {
+    for (;;) {
       CaptionData p;
       {
         std::lock_guard<std::mutex> lock(captionDataMtx);
+        if (captionDataQueue.empty()) {
+          break;
+        }
         p = std::move(captionDataQueue.front());
         captionDataQueue.pop_front();
       }
       double pts = (double)p.pts;
       std::vector<uint8_t> &buffer = p.data;
-      double ptsTime = pts * av_q2d(captionStream->time_base);
+      double ptsTime = pts * av_q2d(p.timeBase);
 
       // AudioFrameは完全に見るだけ
       // VideoとAudioのPTSをクロックから時間に直す
@@ -1345,12 +1407,13 @@ void decoderMainloop() {
       // 0除算を避けるためsample_rateがおかしいときはAudioのPTSをそのまま返す
       int sampleRate = audioStreamList[0]->codecpar->sample_rate;
       double estimatedAudioPlayTime =
-          sampleRate ? audioPtsTime - (double)bufferedAudioSamples / sampleRate
-                     : audioPtsTime;
+          sampleRate
+              ? audioPtsTime - (double)currentBufferedAudioSamples / sampleRate
+              : audioPtsTime;
 
       auto data = emscripten::val(
           emscripten::typed_memory_view<uint8_t>(buffer.size(), &buffer[0]));
-      if (captionIsTtml) {
+      if (p.isTtml) {
         // TTML(4K/8K)は PTS を持たず、表示時刻は TTML 内の begin/end で表現
         // される。JS 側で同期できるよう、ここでは現在の再生メディア時刻
         // (音声再生時刻・秒)を ptsTime として渡す。あわせて字幕アセットの
@@ -1364,10 +1427,13 @@ void decoderMainloop() {
   }
 
   // AudioFrameはVideoFrame処理でのPTS参照用に1個だけキューに残す
-  while (audioFrameQueue.size() > 1) {
+  for (;;) {
     AVFrame *frame = nullptr;
     {
       std::lock_guard<std::mutex> lock(audioFrameMtx);
+      if (audioFrameQueue.size() <= 1) {
+        break;
+      }
       frame = audioFrameQueue.front();
       audioFrameQueue.pop_front();
     }

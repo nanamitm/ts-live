@@ -4,12 +4,13 @@
 #include <emscripten/val.h>
 
 #include "../util/util.hpp"
+#include "audioworklet.hpp"
 
-int bufferedAudioSamples = 0;
+std::atomic<int> bufferedAudioSamples{0};
 
 void setBufferedAudioSamples(int samples) {
   // set buffereredAudioSamples
-  bufferedAudioSamples = samples;
+  bufferedAudioSamples.store(samples, std::memory_order_relaxed);
 }
 
 void feedAudioData(float *buffer0, float *buffer1, int samples) {
