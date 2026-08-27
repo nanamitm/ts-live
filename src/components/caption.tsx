@@ -4,8 +4,7 @@ import React, {
   RefObject,
   useCallback,
   useEffect,
-  useRef,
-  useState
+  useRef
 } from 'react'
 import { WasmModule } from '../lib/wasmmodule'
 import { CanvasProvider } from 'aribb24.js'
@@ -329,14 +328,12 @@ const Caption: React.FC<Props> = ({
   show,
   resetToken
 }) => {
-  // const canvasRef = useRef<HTMLCanvasElement>(null)
-  // const [currentSubtitle, setCurrentSubtitle] = useState<number>()
-  const [renderTimeoutId, setRenderTimeoutId] = useState(
-    setTimeout(() => {}, 0)
-  )
-  const [clearTimeoutId, setClearTimeoutId] = useState(setTimeout(() => {}, 0))
-
   const lastTtmlRef = useRef<string | null>(null)
+  // 2K B24 字幕も複数キューが先読みされるため、表示中の世代と予約タイマーを
+  // ref で管理する。古い字幕の消去タイマーが後続字幕を消すことを防ぐ。
+  const b24TimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([])
+  const b24SeqRef = useRef(0)
+  const b24ShownIdRef = useRef(-1)
   // TTML begin/end 同期用の状態。offset は「TTML 時刻 → 再生メディア時刻」の
   // 差分(秒)で、最初のキュー観測時に確定し番組境界で取り直す。timers は表示/
   // 消去の予約(setTimeout)一覧で service 切替時にまとめて解除する。
@@ -442,6 +439,7 @@ const Caption: React.FC<Props> = ({
           const id = ttmlSeqRef.current
 
           const showTimer = setTimeout(() => {
+            ttmlTimersRef.current = ttmlTimersRef.current.filter(t => t !== showTimer)
             // 既により新しい字幕が表示済みなら、この古い表示は描かない。
             if (id < ttmlShownIdRef.current) return
             ttmlShownIdRef.current = id
@@ -453,6 +451,7 @@ const Caption: React.FC<Props> = ({
             const delayClear = end - ttmlOffsetRef.current - now
             if (delayClear > delayShow) {
               const clearTimer = setTimeout(() => {
+                ttmlTimersRef.current = ttmlTimersRef.current.filter(t => t !== clearTimer)
                 // 後続字幕に置き換わっていれば消去しない(現在の字幕を守る)。
                 if (ttmlShownIdRef.current !== id) return
                 context.clearRect(0, 0, canvas.width, canvas.height)
@@ -477,10 +476,16 @@ const Caption: React.FC<Props> = ({
       const provider = new CanvasProvider(data, ptsTime)
       const estimate = provider.render()
       if (!estimate) return
+      b24SeqRef.current += 1
+      const id = b24SeqRef.current
       // const font = setting.font || SUBTITLE_DEFAULT_FONT
       // const font = `"Rounded M+ 1m for ARIB"`
       const renderId = setTimeout(() => {
-        const result = provider.render({
+        b24TimersRef.current = b24TimersRef.current.filter(t => t !== renderId)
+        // 既に後続字幕が表示済みなら、遅れて発火した古い字幕を描かない。
+        if (id < b24ShownIdRef.current) return
+        b24ShownIdRef.current = id
+        provider.render({
           canvas,
           useStroke: true,
           keepAspectRatio: true,
@@ -490,16 +495,16 @@ const Caption: React.FC<Props> = ({
         })
         if (estimate.endTime === Number.POSITIVE_INFINITY) return
         const clearId = setTimeout(() => {
-          // console.log('end timeout', now, currentSubtitle)
-          // if (currentSubtitle !== now) return
+          b24TimersRef.current = b24TimersRef.current.filter(t => t !== clearId)
+          // 後続字幕に置き換わっていれば、現在の字幕を消さない。
+          if (b24ShownIdRef.current !== id) return
           context.clearRect(0, 0, canvas.width, canvas.height)
-          // setCurrentSubtitle(undefined)
         }, (estimate.endTime - estimate.startTime) * 1000)
-        setClearTimeoutId(clearId)
+        b24TimersRef.current.push(clearId)
       }, estimate.startTime * 1000)
-      setRenderTimeoutId(renderId)
+      b24TimersRef.current.push(renderId)
     },
-    []
+    [canvasRef]
   )
 
   useEffect(() => {
@@ -521,8 +526,9 @@ const Caption: React.FC<Props> = ({
     const context = canvas.getContext('2d')
     if (!context) return
     context.clearRect(0, 0, canvas.width, canvas.height)
-    clearTimeout(renderTimeoutId)
-    clearTimeout(clearTimeoutId)
+    for (const t of b24TimersRef.current) clearTimeout(t)
+    b24TimersRef.current = []
+    b24ShownIdRef.current = -1
     // TTML 同期状態もリセットする。直近 TTML キャッシュも破棄し、切替後に
     // OFF→ON しても前番組(4K)の字幕が復活しないようにする。
     for (const t of ttmlTimersRef.current) clearTimeout(t)
@@ -533,7 +539,17 @@ const Caption: React.FC<Props> = ({
     ttmlShownIdRef.current = -1
     lastTtmlRef.current = null
     glyphMapRef.current.clear()
-  }, [service, resetToken])
+  }, [canvasRef, service, resetToken])
+
+  // アンマウント時にも遅延描画を残さない。
+  useEffect(() => {
+    return () => {
+      for (const t of b24TimersRef.current) clearTimeout(t)
+      for (const t of ttmlTimersRef.current) clearTimeout(t)
+      b24TimersRef.current = []
+      ttmlTimersRef.current = []
+    }
+  }, [])
 
   // 字幕表示が OFF→ON になったら、直近の TTML 字幕を即座に再描画する。TTML は
   // 同一内容が間引かれ再送されないため、これが無いと ON にしても次に内容が
@@ -545,7 +561,7 @@ const Caption: React.FC<Props> = ({
     const context = canvasRef.current.getContext('2d')
     if (!context) return
     renderTtml(context, canvasRef.current, lastTtmlRef.current, glyphMapRef.current)
-  }, [show])
+  }, [canvasRef, show])
 
   return (
     <canvas
