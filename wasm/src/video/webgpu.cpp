@@ -16,22 +16,25 @@ extern "C" {
 struct WebGPUContext {
   int textureWidth = 0;
   int textureHeight = 0;
-  WGPUDevice device;
-  WGPUSwapChain swapChain;
-  WGPUQueue queue;
-  WGPUComputePipeline yadifPipeline;
-  WGPURenderPipeline pipeline;
-  WGPUBindGroupLayout yadifBindGroupLayout, bindGroupLayout;
-  WGPUTexture curTextureY, curTextureU, curTextureV;
-  WGPUTextureView curViewY, curViewU, curViewV;
-  WGPUTexture prevTextureY, prevTextureU, prevTextureV;
-  WGPUTextureView prevViewY, prevViewU, prevViewV;
-  WGPUTexture nextTextureY, nextTextureU, nextTextureV;
-  WGPUTextureView nextViewY, nextViewU, nextViewV;
-  WGPUTexture frameTexture;
-  WGPUTextureView frameView;
-  WGPUBindGroup yadifBindGroup, bindGroup;
-  WGPUSampler sampler;
+  WGPUDevice device = nullptr;
+  WGPUSwapChain swapChain = nullptr;
+  WGPUQueue queue = nullptr;
+  WGPUComputePipeline yadifPipeline = nullptr;
+  WGPURenderPipeline pipeline = nullptr;
+  WGPUBindGroupLayout yadifBindGroupLayout = nullptr, bindGroupLayout = nullptr;
+  WGPUTexture curTextureY = nullptr, curTextureU = nullptr,
+              curTextureV = nullptr;
+  WGPUTextureView curViewY = nullptr, curViewU = nullptr, curViewV = nullptr;
+  WGPUTexture prevTextureY = nullptr, prevTextureU = nullptr,
+              prevTextureV = nullptr;
+  WGPUTextureView prevViewY = nullptr, prevViewU = nullptr, prevViewV = nullptr;
+  WGPUTexture nextTextureY = nullptr, nextTextureU = nullptr,
+              nextTextureV = nullptr;
+  WGPUTextureView nextViewY = nullptr, nextViewU = nullptr, nextViewV = nullptr;
+  WGPUTexture frameTexture = nullptr;
+  WGPUTextureView frameView = nullptr;
+  WGPUBindGroup yadifBindGroup = nullptr, bindGroup = nullptr;
+  WGPUSampler sampler = nullptr;
 };
 
 static WebGPUContext ctx;
@@ -53,6 +56,9 @@ static WGPUShaderModule createShader(const char *const code,
   return wgpuDeviceCreateShaderModule(ctx.device, &desc);
 }
 
+// createTextures() が作るものは「テクスチャとビュー」だけではない。サンプラと
+// バインドグループも毎回作り直しているので、ここで一緒に解放しないと解像度が
+// 変わるたびにリークする。
 static void releaseTextures() {
   wgpuTextureViewRelease(ctx.curViewY);
   wgpuTextureViewRelease(ctx.curViewU);
@@ -77,11 +83,22 @@ static void releaseTextures() {
 
   wgpuTextureViewRelease(ctx.frameView);
   wgpuTextureRelease(ctx.frameTexture);
+
+  if (ctx.yadifBindGroup != nullptr) {
+    wgpuBindGroupRelease(ctx.yadifBindGroup);
+    ctx.yadifBindGroup = nullptr;
+  }
+  if (ctx.bindGroup != nullptr) {
+    wgpuBindGroupRelease(ctx.bindGroup);
+    ctx.bindGroup = nullptr;
+  }
+  if (ctx.sampler != nullptr) {
+    wgpuSamplerRelease(ctx.sampler);
+    ctx.sampler = nullptr;
+  }
 }
 
 static void createTextures(int width, int height) {
-  std::vector<uint8_t> tmpBuffer(width * height);
-
   WGPUExtent3D size = {};
   size.width = width;
   size.height = height;
@@ -352,9 +369,6 @@ void initWebGpu() {
   createTextures(1920, 1080);
 }
 
-static void (
-    *initDeviceCallback)(); // キャプチャするとコンパイルできなかったのでグローバル変数化・・・
-
 void drawWebGpu(AVFrame *frame) {
   if (frame->width != ctx.textureWidth || frame->height != ctx.textureHeight) {
     releaseTextures();
@@ -395,15 +409,24 @@ void drawWebGpu(AVFrame *frame) {
       .depthOrArrayLayers = 1,
   };
 
+  // AVFrame の各行は linesize バイト間隔で並ぶ (アライメントのため width より
+  // 大きいことがある)。width を渡すと行がずれて映像が斜めになるので、実際の
+  // ストライドを bytesPerRow として渡す。
   WGPUTextureDataLayout textureDataLayout = {
       .offset = 0,
-      .bytesPerRow = static_cast<uint32_t>(frame->width),
+      .bytesPerRow = static_cast<uint32_t>(frame->linesize[0]),
       .rowsPerImage = static_cast<uint32_t>(frame->height),
   };
 
-  WGPUTextureDataLayout textureDataLayoutUv = {
+  WGPUTextureDataLayout textureDataLayoutU = {
       .offset = 0,
-      .bytesPerRow = static_cast<uint32_t>(frame->width / 2),
+      .bytesPerRow = static_cast<uint32_t>(frame->linesize[1]),
+      .rowsPerImage = static_cast<uint32_t>(frame->height / 2),
+  };
+
+  WGPUTextureDataLayout textureDataLayoutV = {
+      .offset = 0,
+      .bytesPerRow = static_cast<uint32_t>(frame->linesize[2]),
       .rowsPerImage = static_cast<uint32_t>(frame->height / 2),
   };
 
@@ -417,25 +440,29 @@ void drawWebGpu(AVFrame *frame) {
 
   copyTexture.texture = ctx.nextTextureY;
   wgpuQueueWriteTexture(ctx.queue, &copyTexture, frame->data[0],
-                        frame->height * frame->linesize[0], &textureDataLayout,
-                        &copySize);
+                        (size_t)frame->height * frame->linesize[0],
+                        &textureDataLayout, &copySize);
 
   copyTexture.texture = ctx.nextTextureU;
   wgpuQueueWriteTexture(ctx.queue, &copyTexture, frame->data[1],
-                        frame->height * frame->linesize[1],
-                        &textureDataLayoutUv, &copySizeuv);
+                        (size_t)(frame->height / 2) * frame->linesize[1],
+                        &textureDataLayoutU, &copySizeuv);
 
   copyTexture.texture = ctx.nextTextureV;
   wgpuQueueWriteTexture(ctx.queue, &copyTexture, frame->data[2],
-                        frame->height * frame->linesize[2],
-                        &textureDataLayoutUv, &copySizeuv);
+                        (size_t)(frame->height / 2) * frame->linesize[2],
+                        &textureDataLayoutV, &copySizeuv);
 
   WGPUComputePassEncoder compPass =
       wgpuCommandEncoderBeginComputePass(encoder, &compPassDesc);
   wgpuComputePassEncoderSetPipeline(compPass, ctx.yadifPipeline);
   wgpuComputePassEncoderSetBindGroup(compPass, 0, ctx.yadifBindGroup, 0, 0);
-  wgpuComputePassEncoderDispatchWorkgroups(compPass, ctx.textureWidth / 16 / 2,
-                                           ctx.textureHeight / 4 / 2, 1);
+  // 1 invocation が輝度 2x2 画素を処理し、ワークグループは 16x4。切り捨てで
+  // 割ると幅/高さが端数のとき右端・下端が処理されないため切り上げる (範囲外
+  // の textureStore は WGSL 仕様上無視される)。
+  const uint32_t dispatchX = ((uint32_t)ctx.textureWidth + 31) / 32;
+  const uint32_t dispatchY = ((uint32_t)ctx.textureHeight + 7) / 8;
+  wgpuComputePassEncoderDispatchWorkgroups(compPass, dispatchX, dispatchY, 1);
   wgpuComputePassEncoderEnd(compPass);
   wgpuComputePassEncoderRelease(compPass);
 
