@@ -5,10 +5,20 @@ on:
     branches: [main]
     paths:
       - 'src/**'
+      - 'test/**'
+      - 'package.json'
+      - 'next.config.js'
+      - 'tsconfig.json'
+      - 'yarn.lock'
   pull_request:
     branches: [main]
     paths:
       - 'src/**'
+      - 'test/**'
+      - 'package.json'
+      - 'next.config.js'
+      - 'tsconfig.json'
+      - 'yarn.lock'
 
 jobs:
   build-next:
@@ -21,5 +31,6 @@ jobs:
           node-version: '22'
       - run: yarn
       - run: yarn lint
+      - run: yarn test
       - run: yarn build
       - run: yarn export

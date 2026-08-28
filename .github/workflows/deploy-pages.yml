@@ -60,6 +60,9 @@ jobs:
       - name: Lint frontend
         run: yarn lint
 
+      - name: Run tests
+        run: yarn test
+
       - name: Build frontend
         run: yarn build
 

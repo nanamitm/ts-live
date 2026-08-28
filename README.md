@@ -8,9 +8,8 @@ MIT-License（内部で利用している ffmpeg は LGPL です。他にも多�
 
 ## 対応ブラウザ
 
-Chrome 99 以降、その時点の最新版（適宜対応していきます）
+Chrome / Edge 113 以降、その時点の最新版（適宜対応していきます）
 Firefox/Safari は WebGPU の関係でまだ使えません。
-Origin Trial の関係で現在は Edge には対応していません（Edge 102 あたりで対応しているかも）。
 
 ## run
 
@@ -33,9 +32,9 @@ F2 キーでスクリーンキャプチャが出来ます。
 
 - WebAssembly thread を使う（=SharedArrayBuffer を使う）関係で Secure Context 必須
 - mixed content の関係で mirakurun サーバと http/https 混在は出来ない
-- [WebGPU](https://chromestatus.com/feature/6213121689518080) を使っているため、localhost:3000 以外で起動するには Origin Trials キーの取得・設定が必要
+- [WebGPU](https://chromestatus.com/feature/6213121689518080) を使うため、WebGPU が有効なブラウザ (Chrome/Edge 113 以降) が必要
 
-上記の上 2 つの制約から、「http://localhostでアクセスしてmirakurunにhttp接続」または「httpsサーバに接続してmirakurunにもhttps接続」のどちらかでないと動きません。localhost:3000 以外（https 接続する場合）では Origin Trials キーを取得＆設定するか、ブラウザ起動時にコマンドライン引数をつける必要があります。
+上記の上 2 つの制約から、「http://localhostでアクセスしてmirakurunにhttp接続」または「httpsサーバに接続してmirakurunにもhttps接続」のどちらかでないと動きません。
 
 ## ファイル再生機能
 

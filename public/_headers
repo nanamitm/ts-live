@@ -1,5 +1,6 @@
 /*
-  Access-Control-Allow-Origin: *
   Cross-Origin-Embedder-Policy: require-corp
   Cross-Origin-Opener-Policy: same-origin
-  
+
+/wasm/*
+  Access-Control-Allow-Origin: *

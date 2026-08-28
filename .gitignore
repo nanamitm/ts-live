@@ -40,3 +40,8 @@ public/data/
 
 .env
 public/bs4k-sample.hevc
+
+# cmake --install が public/wasm 以下に吐く中間生成物 (fmt のヘッダ/静的ライブラリ)。
+# 配信物ではないので追跡しない。
+/public/wasm/include/
+/public/wasm/lib/

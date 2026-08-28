@@ -117,7 +117,7 @@ set(FFMPEG_LIBRARIES
 )
 
 file(GLOB_RECURSE SOURCES src/*.cpp)
-file(GLOB_RECURSE HEADERS src/*/hpp)
+file(GLOB_RECURSE HEADERS src/*.hpp)
 file(GLOB SHADERS src/video/shaders/*.wgsl)
 
 add_executable(ts-live ${SOURCES} ${HEADERS} ${SHADERS} src/audio/processor.js)

@@ -12,9 +12,13 @@ module.exports = {
   env: {
     VERSION: process.env.VERSION
   },
+  // NOTE: 静的エクスポート(next export)では headers/rewrites は反映されない。
+  // 本番(Cloudflare Pages)のヘッダーは public/_headers が正となるので、両者を
+  // 変更するときは必ず揃えること。ここは `yarn dev` 用。
   async headers () {
     return [
       {
+        // SharedArrayBuffer(WASM thread)に必要な cross-origin isolation。
         source: '/:path*',
         headers: [
           {
@@ -24,21 +28,27 @@ module.exports = {
           {
             key: 'Cross-Origin-Opener-Policy',
             value: 'same-origin'
-          },
+          }
+        ]
+      },
+      {
+        // WASM 一式は他オリジンからの取得を許可する。HTML までワイルドカードで
+        // 開ける必要は無いのでアセットに限定する。
+        source: '/wasm/:path*',
+        headers: [
           {
             key: 'Access-Control-Allow-Origin',
             value: '*'
-          },
-          {
-            key: 'origin-trial',
-            value:
-              'AjPwILqou86MNqXlfZc0tZycsl9U9sV/uI2ti0RK1/w0kT3/l35O3zugkEb31z1gKbxnakvZahtfWf9h42buSA4AAABJeyJvcmlnaW4iOiJodHRwOi8vbG9jYWxob3N0OjMwMDAiLCJmZWF0dXJlIjoiV2ViR1BVIiwiZXhwaXJ5IjoxNjYzNzE4Mzk5fQ=='
           }
         ]
       }
     ]
   },
+  // 開発コンテナの mirakc を叩くための開発専用 rewrite。
   async rewrites () {
+    if (process.env.NODE_ENV !== 'development') {
+      return []
+    }
     return [
       {
         source: '/api/:path*',
