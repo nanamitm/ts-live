@@ -7,7 +7,7 @@
     "export": "next export",
     "start": "next start",
     "lint": "next lint",
-    "test": "node --test \"test/**/*.test.mjs\"",
+    "test": "node --test --experimental-strip-types --no-warnings \"test/**/*.test.m[jt]s\"",
     "cmake:config": "mkdir -p wasm/build && cd wasm/build && emcmake cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ..",
     "cmake:config:debug": "mkdir -p wasm/build && cd wasm/build && emcmake cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ..",
     "cmake:build": "cmake --build wasm/build --parallel 4 && cmake --install wasm/build --prefix public/wasm",

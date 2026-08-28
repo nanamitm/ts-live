@@ -25,6 +25,7 @@ import { VolumeMute, VolumeUp } from '@mui/icons-material'
 import { CartesianGrid, LineChart, XAxis, YAxis, Line, Legend } from 'recharts'
 import Head from 'next/head'
 import { WasmModule, StatsData, VideoStreamInfo } from '../lib/wasmmodule'
+import { CONTAINER_PROBE_SIZE, looksLikeTlv } from '../lib/container'
 import dayjs from 'dayjs'
 
 import { Program, Service } from 'mirakurun/api'
@@ -825,18 +826,10 @@ const Page: NextPage = () => {
   // ファイル先頭を読み、MPEG-TS(同期バイト 0x47 が 188/192 バイト間隔で並ぶ)なら
   // 2K(TS)=false、それ以外は BS4K TLV とみなす。'auto' モードで使う。
   const detectTlvFromHeader = async (file: File): Promise<boolean> => {
-    const buf = new Uint8Array(await file.slice(0, 192 * 24).arrayBuffer())
-    const looksTs = (start: number, stride: number) => {
-      let hit = 0
-      for (let i = 0; i < 8; i++) {
-        const pos = start + i * stride
-        if (pos < buf.length && buf[pos] === 0x47) hit++
-      }
-      return hit >= 6
-    }
-    // 188=通常TS, 192(offset4)=M2TS(4バイトタイムスタンプ付), 192(offset0)も一応
-    const isTs = looksTs(0, 188) || looksTs(4, 192) || looksTs(0, 192)
-    return !isTs
+    const buf = new Uint8Array(
+      await file.slice(0, CONTAINER_PROBE_SIZE).arrayBuffer()
+    )
+    return looksLikeTlv(buf)
   }
 
   const playLocalFile = (file: File) => {
