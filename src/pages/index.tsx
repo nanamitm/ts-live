@@ -39,7 +39,10 @@ declare interface EpgRecordedFile {
   filename: string
 }
 
-let initialized = false;
+// グラフに保持する統計データの点数。
+const CHART_HISTORY = 300
+
+let initialized = false
 
 const Page: NextPage = () => {
   const router = useRouter()
@@ -106,7 +109,8 @@ const Page: NextPage = () => {
       VideoFrameQueueSize: 0,
       AudioFrameQueueSize: 0,
       InputBufferSize: 0,
-      SDLQueuedAudioSize: 0,
+      AudioWorkletBufferSize: 0,
+      CaptionDataQueueSize: 0,
     },
   ])
   const [showCharts, setShowCharts] = useState<boolean>(false)
@@ -395,35 +399,49 @@ const Page: NextPage = () => {
 
   const [wakeLock, setWakeLock] = useState<WakeLockSentinel>()
   const [wasmMod, setWasmMod] = useState<WasmModule | null>(null)
+  // WebGPU 非対応や WASM 読み込み失敗を握り潰さずに画面へ出す。
+  const [initError, setInitError] = useState<string | null>(null)
 
   useEffect(() => {
-    let mounted = true;
-    console.log("useEffect", initialized)
+    // WASM は <script> をグローバルに読み込むので、初期化は一度きり。
+    // (React StrictMode の二重マウントでも二重ロードしない)
     if (initialized) {
       return
     }
-    initialized = true;
+    initialized = true
     ;(async () => {
-      console.log("async", wasmMod, initialized)
-
-      const adapter = await (navigator as any).gpu.requestAdapter()
-      const device = await adapter.requestDevice()
-      const script = document.createElement('script')
-      script.onload = () => {
-        console.log("onload")
-        ;(window as any)
-          .createWasmModule({ preinitializedWebGPUDevice: device })
-          .then((m: WasmModule) => {
-            console.log('then', m)
-            console.log("setWasmMod")
-            setWasmMod(m)
-          })
+      const gpu = (navigator as any).gpu
+      if (!gpu) {
+        throw new Error(
+          'このブラウザでは WebGPU が使えません。Chrome/Edge の最新版でお試しください。'
+        )
       }
-      script.src = "/wasm/ts-live.js"
-      document.head.appendChild(script)
-      console.log("script element created")
-    })();
-}, [])
+      const adapter = await gpu.requestAdapter()
+      if (!adapter) {
+        throw new Error('WebGPU アダプタを取得できませんでした。')
+      }
+      const device = await adapter.requestDevice()
+      const loadedModule = await new Promise<WasmModule>((resolve, reject) => {
+        const script = document.createElement('script')
+        script.onload = () => {
+          ;(window as any)
+            .createWasmModule({ preinitializedWebGPUDevice: device })
+            .then(resolve)
+            .catch(reject)
+        }
+        script.onerror = () =>
+          reject(new Error('/wasm/ts-live.js の読み込みに失敗しました。'))
+        script.src = '/wasm/ts-live.js'
+        document.head.appendChild(script)
+      })
+      setWasmMod(loadedModule)
+    })().catch((ex: unknown) => {
+      console.error('WASM initialization failed:', ex)
+      // 失敗したままだと再試行できないのでフラグを戻す。
+      initialized = false
+      setInitError(ex instanceof Error ? ex.message : String(ex))
+    })
+  }, [])
 
   useEffect(() => {
     if (!wasmMod) return
@@ -447,14 +465,14 @@ const Page: NextPage = () => {
   //   )
   //   return CanvasProvider
   // })
+  // 直近 CHART_HISTORY 点だけを保持する。state 配列を直接書き換えると React の
+  // 再レンダー判定が壊れるので、必ず新しい配列を返す。
   const statsCallback = useCallback(function statsCallbackFunc(statsDataList: StatsData[]) {
     setChartData(prev => {
-      if (prev.length + statsDataList.length > 300) {
-        const overLength = prev.length + statsDataList.length - 300
-        prev.copyWithin(0, overLength)
-        prev.length -= statsDataList.length + overLength
-      }
-      return prev.concat(statsDataList)
+      const merged = prev.concat(statsDataList)
+      return merged.length > CHART_HISTORY
+        ? merged.slice(merged.length - CHART_HISTORY)
+        : merged
     })
   }, [])
 
@@ -539,7 +557,13 @@ const Page: NextPage = () => {
     })
   }, [mirakurunOk, mirakurunServer])
 
-  const findCurrentProgram = (programs: Array<Program>, activeService: Service) => {
+  // 現在放送中の番組を選び、その番組が終わる時刻に一覧から取り除くタイマーを
+  // 張る。タイマー ID を返し、呼び出し側(effect)が破棄できるようにする
+  // (放置すると service を切り替えるたびに最長で番組長ぶん残り続ける)。
+  const findCurrentProgram = (
+    programs: Array<Program>,
+    activeService: Service
+  ): ReturnType<typeof setTimeout> | null => {
     const currentTime = Date.now()
     const current = programs.find(v => {
       if (
@@ -553,19 +577,29 @@ const Page: NextPage = () => {
         return false
       }
     })
-    if (current !== undefined) {
-      setCurrentProgram(current)
-      setTimeout(() => {
-        setPrograms(prev => [...prev.filter(p => p.id !== current.id)])
-      }, current.startAt + current.duration - currentTime)
+    if (current === undefined) {
+      return null
     }
+    setCurrentProgram(current)
+    // setTimeout の遅延は 32bit を超えると即発火してしまうので上限を設ける。
+    const delay = Math.min(
+      Math.max(current.startAt + current.duration - currentTime, 0),
+      0x7fffffff
+    )
+    return setTimeout(() => {
+      setPrograms(prev => prev.filter(p => p.id !== current.id))
+    }, delay)
   }
 
   useEffect(() => {
     if (!activeService) {
       return
     }
-    findCurrentProgram(programs, activeService)
+    const timer = findCurrentProgram(programs, activeService)
+    return () => {
+      if (timer !== null) clearTimeout(timer)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [programs, activeService])
 
   useEffect(() => {
@@ -766,6 +800,9 @@ const Page: NextPage = () => {
       if (stopFuncRef.current === stop) stopFuncRef.current = () => {}
       stop()
     }
+    // 再生中にサーバー URL や統計表示の設定が変わっても再生を止めたくないので、
+    // それらは意図的に依存から外している。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     touched,
     mirakurunOk,
@@ -978,7 +1015,7 @@ const Page: NextPage = () => {
         </MenuItem>
       )
     })
-  }, [epgRecordedFiles, activeRecordedFileId])
+  }, [epgRecordedFiles])
 
   useEffect(() => {
     if (!wasmMod) return
@@ -1085,7 +1122,7 @@ const Page: NextPage = () => {
                   activeService ? activeService.id : tvServices.length > 0 ? tvServices[0].id : null
                 }
                 onChange={ev => {
-                  if (ev.target.value !== null && typeof (ev.target.value === 'number')) {
+                  if (ev.target.value !== null && typeof ev.target.value === 'number') {
                     const id = ev.target.value
                     const active = tvServices.find(v => v.id === id)
                     if (active) setActiveService(active)
@@ -1437,6 +1474,27 @@ const Page: NextPage = () => {
             resetToken={captionResetToken}
           ></Caption>
         </div>
+        {initError && (
+          <div
+            css={css`
+              position: absolute;
+              top: 50%;
+              left: 50%;
+              transform: translate(-50%, -50%);
+              z-index: 100;
+              max-width: 80%;
+              padding: 16px 24px;
+              border-radius: 8px;
+              background: rgba(0, 0, 0, 0.75);
+              color: #ff8a80;
+              font-size: 15px;
+              line-height: 1.6;
+              text-align: center;
+            `}
+          >
+            {initError}
+          </div>
+        )}
         <div
           css={css`
             position: absolute;

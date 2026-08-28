@@ -1,9 +1,12 @@
+// decoderMainloop() が statsCallback へ渡す 1 サンプル。キー名は WASM 側の
+// data.set(...) と一致させること。
 export declare interface StatsData {
   time: number
   VideoFrameQueueSize: number
   AudioFrameQueueSize: number
-  SDLQueuedAudioSize: number
+  AudioWorkletBufferSize: number
   InputBufferSize: number
+  CaptionDataQueueSize: number
 }
 
 // probe 後に WASM から通知される映像ストリーム情報。webCodecs は「実際に
@@ -38,7 +41,8 @@ export declare interface WasmModule extends EmscriptenModule {
     callback: ((statsDataList: Array<StatsData>) => void) | null
   ): void
   playFile(url: string): void
-  getNextInputBuffer(size: number): Uint8Array
+  // 入力リングバッファが満杯のときは null を返す (バックプレッシャ)。
+  getNextInputBuffer(size: number): Uint8Array | null
   commitInputData(size: number): void
   reset(): void
   setAudioGain(volume: number): void
