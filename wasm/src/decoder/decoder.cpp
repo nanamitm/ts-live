@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
@@ -46,7 +47,7 @@ const size_t DEFAULT_HEIGHT = 1080;
 
 std::chrono::system_clock::time_point startTime;
 
-bool resetedDecoder = false;
+std::atomic<bool> resetedDecoder{false};
 std::uint8_t inputBuffer[MAX_INPUT_BUFFER];
 std::mutex inputBufferMtx;
 std::condition_variable waitCv;
@@ -55,7 +56,7 @@ std::condition_variable waitCv;
 // sync_byte) 探索・188バイト単位の servicefilter 処理は通常放送(MPEG2-TS)
 // 専用のロジックであり、可変長パケットの TLV データに対して行うと
 // バイト列を破壊してしまうため、TLV モードでは素通しに切り替える。
-bool tlvMode = false;
+std::atomic<bool> tlvMode{false};
 
 void setTlvMode(bool isTlv) {
   tlvMode = isTlv;
@@ -68,17 +69,6 @@ size_t inputBufferWriteIndex = 0;
 // for libav
 AVCodecContext *videoCodecContext = nullptr;
 AVCodecContext *audioCodecContext = nullptr;
-
-// WebGPU側は 8bit yuv420p 前提のため、HEVC Main10 (yuv420p10le) 等の
-// 高ビット深度フレームは描画直前 (メインループ = 消費側の単一スレッド) で
-// 8bit に変換する。デコードスレッド側で毎フレーム 12MB を malloc/free して
-// 変換していた旧実装は、WASM の単一 malloc ロックを複数デコードワーカーと
-// 奪い合ってコマ送りの一因になっていた。変換先フレームは 1 枚だけ確保して
-// 使い回すことで malloc 競合を無くす。
-SwsContext *videoSwsContext = nullptr;
-AVPixelFormat videoSwsSrcFormat = AV_PIX_FMT_NONE;
-int videoSwsWidth = 0, videoSwsHeight = 0;
-AVFrame *conversionFrame = nullptr; // 8bit 変換先 (使い回し)
 
 std::deque<AVFrame *> videoFrameQueue, audioFrameQueue;
 // 字幕キューの 1 件。streamIndex は届いた字幕アセットの AVStream index で、
@@ -99,7 +89,7 @@ std::mutex videoFrameMtx, audioFrameMtx, captionDataMtx;
 std::mutex ttmlMtx;
 std::string lastTtml;
 int lastTtmlStreamIndex = -1;
-bool videoFrameFound = false;
+std::atomic<bool> videoFrameFound{false};
 
 // 10bit→8bit 変換を専用スレッドに分離するための中間キュー。
 // 「デコード(高速・並列)」「変換(4K swscale)」「描画」を別スレッドで
@@ -139,7 +129,7 @@ emscripten::val captionCallback = emscripten::val::null();
 // 対応コーデックは HEVC (BS4K/8K) と H.264 (スカパープレミアム等)。probe の
 // 結果が非対応コーデック(MPEG-2 等)だった場合はソフトデコードへ自動で
 // フォールバックし、下の videoStreamInfoCallback で JS に通知する。
-bool webCodecsMode = false;
+std::atomic<bool> webCodecsMode{false};
 emscripten::val videoAuCallback = emscripten::val::null();
 
 // probe 完了後に映像ストリーム情報(コーデック/解像度/profile/level/SAR と
@@ -156,7 +146,7 @@ struct VideoStreamInfo {
 };
 VideoStreamInfo pendingVideoStreamInfo;
 std::mutex videoStreamInfoMtx;
-bool videoStreamInfoPending = false;
+std::atomic<bool> videoStreamInfoPending{false};
 
 // WebCodecs モード用の HEVC アクセスユニットキュー。デマルチプレクスは
 // 別スレッド(Worker)で動くため、VideoDecoder(メインスレッド API)を触る
@@ -191,7 +181,7 @@ double getAudioPlaybackTime() { return currentAudioPlaybackTime; }
 std::string playFileUrl;
 std::thread downloaderThread;
 
-bool resetedDownloader = false;
+std::atomic<bool> resetedDownloader{false};
 
 std::vector<emscripten::val> statsBuffer;
 
@@ -424,17 +414,6 @@ void resetInternal() {
     std::lock_guard<std::mutex> lock(videoStreamInfoMtx);
     videoStreamInfoPending = false;
   }
-
-  if (videoSwsContext != nullptr) {
-    sws_freeContext(videoSwsContext);
-    videoSwsContext = nullptr;
-  }
-  if (conversionFrame != nullptr) {
-    av_frame_free(&conversionFrame);
-  }
-  videoSwsSrcFormat = AV_PIX_FMT_NONE;
-  videoSwsWidth = 0;
-  videoSwsHeight = 0;
 }
 
 void reset() {
@@ -444,7 +423,7 @@ void reset() {
   resetInternal();
 }
 
-void videoDecoderThreadFunc(bool &terminateFlag) {
+void videoDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
   // find decoder
   const AVCodec *videoCodec =
       avcodec_find_decoder(videoStream->codecpar->codec_id);
@@ -550,9 +529,8 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
       if (spdlog::should_log(spdlog::level::debug)) {
         const AVPixFmtDescriptor *desc =
             av_pix_fmt_desc_get((AVPixelFormat)(frame->format));
-        int bufferSize = av_image_get_buffer_size((AVPixelFormat)frame->format,
-                                                  frame->width, frame->height,
-                                                  1);
+        int bufferSize = av_image_get_buffer_size(
+            (AVPixelFormat)frame->format, frame->width, frame->height, 1);
         spdlog::debug("VideoFrame: {}x{}x{} pixfmt:{} key:{} interlace:{} "
                       "tff:{} codecContext->field_order:?? pts:{} "
                       "stream.timebase:{} bufferSize:{}",
@@ -599,7 +577,14 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
 // 10bit→8bit 変換専用スレッド。videoConvertQueue から生フレームを取り出し、
 // 必要なら 8bit yuv420p に変換して videoFrameQueue へ送る。デコード・描画と
 // 並列に動くことで、各段が単独で実時間を維持できる。
-void videoConvertThreadFunc(bool &terminateFlag) {
+void videoConvertThreadFunc(std::atomic<bool> &terminateFlag) {
+  // swscale の状態はこのスレッドだけが持つ。以前はグローバルに置いていたため、
+  // 変換中に別スレッド(reset())が sws_freeContext して解放済みポインタを
+  // 使う可能性があった。
+  SwsContext *swsContext = nullptr;
+  AVPixelFormat swsSrcFormat = AV_PIX_FMT_NONE;
+  int swsWidth = 0, swsHeight = 0;
+
   while (!terminateFlag) {
     // 下流 (描画待ちの videoFrameQueue) が溜まっていたら抑制する。
     while (!terminateFlag) {
@@ -631,29 +616,32 @@ void videoConvertThreadFunc(bool &terminateFlag) {
 
     AVFrame *outFrame = nullptr;
     if ((AVPixelFormat)raw->format != AV_PIX_FMT_YUV420P) {
-      if (videoSwsContext == nullptr ||
-          videoSwsSrcFormat != (AVPixelFormat)raw->format ||
-          videoSwsWidth != raw->width || videoSwsHeight != raw->height) {
-        if (videoSwsContext != nullptr) {
-          sws_freeContext(videoSwsContext);
+      if (swsContext == nullptr || swsSrcFormat != (AVPixelFormat)raw->format ||
+          swsWidth != raw->width || swsHeight != raw->height) {
+        if (swsContext != nullptr) {
+          sws_freeContext(swsContext);
         }
-        videoSwsContext =
+        swsContext =
             sws_getContext(raw->width, raw->height, (AVPixelFormat)raw->format,
                            raw->width, raw->height, AV_PIX_FMT_YUV420P,
                            SWS_POINT, nullptr, nullptr, nullptr);
-        videoSwsSrcFormat = (AVPixelFormat)raw->format;
-        videoSwsWidth = raw->width;
-        videoSwsHeight = raw->height;
+        swsSrcFormat = (AVPixelFormat)raw->format;
+        swsWidth = raw->width;
+        swsHeight = raw->height;
       }
-      if (videoSwsContext != nullptr) {
+      if (swsContext != nullptr) {
         outFrame = av_frame_alloc();
         outFrame->format = AV_PIX_FMT_YUV420P;
         outFrame->width = raw->width;
         outFrame->height = raw->height;
-        av_frame_get_buffer(outFrame, 0);
-        av_frame_copy_props(outFrame, raw);
-        sws_scale(videoSwsContext, raw->data, raw->linesize, 0, raw->height,
-                  outFrame->data, outFrame->linesize);
+        if (av_frame_get_buffer(outFrame, 0) < 0) {
+          spdlog::error("av_frame_get_buffer for conversion failed");
+          av_frame_free(&outFrame);
+        } else {
+          av_frame_copy_props(outFrame, raw);
+          sws_scale(swsContext, raw->data, raw->linesize, 0, raw->height,
+                    outFrame->data, outFrame->linesize);
+        }
       }
     }
     if (outFrame == nullptr) {
@@ -667,9 +655,13 @@ void videoConvertThreadFunc(bool &terminateFlag) {
       videoFrameQueue.push_back(outFrame);
     }
   }
+
+  if (swsContext != nullptr) {
+    sws_freeContext(swsContext);
+  }
 }
 
-void audioDecoderThreadFunc(bool &terminateFlag) {
+void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
   const AVCodec *audioCodec =
       avcodec_find_decoder(audioStreamList[0]->codecpar->codec_id);
   if (audioCodec == nullptr) {
@@ -895,9 +887,9 @@ void decoderThreadFunc() {
     }
   }
 
-  bool videoTerminateFlag = false;
-  bool audioTerminateFlag = false;
-  bool convertTerminateFlag = false;
+  std::atomic<bool> videoTerminateFlag{false};
+  std::atomic<bool> audioTerminateFlag{false};
+  std::atomic<bool> convertTerminateFlag{false};
   // WebCodecs モードでは映像は JS 側でデコードするので、WASM の映像デコード/
   // 変換スレッドは起動しない。音声スレッドは共通で起動する。
   std::thread videoDecoderThread;
@@ -1238,21 +1230,25 @@ void decoderMainloop() {
   // VideoDecoder を構成するため、下の AU 受け渡しより必ず先に届ける。
   if (videoStreamInfoPending && !videoStreamInfoCallback.isNull()) {
     VideoStreamInfo info;
+    bool deliver = false;
     {
       std::lock_guard<std::mutex> lock(videoStreamInfoMtx);
+      // 取り出しと同時にフラグを降ろす (降ろせなければ既に配信済み)。
+      deliver = videoStreamInfoPending.exchange(false);
       info = pendingVideoStreamInfo;
-      videoStreamInfoPending = false;
     }
-    auto obj = emscripten::val::object();
-    obj.set("codec", info.codecName);
-    obj.set("width", info.width);
-    obj.set("height", info.height);
-    obj.set("profile", info.profile);
-    obj.set("level", info.level);
-    obj.set("sarNum", info.sarNum);
-    obj.set("sarDen", info.sarDen);
-    obj.set("webCodecs", info.webCodecs);
-    videoStreamInfoCallback(obj);
+    if (deliver) {
+      auto obj = emscripten::val::object();
+      obj.set("codec", info.codecName);
+      obj.set("width", info.width);
+      obj.set("height", info.height);
+      obj.set("profile", info.profile);
+      obj.set("level", info.level);
+      obj.set("sarNum", info.sarNum);
+      obj.set("sarDen", info.sarDen);
+      obj.set("webCodecs", info.webCodecs);
+      videoStreamInfoCallback(obj);
+    }
   }
 
   // WebCodecs モード: 溜まったアクセスユニット(HEVC/H.264)を JS の
@@ -1550,7 +1546,8 @@ void downloadNextRange() {
       if (inputBufferWriteIndex + fetch->numBytes >= MAX_INPUT_BUFFER) {
         size_t remainSize = inputBufferWriteIndex - inputBufferReadIndex;
         // 詰め直しは領域が重なりうるので memmove を使う (memcpy は UB)。
-        memmove(&inputBuffer[0], &inputBuffer[inputBufferReadIndex], remainSize);
+        memmove(&inputBuffer[0], &inputBuffer[inputBufferReadIndex],
+                remainSize);
         inputBufferReadIndex = 0;
         inputBufferWriteIndex = remainSize;
       }
