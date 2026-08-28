@@ -65,16 +65,19 @@ class AudioFeederProcessor extends AudioWorkletProcessor {
       this.currentBufferReadSize = 0
       if (output[0].length > copySize) {
         if (this.buffers0.length > 1) {
-          output[0].set(
-            this.buffers0[1].subarray(0, output[0].length - copySize),
-            copySize
-          )
-          output[1].set(
-            this.buffers1[1].subarray(0, output[0].length - copySize),
-            copySize
-          )
-          this.bufferedSamples -= output[0].length - copySize
-          this.currentBufferReadSize = copySize
+          // 次のバッファから残りを詰める。読み進めた位置は「次のバッファから
+          // 取り出した長さ」であって copySize ではない (ここを取り違えると
+          // バッファ境界のたびにサンプルが飛ぶ/重複してノイズになる)。
+          const need = output[0].length - copySize
+          const take = Math.min(need, this.buffers0[1].length)
+          output[0].set(this.buffers0[1].subarray(0, take), copySize)
+          output[1].set(this.buffers1[1].subarray(0, take), copySize)
+          this.bufferedSamples -= take
+          this.currentBufferReadSize = take
+          if (take < need) {
+            output[0].fill(0, copySize + take)
+            output[1].fill(0, copySize + take)
+          }
           this.buffers0.shift()
           this.buffers1.shift()
         } else {
