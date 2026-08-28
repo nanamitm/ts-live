@@ -446,6 +446,7 @@ void videoDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
   if (avcodec_parameters_to_context(videoCodecContext, videoStream->codecpar) <
       0) {
     spdlog::error("avcodec_parameters_to_context failed");
+    avcodec_free_context(&videoCodecContext);
     return;
   }
   // BS4K/8K (HEVC 4K/8K 60p) のソフトウェアデコードはシングルスレッドでは
@@ -476,11 +477,17 @@ void videoDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
   videoCodecContext->skip_loop_filter = AVDISCARD_ALL;
   if (avcodec_open2(videoCodecContext, videoCodec, nullptr) != 0) {
     spdlog::error("avcodec_open2 failed");
+    avcodec_free_context(&videoCodecContext);
     return;
   }
   spdlog::debug("avcodec for video open success.");
 
   AVFrame *frame = av_frame_alloc();
+  if (frame == nullptr) {
+    spdlog::error("av_frame_alloc for video failed");
+    avcodec_free_context(&videoCodecContext);
+    return;
+  }
 
   while (!terminateFlag) {
     // パイプラインが詰まったら、ここ(映像デコーダー)だけを一時停止する。
@@ -570,6 +577,7 @@ void videoDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
     av_packet_free(&ppacket);
   }
 
+  av_frame_free(&frame);
   spdlog::debug("freeing videoCodecContext");
   avcodec_free_context(&videoCodecContext);
 }
@@ -681,11 +689,13 @@ void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
   if (avcodec_parameters_to_context(audioCodecContext,
                                     audioStreamList[0]->codecpar) < 0) {
     spdlog::error("avcodec_parameters_to_context failed");
+    avcodec_free_context(&audioCodecContext);
     return;
   }
 
   if (avcodec_open2(audioCodecContext, audioCodec, nullptr) != 0) {
     spdlog::error("avcodec_open2 failed");
+    avcodec_free_context(&audioCodecContext);
     return;
   }
   spdlog::debug("avcodec for audio open success.");
@@ -694,6 +704,11 @@ void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
   // inputBufferReadIndex = 0;
 
   AVFrame *frame = av_frame_alloc();
+  if (frame == nullptr) {
+    spdlog::error("av_frame_alloc for audio failed");
+    avcodec_free_context(&audioCodecContext);
+    return;
+  }
 
   while (!terminateFlag) {
     AVPacket *ppacket;
@@ -738,7 +753,8 @@ void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
     }
     av_packet_free(&ppacket);
   }
-  spdlog::debug("freeing videoCodecContext");
+  av_frame_free(&frame);
+  spdlog::debug("freeing audioCodecContext");
   avcodec_free_context(&audioCodecContext);
 }
 
@@ -750,9 +766,21 @@ void decoderThreadFunc() {
   AVIOContext *avioContext = nullptr;
   uint8_t *ibuf = nullptr;
   size_t ibufSize = 64 * 1024;
-  size_t requireBufSize = 2 * 1024 * 1024;
 
-  AVFrame *frame = nullptr;
+  // probe 失敗などの途中終了でも ffmpeg のコンテキストを取りこぼさない。
+  // decoderThreadFunc() は initDecoder() のループから繰り返し呼ばれるので、
+  // 1 回あたりの取りこぼしがそのまま累積する。
+  auto releaseContexts = [&]() {
+    if (formatContext != nullptr) {
+      avformat_close_input(&formatContext);
+    }
+    if (avioContext != nullptr) {
+      // ffmpeg がバッファを付け替えている場合があるので avioContext が今
+      // 持っているものを解放する (元の ibuf ではなく)。
+      av_freep(&avioContext->buffer);
+      avio_context_free(&avioContext);
+    }
+  };
 
   // probe phase
   {
@@ -771,6 +799,7 @@ void decoderThreadFunc() {
 
       if (avformat_open_input(&formatContext, nullptr, nullptr, nullptr) != 0) {
         spdlog::error("avformat_open_input error");
+        releaseContexts();
         return;
       }
       spdlog::debug("open success");
@@ -779,6 +808,7 @@ void decoderThreadFunc() {
 
     if (avformat_find_stream_info(formatContext, nullptr) < 0) {
       spdlog::error("avformat_find_stream_info error");
+      releaseContexts();
       return;
     }
     spdlog::debug("avformat_find_stream_info success");
@@ -817,10 +847,12 @@ void decoderThreadFunc() {
     }
     if (videoStream == nullptr) {
       spdlog::error("No video stream ...");
+      releaseContexts();
       return;
     }
     if (audioStreamList.empty()) {
       spdlog::error("No audio stream ...");
+      releaseContexts();
       return;
     }
     spdlog::info("Found video stream index:{} codec:{} dim:{}x{} "
@@ -934,13 +966,7 @@ void decoderThreadFunc() {
       std::this_thread::sleep_for(std::chrono::milliseconds(3));
       continue;
     }
-    // decode frames
-    if (frame == nullptr) {
-      frame = av_frame_alloc();
-    }
     AVPacket *ppacket = av_packet_alloc();
-    int videoCount = 0;
-    int audioCount = 0;
     int ret = av_read_frame(formatContext, ppacket);
     if (ret != 0) {
       spdlog::info("av_read_frame: {} {}", ret, av_err2str(ret));
@@ -1098,10 +1124,8 @@ void decoderThreadFunc() {
   spdlog::debug("join to audioDecoderThread");
   audioDecoderThread.join();
 
-  spdlog::debug("freeing avio_context");
-  avio_context_free(&avioContext);
-  // spdlog::debug("freeing avformat context");
-  avformat_free_context(formatContext);
+  spdlog::debug("freeing avformat/avio context");
+  releaseContexts();
 
   spdlog::debug("decoderThreadFunc end.");
 }
@@ -1182,6 +1206,9 @@ void initDecoder() {
     while (true) {
       resetedDecoder = false;
       decoderThreadFunc();
+      // probe に失敗した場合 decoderThreadFunc() は即座に戻る。そのまま回すと
+      // CPU を食い潰すので少し待ってから再挑戦する。
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   });
 
