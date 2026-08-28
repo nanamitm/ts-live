@@ -122,7 +122,15 @@ AVStream *captionStream = nullptr;
 // aribb24.js は B24 専用なので、TTML のときは描画せずダンプ観測に留める。
 bool captionIsTtml = false;
 
-int64_t initPts = -1;
+// AVFrame の参照バッファサイズ。buf[n] は平面数より多いインデックスや
+// モノラル音声では nullptr になるため、ログ用に安全に取り出す。
+static int64_t frameBufSize(const AVFrame *frame, int index) {
+  if (frame == nullptr || index < 0 || index >= AV_NUM_DATA_POINTERS ||
+      frame->buf[index] == nullptr) {
+    return 0;
+  }
+  return (int64_t)frame->buf[index]->size;
+}
 
 emscripten::val captionCallback = emscripten::val::null();
 
@@ -274,8 +282,10 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
   }
 
   // 0x47: TS packet header sync_byte
-  while (inputBuffer[inputBufferReadIndex] != 0x47 &&
-         inputBufferReadIndex < inputBufferWriteIndex) {
+  // 添字を使う前に必ず範囲を確認する (読み切った位置で配列外を読まないよう
+  // 境界チェックを先に置く)。
+  while (inputBufferReadIndex < inputBufferWriteIndex &&
+         inputBuffer[inputBufferReadIndex] != 0x47) {
     inputBufferReadIndex++;
   }
 
@@ -533,34 +543,38 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
       // return;
     }
     while (avcodec_receive_frame(videoCodecContext, frame) == 0) {
-      const AVPixFmtDescriptor *desc =
-          av_pix_fmt_desc_get((AVPixelFormat)(frame->format));
-      int bufferSize = av_image_get_buffer_size((AVPixelFormat)frame->format,
-                                                frame->width, frame->height, 1);
-      spdlog::debug("VideoFrame: {}x{}x{} pixfmt:{} key:{} interlace:{} "
-                    "tff:{} codecContext->field_order:?? pts:{} "
-                    "stream.timebase:{} bufferSize:{}",
-                    frame->width, frame->height, frame->ch_layout.nb_channels,
-                    frame->format, frame->flags & AV_FRAME_FLAG_KEY,
-                    frame->flags & AV_FRAME_FLAG_INTERLACED,
-                    frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST, frame->pts,
-                    av_q2d(videoStream->time_base), bufferSize);
-      if (desc == nullptr) {
-        spdlog::debug("desc is NULL");
-      } else {
+      // spdlog::debug() は関数呼び出しなので、ログレベルに関わらず引数が必ず
+      // 評価される。frame->buf[n] は平面数の少ないピクセルフォーマットでは
+      // nullptr になり得るため、ダンプ全体をレベル判定で囲う (毎フレームの
+      // av_image_get_buffer_size 呼び出しも省ける)。
+      if (spdlog::should_log(spdlog::level::debug)) {
+        const AVPixFmtDescriptor *desc =
+            av_pix_fmt_desc_get((AVPixelFormat)(frame->format));
+        int bufferSize = av_image_get_buffer_size((AVPixelFormat)frame->format,
+                                                  frame->width, frame->height,
+                                                  1);
+        spdlog::debug("VideoFrame: {}x{}x{} pixfmt:{} key:{} interlace:{} "
+                      "tff:{} codecContext->field_order:?? pts:{} "
+                      "stream.timebase:{} bufferSize:{}",
+                      frame->width, frame->height, frame->ch_layout.nb_channels,
+                      frame->format, frame->flags & AV_FRAME_FLAG_KEY,
+                      frame->flags & AV_FRAME_FLAG_INTERLACED,
+                      frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST, frame->pts,
+                      av_q2d(videoStream->time_base), bufferSize);
+        if (desc == nullptr) {
+          spdlog::debug("desc is NULL");
+        } else {
+          spdlog::debug(
+              "desc name:{} nb_components:{} comp[0].plane:{} .offet:{} "
+              "comp[1].plane:{} .offset:{} comp[2].plane:{} .offset:{}",
+              desc->name, desc->nb_components, desc->comp[0].plane,
+              desc->comp[0].offset, desc->comp[1].plane, desc->comp[1].offset,
+              desc->comp[2].plane, desc->comp[2].offset);
+        }
         spdlog::debug(
-            "desc name:{} nb_components:{} comp[0].plane:{} .offet:{} "
-            "comp[1].plane:{} .offset:{} comp[2].plane:{} .offset:{}",
-            desc->name, desc->nb_components, desc->comp[0].plane,
-            desc->comp[0].offset, desc->comp[1].plane, desc->comp[1].offset,
-            desc->comp[2].plane, desc->comp[2].offset);
-      }
-      spdlog::debug(
-          "buf[0]size:{} buf[1].size:{} buf[2].size:{} buffer_size:{}",
-          frame->buf[0]->size, frame->buf[1]->size, frame->buf[2]->size,
-          bufferSize);
-      if (initPts < 0) {
-        initPts = frame->pts;
+            "buf[0]size:{} buf[1].size:{} buf[2].size:{} buffer_size:{}",
+            frameBufSize(frame, 0), frameBufSize(frame, 1),
+            frameBufSize(frame, 2), bufferSize);
       }
       frame->time_base.den = videoStream->time_base.den;
       frame->time_base.num = videoStream->time_base.num;
@@ -710,16 +724,15 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
       // return;
     }
     while (avcodec_receive_frame(audioCodecContext, frame) == 0) {
+      // buf[1] はモノラル(=1プレーン)やパック形式では nullptr。引数は常に
+      // 評価されるので frameBufSize() 経由で参照する。
       spdlog::debug("AudioFrame: format:{} pts:{} frame timebase:{} stream "
                     "timebase:{} buf[0].size:{} buf[1].size:{} nb_samples:{} "
                     "ch:{}",
                     frame->format, frame->pts, av_q2d(frame->time_base),
-                    av_q2d(audioStreamList[0]->time_base), frame->buf[0]->size,
-                    frame->buf[1]->size, frame->nb_samples,
-                    frame->ch_layout.nb_channels);
-      if (initPts < 0) {
-        initPts = frame->pts;
-      }
+                    av_q2d(audioStreamList[0]->time_base),
+                    frameBufSize(frame, 0), frameBufSize(frame, 1),
+                    frame->nb_samples, frame->ch_layout.nb_channels);
       frame->time_base = audioStreamList[0]->time_base;
       // 通常は最初の映像フレームが出るまで音声を積まない(起動時 A/V 同期)。
       // WebCodecs モードは映像を JS 側でデコードするため videoFrameFound が
@@ -939,6 +952,11 @@ void decoderThreadFunc() {
     int ret = av_read_frame(formatContext, ppacket);
     if (ret != 0) {
       spdlog::info("av_read_frame: {} {}", ret, av_err2str(ret));
+      // 失敗しても確保済みパケットは必ず解放する (解放漏れのままリトライすると
+      // 読み出しエラーが続く間ずっとリークし続ける)。
+      av_packet_free(&ppacket);
+      // エラーが続くときに CPU を食い潰さないよう少し待つ。
+      std::this_thread::sleep_for(std::chrono::milliseconds(3));
       continue;
     }
     if (ppacket->stream_index == videoStream->index) {
@@ -1023,23 +1041,31 @@ void decoderThreadFunc() {
           }
         }
         if (changed && !captionCallback.isNull()) {
-          std::vector<uint8_t> buffer(ppacket->size);
-          memcpy(&buffer[0], ppacket->data, ppacket->size);
+          std::vector<uint8_t> buffer(ppacket->data,
+                                      ppacket->data + ppacket->size);
           std::lock_guard<std::mutex> lock(captionDataMtx);
           captionDataQueue.push_back(CaptionData{0, pktCapStream->index,
                                                  pktCapStream->time_base, true,
                                                  std::move(buffer)});
         }
       } else {
-        std::string str = fmt::format("{:02X}", ppacket->data[0]);
-        for (int i = 1; i < ppacket->size; i++) {
-          str += fmt::format(" {:02x}", ppacket->data[i]);
+        // 16進ダンプの生成は debug 出力時だけに限定する (毎字幕パケットで
+        // 文字列を組み立てるとログレベルに関わらずコストがかかる)。空パケット
+        // では data[0] を参照しない。
+        if (spdlog::should_log(spdlog::level::debug)) {
+          std::string str;
+          for (int i = 0; i < ppacket->size; i++) {
+            if (i > 0) {
+              str += ' ';
+            }
+            str += fmt::format("{:02x}", ppacket->data[i]);
+          }
+          spdlog::debug("CaptionPacket received. size: {} data: [{}]",
+                        ppacket->size, str);
         }
-        spdlog::debug("CaptionPacket received. size: {} data: [{}]",
-                      ppacket->size, str);
-        if (!captionCallback.isNull()) {
-          std::vector<uint8_t> buffer(ppacket->size);
-          memcpy(&buffer[0], ppacket->data, ppacket->size);
+        if (ppacket->size > 0 && !captionCallback.isNull()) {
+          std::vector<uint8_t> buffer(ppacket->data,
+                                      ppacket->data + ppacket->size);
           {
             std::lock_guard<std::mutex> lock(captionDataMtx);
             captionDataQueue.push_back(
@@ -1523,9 +1549,18 @@ void downloadNextRange() {
       std::lock_guard<std::mutex> lock(inputBufferMtx);
       if (inputBufferWriteIndex + fetch->numBytes >= MAX_INPUT_BUFFER) {
         size_t remainSize = inputBufferWriteIndex - inputBufferReadIndex;
-        memcpy(&inputBuffer[0], &inputBuffer[inputBufferReadIndex], remainSize);
+        // 詰め直しは領域が重なりうるので memmove を使う (memcpy は UB)。
+        memmove(&inputBuffer[0], &inputBuffer[inputBufferReadIndex], remainSize);
         inputBufferReadIndex = 0;
         inputBufferWriteIndex = remainSize;
+      }
+      // 詰め直してもなお入らない場合は書かずに捨てる。ここで書き込むと
+      // 入力リングバッファの外へはみ出す。次のループで消費を待って再取得する。
+      if (inputBufferWriteIndex + fetch->numBytes >= MAX_INPUT_BUFFER) {
+        spdlog::warn("input buffer full: drop fetched {} bytes (offset {})",
+                     fetch->numBytes, downloadCount);
+        emscripten_fetch_close(fetch);
+        return;
       }
       memcpy(&inputBuffer[inputBufferWriteIndex], &fetch->data[0],
              fetch->numBytes);
