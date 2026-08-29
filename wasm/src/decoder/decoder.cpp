@@ -52,6 +52,16 @@ std::uint8_t inputBuffer[MAX_INPUT_BUFFER];
 std::mutex inputBufferMtx;
 std::condition_variable waitCv;
 
+// 入力の終端に達した (ローカルファイルを流し切った / Range ダウンロードが
+// 最後のチャンクまで届いた)。read_packet はバッファを読み切ったところで
+// AVERROR_EOF を返し、デマルチプレクサに「もう来ない」と伝える。これが無いと
+// ffmpeg は次のデータを待ち続け、バッファ末尾に残ったぶんが処理されないまま
+// 再生が止まる。
+std::atomic<bool> inputEnded{false};
+
+// 入力の供給側 (JS のローカルファイル読み込みループ) から呼ぶ。
+void setInputEnded();
+
 // BS4K/8K (MMT/TLV) 再生時は true。read_packet() 内の 0x47 (MPEG2-TS
 // sync_byte) 探索・188バイト単位の servicefilter 処理は通常放送(MPEG2-TS)
 // 専用のロジックであり、可変長パケットの TLV データに対して行うと
@@ -278,11 +288,17 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
     // 部分読み出し (要求より少ないバイト数を返す) が正式に許容されている
     // ため、TLV モードでは 1 バイトでも届いていればすぐ返す。
     waitCv.wait(lock, [&] {
-      return inputBufferWriteIndex > inputBufferReadIndex || resetedDecoder;
+      return inputBufferWriteIndex > inputBufferReadIndex || resetedDecoder ||
+             inputEnded;
     });
     if (resetedDecoder) {
       spdlog::debug("resetedDecoder detected in read_packet");
       return AVERROR_EXIT;
+    }
+    if (inputBufferWriteIndex <= inputBufferReadIndex) {
+      // 終端に達していて、かつ読み切った。
+      spdlog::debug("input ended in read_packet (tlv)");
+      return AVERROR_EOF;
     }
     // TLV は可変長パケットで 0x47 探索や 188 バイト単位の servicefilter
     // 処理が意味を持たない (むしろデータを破壊する) ため、ffmpeg 側の
@@ -295,9 +311,11 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
     return copySize;
   }
 
+  // 終端に達したら bufSize 分たまるのを待たない。待ち続けると末尾の端数が
+  // 永遠に処理されない。
   waitCv.wait(lock, [&] {
     return inputBufferWriteIndex - inputBufferReadIndex >= bufSize ||
-           resetedDecoder;
+           resetedDecoder || inputEnded;
   });
   if (resetedDecoder) {
     spdlog::debug("resetedDecoder detected in read_packet");
@@ -352,6 +370,11 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
 
   waitCv.notify_all();
   if (copySize == 0) {
+    if (inputEnded && inputBufferReadIndex + 188 > inputBufferWriteIndex) {
+      // 終端に達していて、もう 1 パケットも取り出せない。
+      spdlog::debug("input ended in read_packet (ts)");
+      return AVERROR_EOF;
+    }
     // servicefilter が何も吐かなかった場合。AVIOContext の read_packet で 0 を
     // 返すと ffmpeg
     // 側が即座に呼び直してビジーループになるため、「今は読めない」 を意味する
@@ -359,6 +382,13 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
     return AVERROR(EAGAIN);
   }
   return copySize;
+}
+
+void setInputEnded() {
+  spdlog::info("setInputEnded");
+  std::lock_guard<std::mutex> lock(inputBufferMtx);
+  inputEnded = true;
+  waitCv.notify_all();
 }
 
 void commitInputData(size_t nextSize) {
@@ -381,6 +411,7 @@ void resetInternal() {
   }
   {
     std::lock_guard<std::mutex> lock(inputBufferMtx);
+    inputEnded = false;
     inputBufferReadIndex = 0;
     inputBufferWriteIndex = 0;
     servicefilter.ClearPackets();
@@ -1032,6 +1063,7 @@ void decoderThreadFunc() {
       std::thread([&]() { audioDecoderThreadFunc(audioTerminateFlag); });
 
   // decode phase
+  bool eofReported = false;
   while (!resetedDecoder) {
     // デマルチプレクスの読み進み制御 (throttle)。
     //
@@ -1065,12 +1097,20 @@ void decoderThreadFunc() {
     AVPacket *ppacket = av_packet_alloc();
     int ret = av_read_frame(formatContext, ppacket);
     if (ret != 0) {
-      spdlog::info("av_read_frame: {} {}", ret, av_err2str(ret));
+      // 終端に達した後は同じログを出し続けないよう 1 回だけ記録する。
+      if (ret != AVERROR_EOF || !eofReported) {
+        spdlog::info("av_read_frame: {} {}", ret, av_err2str(ret));
+        eofReported = eofReported || ret == AVERROR_EOF;
+      }
       // 失敗しても確保済みパケットは必ず解放する (解放漏れのままリトライすると
       // 読み出しエラーが続く間ずっとリークし続ける)。
       av_packet_free(&ppacket);
-      // エラーが続くときに CPU を食い潰さないよう少し待つ。
-      std::this_thread::sleep_for(std::chrono::milliseconds(3));
+      // エラーが続くときに CPU を食い潰さないよう少し待つ。終端に達した場合は
+      // ここでスレッドを畳まない。畳むと次の周回の resetInternal() が、まだ
+      // 再生していないキューのフレームまで捨ててしまう。デコード済みぶんを
+      // 鳴らし切れるよう、そのまま待機して reset() を待つ。
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(ret == AVERROR_EOF ? 100 : 3));
       continue;
     }
     if (ppacket->stream_index == videoStream->index) {
@@ -1725,7 +1765,8 @@ void decoderMainloop() {
   }
 }
 
-void downloadNextRange() {
+// 戻り値: まだ続きがあるなら true、終端に達したら false。
+bool downloadNextRange() {
   emscripten_fetch_attr_t attr;
   emscripten_fetch_attr_init(&attr);
   strcpy(attr.requestMethod, "GET");
@@ -1738,6 +1779,14 @@ void downloadNextRange() {
 
   spdlog::debug("request {} Range: {}", playFileUrl, range);
   emscripten_fetch_t *fetch = emscripten_fetch(&attr, playFileUrl.c_str());
+  bool hasMore = true;
+  if (fetch->status == 416) {
+    // Range が範囲外 = ちょうど読み切っていた。
+    spdlog::info("fetch reached the end of {} ({} bytes)", playFileUrl,
+                 downloadCount);
+    emscripten_fetch_close(fetch);
+    return false;
+  }
   if (fetch->status == 206) {
     spdlog::debug("fetch success size: {}", fetch->numBytes);
     {
@@ -1756,7 +1805,8 @@ void downloadNextRange() {
         spdlog::warn("input buffer full: drop fetched {} bytes (offset {})",
                      fetch->numBytes, downloadCount);
         emscripten_fetch_close(fetch);
-        return;
+        // 消費待ち。まだ終端ではないので、同じ Range をやり直す。
+        return true;
       }
       memcpy(&inputBuffer[inputBufferWriteIndex], &fetch->data[0],
              fetch->numBytes);
@@ -1764,11 +1814,19 @@ void downloadNextRange() {
       downloadCount += fetch->numBytes;
       waitCv.notify_all();
     }
+    // 要求より短いチャンクが返ってきたら、それが最後のチャンク。
+    if (fetch->numBytes < donwloadRangeSize) {
+      spdlog::info("fetch reached the end of {} ({} bytes)", playFileUrl,
+                   downloadCount);
+      hasMore = false;
+    }
   } else {
     spdlog::error("fetch failed URL: {} status code: {}", playFileUrl,
                   fetch->status);
+    hasMore = false;
   }
   emscripten_fetch_close(fetch);
+  return hasMore;
 }
 
 void downloaderThraedFunc() {
@@ -1780,7 +1838,12 @@ void downloaderThraedFunc() {
       remainSize = inputBufferWriteIndex - inputBufferReadIndex;
     }
     if (remainSize < donwloadRangeSize / 2) {
-      downloadNextRange();
+      if (!downloadNextRange()) {
+        // 全部落とし終えた。デマルチプレクサへ終端を伝えて、このスレッドは
+        // 役目を終える (残りはバッファから再生される)。
+        setInputEnded();
+        return;
+      }
     } else {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }

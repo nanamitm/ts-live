@@ -44,6 +44,9 @@ export declare interface WasmModule extends EmscriptenModule {
   // 入力リングバッファが満杯のときは null を返す (バックプレッシャ)。
   getNextInputBuffer(size: number): Uint8Array | null
   commitInputData(size: number): void
+  // 入力の供給が終わったことを伝える。デマルチプレクサはバッファを読み切った
+  // ところで EOF として扱う。
+  setInputEnded(): void
   reset(): void
   // reset() の後片付けはデコードスレッドで非同期に進む。完了したら true。
   isResetCompleted(): boolean

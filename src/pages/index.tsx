@@ -911,6 +911,9 @@ const Page: NextPage = () => {
           ret = await reader.read()
         }
         console.log('local file feed done.', file.name)
+        // 供給終了をデコーダへ伝える。これが無いとデマルチプレクサは次のデータを
+        // 待ち続け、バッファ末尾に残ったぶんが処理されないまま再生が止まる。
+        if (!aborted) Module.setInputEnded()
 
         // ループ再生: フィード完了後もバッファ(最大48MB)分は再生が続くため、音声
         // クロックが進まなくなった=バッファ枯渇を待ってから頭出しし直す。
