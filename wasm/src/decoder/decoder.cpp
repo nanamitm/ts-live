@@ -52,6 +52,15 @@ std::uint8_t inputBuffer[MAX_INPUT_BUFFER];
 std::mutex inputBufferMtx;
 std::condition_variable waitCv;
 
+// 一時停止中。メインループでのフレーム取り出し・描画・音声供給を止める。
+// デコード側は各キューの上限に当たって自然に止まるので、ここだけで足りる。
+std::atomic<bool> paused{false};
+
+void setPaused(bool value) {
+  paused = value;
+  spdlog::info("setPaused: {}", value);
+}
+
 // 入力の終端に達した (ローカルファイルを流し切った / Range ダウンロードが
 // 最後のチャンクまで届いた)。read_packet はバッファを読み切ったところで
 // AVERROR_EOF を返し、デマルチプレクサに「もう来ない」と伝える。これが無いと
@@ -412,6 +421,8 @@ void resetInternal() {
   {
     std::lock_guard<std::mutex> lock(inputBufferMtx);
     inputEnded = false;
+    // 新しい再生は必ず再生状態から始める。
+    paused = false;
     inputBufferReadIndex = 0;
     inputBufferWriteIndex = 0;
     servicefilter.ClearPackets();
@@ -1450,6 +1461,14 @@ void decoderMainloop() {
       obj.set("webCodecs", info.webCodecs);
       videoStreamInfoCallback(obj);
     }
+  }
+
+  // 一時停止中は、映像の取り出し・描画も、字幕の排出も、AudioWorklet への
+  // 音声供給も行わない。音声が供給されない = 再生時刻が進まないので、映像は
+  // 現在のフレームで止まる。デマルチプレクス/デコードは各キューの上限に当たって
+  // 自然に停止し、解除すれば続きから再開する。
+  if (paused) {
+    return;
   }
 
   // WebCodecs モード: 溜まったアクセスユニット(HEVC/H.264)を JS の

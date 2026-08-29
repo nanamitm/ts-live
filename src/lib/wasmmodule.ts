@@ -47,6 +47,8 @@ export declare interface WasmModule extends EmscriptenModule {
   // 入力の供給が終わったことを伝える。デマルチプレクサはバッファを読み切った
   // ところで EOF として扱う。
   setInputEnded(): void
+  // 一時停止。メインループでの描画・音声供給が止まる。
+  setPaused(paused: boolean): void
   reset(): void
   // reset() の後片付けはデコードスレッドで非同期に進む。完了したら true。
   isResetCompleted(): boolean

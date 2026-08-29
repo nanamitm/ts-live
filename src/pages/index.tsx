@@ -16,11 +16,12 @@ import {
   InputLabel,
   MenuItem,
   Select,
+  IconButton,
   Slider,
   Stack,
   TextField,
 } from '@mui/material'
-import { VolumeMute, VolumeUp } from '@mui/icons-material'
+import { Pause, PlayArrow, VolumeMute, VolumeUp } from '@mui/icons-material'
 import { CartesianGrid, LineChart, XAxis, YAxis, Line, Legend } from 'recharts'
 import Head from 'next/head'
 import { WasmModule, StatsData, VideoStreamInfo } from '../lib/wasmmodule'
@@ -115,6 +116,11 @@ const Page: NextPage = () => {
   } | null>(null)
   // スライダーをドラッグしている間は、推定位置での上書きを止める。
   const [localSeeking, setLocalSeeking] = useState<number | null>(null)
+  const [localPaused, setLocalPaused] = useState<boolean>(false)
+  // WebCodecs 経路の resumeAudio (pointerdown/keydown) から参照する。一時停止の
+  // クリックそのものが pointerdown なので、これが無いと押した瞬間に
+  // AudioContext が再開されてしまう。
+  const localPausedRef = useRef<boolean>(false)
   // WebCodecs で再生不能だったとき true にして WASM ソフトデコードで再生し直す
   // (ループ/最初から再生でも維持)。新しいファイルを開いたらリセットする。
   const localForceSoftwareRef = useRef<boolean>(false)
@@ -357,6 +363,8 @@ const Page: NextPage = () => {
     // 出ない。feedAudioData 内の resume() は非同期でジェスチャから離れており
     // 効かないため、ユーザーの操作(クリック/キー)で確実に resume する。
     const resumeAudio = () => {
+      // 一時停止中の suspend を勝手に解除しない。
+      if (localPausedRef.current) return
       const ctx = (Module as any).myAudio?.ctx as AudioContext | undefined
       if (ctx && ctx.state === 'suspended') {
         ctx.resume().catch(() => {})
@@ -839,6 +847,9 @@ const Page: NextPage = () => {
     }
     const Module = wasmMod
     lastLocalFileRef.current = file
+    // 再生開始/シークは必ず再生状態から (WASM 側も resetInternal で解除される)。
+    localPausedRef.current = false
+    setLocalPaused(false)
     localStartOffsetRef.current = startOffset
     localFedBytesRef.current = 0
     localClockBaseRef.current = null
@@ -1022,6 +1033,28 @@ const Page: NextPage = () => {
     return () => clearInterval(timer)
   }, [playMode, wasmMod])
 
+  // 一時停止/再開。WASM 側は「メインループで映像を出さない・音声を渡さない」
+  // だけなので、AudioWorklet に既に積まれているぶんが鳴り続けないよう
+  // AudioContext も合わせて止める。
+  const setPlaybackPaused = useCallback(
+    (paused: boolean) => {
+      const Module = wasmMod
+      if (!Module) return
+      Module.setPaused(paused)
+      const ctx = (Module as any).myAudio?.ctx as AudioContext | undefined
+      if (ctx) {
+        if (paused) {
+          ctx.suspend().catch(() => {})
+        } else {
+          ctx.resume().catch(() => {})
+        }
+      }
+      localPausedRef.current = paused
+      setLocalPaused(paused)
+    },
+    [wasmMod]
+  )
+
   const seekLocalFile = (bytes: number) => {
     const file = lastLocalFileRef.current
     if (!file) return
@@ -1029,6 +1062,18 @@ const Page: NextPage = () => {
     console.log('local file seek to', offset, `${((offset / file.size) * 100).toFixed(1)}%`)
     playLocalFile(file, offset)
   }
+
+  // スペースキーで一時停止/再開 (ローカルファイル再生中のみ)。
+  useKey(
+    ' ',
+    ev => {
+      if (playMode !== 'localfile' || !lastLocalFileRef.current) return
+      ev.preventDefault()
+      setPlaybackPaused(!localPaused)
+    },
+    {},
+    [playMode, localPaused, setPlaybackPaused]
+  )
 
   useKey(
     'F2',
@@ -1589,12 +1634,24 @@ const Page: NextPage = () => {
             <div
               css={css`
                 display: flex;
-                justify-content: space-between;
+                align-items: center;
+                gap: 8px;
                 font-size: 12px;
                 color: #ffffff;
                 text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
               `}
             >
+              <IconButton
+                aria-label={localPaused ? '再生' : '一時停止'}
+                size="small"
+                onClick={() => setPlaybackPaused(!localPaused)}
+                css={css`
+                  color: #ffffff;
+                  padding: 2px;
+                `}
+              >
+                {localPaused ? <PlayArrow /> : <Pause />}
+              </IconButton>
               <span>
                 {formatLocalTime(
                   localPosition.duration > 0 && localPosition.size > 0
@@ -1604,7 +1661,7 @@ const Page: NextPage = () => {
                     : 0
                 )}
               </span>
-              <span>
+              <span css={css`margin-left: auto;`}>
                 {localPosition.duration > 0
                   ? `${formatLocalTime(localPosition.duration)} (推定)`
                   : `${(
