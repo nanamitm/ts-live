@@ -49,6 +49,8 @@ export declare interface WasmModule extends EmscriptenModule {
   setInputEnded(): void
   // 一時停止。メインループでの描画・音声供給が止まる。
   setPaused(paused: boolean): void
+  // 表示済みの映像フレーム数 (単調増加)。シーク後に最初の1枚が出たかの判定用。
+  getDisplayedFrameCount(): number
   reset(): void
   // reset() の後片付けはデコードスレッドで非同期に進む。完了したら true。
   isResetCompleted(): boolean

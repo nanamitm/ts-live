@@ -10,6 +10,7 @@ emscripten::val getNextInputBuffer(size_t nextSize);
 void commitInputData(size_t nextSize);
 void setInputEnded();
 void setPaused(bool value);
+double getDisplayedFrameCount();
 void setCaptionCallback(emscripten::val callback);
 void setStatsCallback(emscripten::val callback);
 void reset();

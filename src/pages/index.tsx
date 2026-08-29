@@ -159,6 +159,9 @@ const Page: NextPage = () => {
   // WebCodecs (BS4K) 用の描画 canvas と再生制御
   const wcCanvasRef = useRef<HTMLCanvasElement>(null)
   const webCodecsCtrlRef = useRef<{ stop: () => void } | null>(null)
+  // WebCodecs 経路で canvas へ描画した回数。WASM 経路の
+  // getDisplayedFrameCount() と同じ役割 (シーク後の最初の1枚の検出)。
+  const wcFramesDrawnRef = useRef<number>(0)
   // WebCodecs が利用可能でも対象サービスの codec をデコードできない場合は、
   // 同じサービスを WASM ソフトウェアデコードで再起動する。
   const liveForceSoftwareServiceRef = useRef<number | null>(null)
@@ -354,6 +357,7 @@ const Page: NextPage = () => {
         canvas.height = dh
       }
       ctx2d.drawImage(target.frame, 0, 0, canvas.width, canvas.height)
+      wcFramesDrawnRef.current++
       target.frame.close()
       frameQueue = frameQueue.slice(showIdx + 1)
     }
@@ -840,16 +844,19 @@ const Page: NextPage = () => {
     return looksLikeTlv(buf)
   }
 
-  const playLocalFile = (file: File, startOffset = 0) => {
+  const playLocalFile = (file: File, startOffset = 0, pauseAtStart = false) => {
     if (!wasmMod) {
       console.error('WasmModule not loaded')
       return
     }
     const Module = wasmMod
     lastLocalFileRef.current = file
-    // 再生開始/シークは必ず再生状態から (WASM 側も resetInternal で解除される)。
+    // いったん再生状態にする。pauseAtStart のときは、新しい位置の映像が 1 枚
+    // 出た時点で下の監視が止め直す (音声クロックが進まないと 1 枚も描画され
+    // ないので、止めたまま位置を変えることはできない)。
     localPausedRef.current = false
     setLocalPaused(false)
+    Module.setPaused(false)
     localStartOffsetRef.current = startOffset
     localFedBytesRef.current = 0
     localClockBaseRef.current = null
@@ -924,6 +931,33 @@ const Page: NextPage = () => {
       }
       Module.setTlvMode(tlv)
       Module.setWebCodecsMode(wantWebCodecs)
+
+      // 一時停止したままのシーク: 最初の 1 フレームが出たら止め直す。その間の
+      // 数百ミリ秒ぶん音が出てしまうので、ゲインを 0 にして黙らせておく。
+      if (pauseAtStart) {
+        Module.setAudioGain(0)
+        const restoreGain = () => Module.setAudioGain(mute ? 0 : volume ?? 1.0)
+        const baseWasmFrames = Module.getDisplayedFrameCount()
+        const baseWcFrames = wcFramesDrawnRef.current
+        ;(async () => {
+          const deadline = performance.now() + 5000
+          while (!aborted && performance.now() < deadline) {
+            if (
+              Module.getDisplayedFrameCount() > baseWasmFrames ||
+              wcFramesDrawnRef.current > baseWcFrames
+            ) {
+              setPlaybackPaused(true)
+              restoreGain()
+              return
+            }
+            await sleep(50)
+          }
+          // 5 秒経っても 1 枚も出ない (デコードできない位置など)。そのまま
+          // 再生を続けるより一時停止しておく方が意図に近い。
+          if (!aborted) setPlaybackPaused(true)
+          restoreGain()
+        })()
+      }
 
       console.log('start local file', file.name, file.size, 'from', startOffset)
       {
@@ -1059,8 +1093,14 @@ const Page: NextPage = () => {
     const file = lastLocalFileRef.current
     if (!file) return
     const offset = Math.min(Math.max(Math.floor(bytes), 0), Math.max(file.size - 1, 0))
-    console.log('local file seek to', offset, `${((offset / file.size) * 100).toFixed(1)}%`)
-    playLocalFile(file, offset)
+    const keepPaused = localPausedRef.current
+    console.log(
+      'local file seek to',
+      offset,
+      `${((offset / file.size) * 100).toFixed(1)}%`,
+      keepPaused ? '(paused)' : ''
+    )
+    playLocalFile(file, offset, keepPaused)
   }
 
   // スペースキーで一時停止/再開 (ローカルファイル再生中のみ)。

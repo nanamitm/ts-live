@@ -52,6 +52,14 @@ std::uint8_t inputBuffer[MAX_INPUT_BUFFER];
 std::mutex inputBufferMtx;
 std::condition_variable waitCv;
 
+// これまでに表示した映像フレーム数 (単調増加)。JS が「シーク後に最初の1枚が
+// 出たか」を判定して一時停止し直すのに使う。
+std::atomic<int64_t> displayedFrameCount{0};
+
+double getDisplayedFrameCount() {
+  return (double)displayedFrameCount.load(std::memory_order_relaxed);
+}
+
 // 一時停止中。メインループでのフレーム取り出し・描画・音声供給を止める。
 // デコード側は各キューの上限に当たって自然に止まるので、ここだけで足りる。
 std::atomic<bool> paused{false};
@@ -1609,6 +1617,7 @@ void decoderMainloop() {
       // メインループ(=描画スレッド)は描画に専念する。ここで 4K の swscale を
       // やると描画レートが実時間を割り、映像が音声から遅れていく。
       drawWebGpu(currentFrame);
+      displayedFrameCount.fetch_add(1, std::memory_order_relaxed);
 
       av_frame_free(&currentFrame);
     }
