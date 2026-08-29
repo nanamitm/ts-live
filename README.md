@@ -18,6 +18,8 @@ $ yarn
 $ yarn dev
 ```
 
+アクセス解析(Google Analytics)は既定で無効です。使う場合はビルド時に環境変数 `NEXT_PUBLIC_GA_ID` に自分の計測 ID を設定してください（未設定ならスクリプト自体を読み込みません）。
+
 3000 番ポートで起動したことをメッセージで確認すること（3000 じゃないときはどこかで別のアプリが 3000 を開いてます）。または Docker イメージ https://github.com/ts-live/ts-live/pkgs/container/ts-live を使う。
 
 ## 操作方法

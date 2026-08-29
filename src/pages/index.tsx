@@ -2,7 +2,6 @@
 import { css } from '@emotion/react'
 import { NextPage } from 'next'
 import dynamic from 'next/dynamic'
-import Script from 'next/script'
 import { EventHandler, useCallback, useEffect, useRef, useState } from 'react'
 import { useAsync, useKey, useLocalStorage } from 'react-use'
 import {
@@ -29,6 +28,7 @@ import { CONTAINER_PROBE_SIZE, looksLikeTlv } from '../lib/container'
 import dayjs from 'dayjs'
 
 import { Program, Service } from 'mirakurun/api'
+import Analytics from '../components/analytics'
 import { useRouter } from 'next/router'
 
 const Caption = dynamic(() => import('../components/caption'), {
@@ -1052,19 +1052,7 @@ const Page: NextPage = () => {
           TS-Live! {currentProgram && currentProgram.name && `| ${currentProgram.name}`}
         </title>
       </Head>
-      <Script
-        src="https://www.googletagmanager.com/gtag/js?id=G-SR7L1XYNV0"
-        strategy="afterInteractive"
-      />
-      <Script id="google-analytics" strategy="afterInteractive">
-        {`
-            window.dataLayer = window.dataLayer || [];
-            function gtag(){window.dataLayer.push(arguments);}
-            gtag('js', new Date());
-
-            gtag('config', 'G-SR7L1XYNV0');
-          `}
-      </Script>
+      <Analytics />
       <Drawer
         anchor="left"
         open={drawer}
