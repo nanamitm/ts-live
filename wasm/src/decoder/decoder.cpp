@@ -267,7 +267,7 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
     });
     if (resetedDecoder) {
       spdlog::debug("resetedDecoder detected in read_packet");
-      return -1;
+      return AVERROR_EXIT;
     }
     // TLV は可変長パケットで 0x47 探索や 188 バイト単位の servicefilter
     // 処理が意味を持たない (むしろデータを破壊する) ため、ffmpeg 側の
@@ -286,7 +286,7 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
   });
   if (resetedDecoder) {
     spdlog::debug("resetedDecoder detected in read_packet");
-    return -1;
+    return AVERROR_EXIT;
   }
 
   // 0x47: TS packet header sync_byte
@@ -316,7 +316,7 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
   // servicefilterに1パケット（188バイト）だけ入れたからといって、
   // 出てくるのは1パケットとは限らない。色々追加される可能性がある
   while (!servicefilterRemain &&
-         inputBufferReadIndex + 188 < inputBufferWriteIndex) {
+         inputBufferReadIndex + 188 <= inputBufferWriteIndex) {
     servicefilter.AddPacket(&inputBuffer[inputBufferReadIndex]);
     inputBufferReadIndex += 188;
     const auto &packets = servicefilter.GetPackets();
@@ -336,6 +336,13 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
   }
 
   waitCv.notify_all();
+  if (copySize == 0) {
+    // servicefilter が何も吐かなかった場合。AVIOContext の read_packet で 0 を
+    // 返すと ffmpeg
+    // 側が即座に呼び直してビジーループになるため、「今は読めない」 を意味する
+    // EAGAIN を返す。
+    return AVERROR(EAGAIN);
+  }
   return copySize;
 }
 
