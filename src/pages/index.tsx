@@ -1422,50 +1422,6 @@ const Page: NextPage = () => {
                     {`再生中: ${localFileName}`}
                   </div>
                 )}
-                {localPosition && localPosition.size > 0 && (
-                  <div css={css`margin-top: 8px;`}>
-                    <Slider
-                      aria-label="再生位置"
-                      min={0}
-                      max={localPosition.size}
-                      step={Math.max(Math.floor(localPosition.size / 1000), 1)}
-                      value={localSeeking ?? localPosition.bytes}
-                      onChange={(ev, val) => {
-                        if (typeof val === 'number') setLocalSeeking(val)
-                      }}
-                      onChangeCommitted={(ev, val) => {
-                        setLocalSeeking(null)
-                        if (typeof val === 'number') seekLocalFile(val)
-                      }}
-                    />
-                    <div
-                      css={css`
-                        display: flex;
-                        justify-content: space-between;
-                        font-size: 12px;
-                      `}
-                    >
-                      <span>
-                        {formatLocalTime(
-                          localPosition.duration > 0 && localPosition.size > 0
-                            ? ((localSeeking ?? localPosition.bytes) /
-                                localPosition.size) *
-                                localPosition.duration
-                            : 0
-                        )}
-                      </span>
-                      <span>
-                        {localPosition.duration > 0
-                          ? `${formatLocalTime(localPosition.duration)} (推定)`
-                          : `${(
-                              ((localSeeking ?? localPosition.bytes) /
-                                localPosition.size) *
-                              100
-                            ).toFixed(1)}%`}
-                      </span>
-                    </div>
-                  </div>
-                )}
               </FormGroup>
               <FormGroup>
                 <FormControlLabel
@@ -1594,6 +1550,72 @@ const Page: NextPage = () => {
           `}
           onClick={() => setDrawer(true)}
         ></div>
+        {playMode === 'localfile' && localPosition && localPosition.size > 0 && (
+          // クリックでドロワーを開く全面オーバーレイ(z-index:99)より手前に置く。
+          <div
+            css={css`
+              position: absolute;
+              left: 0;
+              right: 0;
+              bottom: 0;
+              z-index: 100;
+              padding: 24px 24px 4px;
+              background: linear-gradient(
+                to bottom,
+                rgba(0, 0, 0, 0) 0%,
+                rgba(0, 0, 0, 0.6) 100%
+              );
+            `}
+          >
+            <Slider
+              aria-label="再生位置"
+              size="small"
+              min={0}
+              max={localPosition.size}
+              step={Math.max(Math.floor(localPosition.size / 1000), 1)}
+              value={localSeeking ?? localPosition.bytes}
+              onChange={(ev, val) => {
+                if (typeof val === 'number') setLocalSeeking(val)
+              }}
+              onChangeCommitted={(ev, val) => {
+                setLocalSeeking(null)
+                if (typeof val === 'number') seekLocalFile(val)
+              }}
+              css={css`
+                color: #ffffff;
+                padding: 8px 0;
+              `}
+            />
+            <div
+              css={css`
+                display: flex;
+                justify-content: space-between;
+                font-size: 12px;
+                color: #ffffff;
+                text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+              `}
+            >
+              <span>
+                {formatLocalTime(
+                  localPosition.duration > 0 && localPosition.size > 0
+                    ? ((localSeeking ?? localPosition.bytes) /
+                        localPosition.size) *
+                        localPosition.duration
+                    : 0
+                )}
+              </span>
+              <span>
+                {localPosition.duration > 0
+                  ? `${formatLocalTime(localPosition.duration)} (推定)`
+                  : `${(
+                      ((localSeeking ?? localPosition.bytes) /
+                        localPosition.size) *
+                      100
+                    ).toFixed(1)}%`}
+              </span>
+            </div>
+          </div>
+        )}
         {debug ? (
           <div
             css={css`
