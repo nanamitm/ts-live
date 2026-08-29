@@ -138,10 +138,15 @@ const Page: NextPage = () => {
     info: VideoStreamInfo
   ): VideoDecoderConfig | null => {
     if (info.codec === 'hevc') {
-      // BS4K 実績のある Main10 L5.1 固定(プロファイル情報が取れないファイルが
-      // あるため info からは組み立てない)
+      // hev1.<profile>.<互換フラグ>.L<general_level_idc>.<制約>。
+      // profile は 1=Main / 2=Main10、level は「レベル×30」(5.1 なら 153、
+      // 8K の 6.1 なら 183)。probe で取れないファイルがあるので、その場合は
+      // BS4K で実績のある Main10 L5.1 にフォールバックする。
+      // レベル固定だと 8K(L6.x)で構成が弾かれる。
+      const profileTag = info.profile === 1 ? '1.6' : '2.4'
+      const level = info.level > 0 ? info.level : 153
       const config: VideoDecoderConfig = {
-        codec: 'hev1.2.4.L153.90',
+        codec: `hev1.${profileTag}.L${level}.90`,
         optimizeForLatency: true,
       }
       if (info.width > 0 && info.height > 0) {

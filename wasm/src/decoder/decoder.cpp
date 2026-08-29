@@ -158,6 +158,8 @@ struct VideoAu {
 };
 std::deque<VideoAu> videoAuQueue;
 std::mutex videoAuMtx;
+// キューが溢れて捨てた後、次のキーフレームまでは積まない (videoAuMtx で保護)。
+bool videoAuDropUntilKey = false;
 
 // メインループが更新する「現在の推定音声再生時刻(秒)」。JS 側の映像表示を
 // これに同期させる (音声クロック)。
@@ -398,6 +400,7 @@ void resetInternal() {
   {
     std::lock_guard<std::mutex> lock(videoAuMtx);
     videoAuQueue.clear();
+    videoAuDropUntilKey = false;
   }
   currentAudioPlaybackTime = -1.0;
   {
@@ -1056,11 +1059,22 @@ void decoderThreadFunc() {
         au.data.assign(ppacket->data, ppacket->data + ppacket->size);
         {
           std::lock_guard<std::mutex> lock(videoAuMtx);
-          // 供給過多で暴走しないよう上限を設ける(古いものを捨てる)。
-          if (videoAuQueue.size() > 300) {
-            videoAuQueue.pop_front();
+          // 供給過多で暴走しないよう上限を設ける。ただし GOP の途中の AU を
+          // 抜くと次のキーフレームまで映像が壊れるので、1個ずつ古いものを
+          // 捨てるのではなく、まとめて捨てて次のキーフレームから作り直す。
+          if (videoAuQueue.size() >= 300) {
+            spdlog::warn("videoAuQueue overflow: drop {} AUs and resync at the "
+                         "next key frame",
+                         videoAuQueue.size());
+            videoAuQueue.clear();
+            videoAuDropUntilKey = true;
           }
-          videoAuQueue.push_back(std::move(au));
+          if (videoAuDropUntilKey && au.key) {
+            videoAuDropUntilKey = false;
+          }
+          if (!videoAuDropUntilKey) {
+            videoAuQueue.push_back(std::move(au));
+          }
         }
       } else {
         AVPacket *clonePacket = av_packet_clone(ppacket);
