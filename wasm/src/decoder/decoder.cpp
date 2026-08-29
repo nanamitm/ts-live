@@ -1593,33 +1593,56 @@ void decoderMainloop() {
     //   set_style(videoStream->codecpar->width);
     // }
 
-    // VideoとAudioのPTSをクロックから時間に直す
-    // TODO: クロック一回転したときの処理
-    double videoPtsTime = currentFrame->pts * av_q2d(currentFrame->time_base);
-
     // 上記から推定される、現在再生している音声のPTS（時間）
     double estimatedAudioPlayTime =
         estimateAudioPlayTime(audioFrame, currentBufferedAudioSamples);
 
-    // 1フレーム分くらいはズレてもいいからこれでいいか。フレーム真面目に考えると良くわからない。
-    bool showFlag = estimatedAudioPlayTime > videoPtsTime;
-
-    // リップシンク条件を満たしてたらVideoFrame再生
-    if (showFlag) {
-      {
-        std::lock_guard<std::mutex> lock(videoFrameMtx);
+    // 再生時刻を過ぎたフレームはまとめて取り出し、最後の 1 枚だけを描画して
+    // 残りは捨てる。1 回の呼び出しで 1 枚しか進めないと、メインループが遅く
+    // なった間に溜まったフレームを「1枚/呼び出し」で消化することになり、映像が
+    // 早送りで音声に追いつく動きになる。
+    //
+    // 特にタブが非表示の間は、fps 指定のメインループが setTimeout で回るため
+    // ブラウザに約 1Hz まで絞られる (音声は AudioWorklet
+    // 側で実時間のまま進む)。
+    // 表示に戻した瞬間に数百フレームの遅れが生じているので、ここで捨てないと
+    // 目に見える早送りになる。
+    AVFrame *frameToShow = nullptr;
+    int droppedFrames = 0;
+    {
+      std::lock_guard<std::mutex> lock(videoFrameMtx);
+      while (!videoFrameQueue.empty()) {
+        AVFrame *head = videoFrameQueue.front();
+        if (head->time_base.den == 0 || head->time_base.num == 0) {
+          videoFrameQueue.pop_front();
+          av_frame_free(&head);
+          continue;
+        }
+        // まだ再生時刻に達していないフレームはキューに残す。
+        if (head->pts * av_q2d(head->time_base) >= estimatedAudioPlayTime) {
+          break;
+        }
         videoFrameQueue.pop_front();
+        if (frameToShow != nullptr) {
+          // 一つ前に取り出したものは既に表示時刻を過ぎているので捨てる。
+          av_frame_free(&frameToShow);
+          droppedFrames++;
+        }
+        frameToShow = head;
       }
-      double timestamp =
-          currentFrame->pts * av_q2d(currentFrame->time_base) * 1000000;
+    }
 
+    if (frameToShow != nullptr) {
+      if (droppedFrames > 0) {
+        spdlog::debug("dropped {} late video frames", droppedFrames);
+      }
       // 10bit→8bit 変換は映像デコーダースレッド側で済ませてあるので、
       // メインループ(=描画スレッド)は描画に専念する。ここで 4K の swscale を
       // やると描画レートが実時間を割り、映像が音声から遅れていく。
-      drawWebGpu(currentFrame);
+      drawWebGpu(frameToShow);
       displayedFrameCount.fetch_add(1, std::memory_order_relaxed);
 
-      av_frame_free(&currentFrame);
+      av_frame_free(&frameToShow);
     }
   }
 
