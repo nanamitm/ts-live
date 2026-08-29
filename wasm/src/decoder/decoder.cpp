@@ -1342,6 +1342,9 @@ uint8_t *swrOutput[2] = {nullptr, nullptr};
 int swrOutputSize = 0;
 int channel_layout = 0;
 int sample_rate = 0;
+// swr を構成したときの入力サンプル形式。以前は FLTP 決め打ちで、実際の
+// frame->format と食い違うと変換結果が壊れていた。
+AVSampleFormat swrInputFormat = AV_SAMPLE_FMT_NONE;
 
 // 現在再生中の音声 PTS(秒)の推定値。AudioWorklet に積まれている未再生ぶんを
 // フレームの PTS から引く。sample_rate が取れないときはフレームの PTS をその
@@ -1604,59 +1607,114 @@ void decoderMainloop() {
                   frame->pts, av_q2d(frame->time_base), frame->nb_samples,
                   frame->ch_layout.nb_channels);
 
-    if (frame->ch_layout.nb_channels != 2) {
-      if (!swr || channel_layout != frame->ch_layout.nb_channels ||
-          sample_rate != frame->sample_rate) {
-        spdlog::info("SWR {}: sample_rate:{}->{} layout:{}->{}",
-                     swr ? "Changed" : "Initialized", sample_rate,
-                     frame->sample_rate, channel_layout,
-                     frame->ch_layout.nb_channels);
-        channel_layout = frame->ch_layout.nb_channels;
-        sample_rate = frame->sample_rate;
-        if (swr) {
-          swr_free(&swr);
-        }
-        AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
-        swr_alloc_set_opts2(&swr,       // we're allocating a new context
-                            &outLayout, // out_ch_layout (downmix to stereo)
-                            AV_SAMPLE_FMT_FLTP, // out_sample_fmt
-                            48000,              // out_sample_rate
-                            &frame->ch_layout,  // in_ch_layout
-                            AV_SAMPLE_FMT_FLTP, // in_sample_fmt
-                            frame->sample_rate, // in_sample_rate
-                            0,                  // log_offset
-                            NULL);              // log_ctx
+    const int inChannels = frame->ch_layout.nb_channels;
+    const AVSampleFormat inFormat = (AVSampleFormat)frame->format;
+    // AudioWorklet へそのまま渡せるのは「2ch のプレーナ float」だけ。それ以外
+    // (22.2ch や 5.1ch、パック形式) は swresample でステレオ FLTP へ変換する。
+    const bool directFeed =
+        inChannels == 2 && inFormat == AV_SAMPLE_FMT_FLTP && frame->data[1];
 
-        swr_init(swr);
+    if (frame->sample_rate <= 0 || inChannels <= 0) {
+      spdlog::warn("skip audio frame: sample_rate:{} channels:{}",
+                   frame->sample_rate, inChannels);
+      av_frame_free(&frame);
+      continue;
+    }
+
+    if (!directFeed) {
+      if (!swr || channel_layout != inChannels ||
+          sample_rate != frame->sample_rate || swrInputFormat != inFormat) {
+        const char *fromName = av_get_sample_fmt_name(swrInputFormat);
+        const char *toName = av_get_sample_fmt_name(inFormat);
+        spdlog::info("SWR {}: sample_rate:{}->{} channels:{}->{} format:{}->{}",
+                     swr ? "Changed" : "Initialized", sample_rate,
+                     frame->sample_rate, channel_layout, inChannels,
+                     fromName ? fromName : "none", toName ? toName : "none");
+        swr_free(&swr);
+        channel_layout = 0;
+        sample_rate = 0;
+        swrInputFormat = AV_SAMPLE_FMT_NONE;
+
+        AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
+        AVChannelLayout inLayout;
+        if (frame->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC) {
+          // レイアウトが未指定のままだと swr_init が失敗する。チャンネル数から
+          // 既定のレイアウトを当てる。
+          av_channel_layout_default(&inLayout, inChannels);
+        } else {
+          av_channel_layout_copy(&inLayout, &frame->ch_layout);
+        }
+        int ret =
+            swr_alloc_set_opts2(&swr,       // we're allocating a new context
+                                &outLayout, // out_ch_layout (downmix to stereo)
+                                AV_SAMPLE_FMT_FLTP, // out_sample_fmt
+                                48000,              // out_sample_rate
+                                &inLayout,          // in_ch_layout
+                                inFormat,           // in_sample_fmt
+                                frame->sample_rate, // in_sample_rate
+                                0,                  // log_offset
+                                nullptr);           // log_ctx
+        av_channel_layout_uninit(&inLayout);
+        if (ret >= 0) {
+          ret = swr_init(swr);
+        }
+        if (ret < 0) {
+          // 初期化に失敗したまま変換すると、そのまま雑音を再生してしまう。
+          spdlog::error("swr init failed: {} {}", ret, av_err2str(ret));
+          swr_free(&swr);
+          av_frame_free(&frame);
+          continue;
+        }
+        channel_layout = inChannels;
+        sample_rate = frame->sample_rate;
+        swrInputFormat = inFormat;
       }
 
-      int output_linesize;
-      int out_samples =
-          av_rescale_rnd(swr_get_delay(swr, 48000) + frame->nb_samples, 48000,
-                         48000, AV_ROUND_UP);
+      int out_samples = (int)av_rescale_rnd(
+          swr_get_delay(swr, frame->sample_rate) + frame->nb_samples, 48000,
+          frame->sample_rate, AV_ROUND_UP);
       if (swrOutputSize != out_samples) {
         if (swrOutput[0]) {
           av_freep(&swrOutput[0]);
         }
         int linesize;
-        av_samples_alloc(swrOutput, &linesize, 2, out_samples,
-                         AV_SAMPLE_FMT_FLTP, sizeof(float));
-        spdlog::info("swr out_samples:{}->{} "
-                     "in_samples:{} linesize:{}",
+        int ret = av_samples_alloc(swrOutput, &linesize, 2, out_samples,
+                                   AV_SAMPLE_FMT_FLTP, 0);
+        spdlog::info("swr out_samples:{}->{} in_samples:{} linesize:{}",
                      swrOutputSize, out_samples, frame->nb_samples, linesize);
+        if (ret < 0) {
+          spdlog::error("av_samples_alloc failed: {} {}", ret, av_err2str(ret));
+          swrOutput[0] = nullptr;
+          swrOutput[1] = nullptr;
+          swrOutputSize = 0;
+          av_frame_free(&frame);
+          continue;
+        }
         swrOutputSize = out_samples;
       }
 
-      out_samples =
-          swr_convert(swr, swrOutput, out_samples,
-                      (const uint8_t **)frame->data, frame->nb_samples);
-
-      feedAudioData(reinterpret_cast<float *>(swrOutput[0]),
-                    reinterpret_cast<float *>(swrOutput[1]), out_samples);
+      // 22.2ch (24プレーン) のようにチャンネル数が AV_NUM_DATA_POINTERS(8) を
+      // 超えるプレーナ音声では、frame->data には先頭 8 プレーンしか入らず、全
+      // プレーンは extended_data からしか辿れない。data を渡すと 9 番目以降と
+      // してフレーム構造体の隣 (linesize 配列など) を音声データとして読むため、
+      // 雑音が出続ける。
+      out_samples = swr_convert(swr, swrOutput, out_samples,
+                                (const uint8_t **)frame->extended_data,
+                                frame->nb_samples);
+      if (out_samples < 0) {
+        spdlog::error("swr_convert failed: {} {}", out_samples,
+                      av_err2str(out_samples));
+      } else if (out_samples > 0) {
+        feedAudioData(reinterpret_cast<float *>(swrOutput[0]),
+                      reinterpret_cast<float *>(swrOutput[1]), out_samples);
+      }
     } else {
       if (swr) {
         spdlog::info("swr free (now 2ch audio).");
         swr_free(&swr);
+        channel_layout = 0;
+        sample_rate = 0;
+        swrInputFormat = AV_SAMPLE_FMT_NONE;
       }
       feedAudioData(reinterpret_cast<float *>(frame->data[0]),
                     reinterpret_cast<float *>(frame->data[1]),
