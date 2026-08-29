@@ -201,11 +201,29 @@ void setStatsCallback(emscripten::val callback) {
 }
 
 enum DualMonoMode { MAIN = 0, SUB = 1 };
-DualMonoMode dualMonoMode = DualMonoMode::MAIN;
+// JS(メインスレッド)が書き、デマルチプレクススレッドが読むのでアトミック。
+std::atomic<int> dualMonoMode{DualMonoMode::MAIN};
+
+// 実際に再生している音声ストリーム (audioStreamList 内の位置)。デマルチプレクサ
+// が dualMonoMode から決め、音声デコードスレッドはこれが変わったらデコーダを
+// 開き直す。以前は「パケットは選択したストリーム、デコーダと time_base は常に
+// [0]」という不整合があり、主/副でストリーム構成が異なる放送では別ストリームの
+// パケットを別コンテキストへ送り込んでいた。
+std::atomic<int> selectedAudioStreamIndex{0};
 
 void setDualMonoMode(int mode) {
   //
-  dualMonoMode = (DualMonoMode)mode;
+  dualMonoMode.store(mode, std::memory_order_relaxed);
+}
+
+// 選択中の音声 AVStream。呼び出し側で audioStreamList
+// が空でないことを確認する。
+AVStream *selectedAudioStream() {
+  int index = selectedAudioStreamIndex.load(std::memory_order_relaxed);
+  if (index < 0 || index >= (int)audioStreamList.size()) {
+    index = 0;
+  }
+  return audioStreamList[index];
 }
 
 // Buffer control
@@ -669,39 +687,45 @@ void videoConvertThreadFunc(std::atomic<bool> &terminateFlag) {
   }
 }
 
-void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
-  const AVCodec *audioCodec =
-      avcodec_find_decoder(audioStreamList[0]->codecpar->codec_id);
+// 指定した音声ストリーム用にデコーダを開き直す。主/副の切替時に呼ぶ。
+static bool openAudioDecoder(AVStream *stream) {
+  if (audioCodecContext != nullptr) {
+    avcodec_free_context(&audioCodecContext);
+  }
+  const AVCodec *audioCodec = avcodec_find_decoder(stream->codecpar->codec_id);
   if (audioCodec == nullptr) {
     spdlog::error("No supported decoder for Audio ...");
-    return;
-  } else {
-    spdlog::debug("Audio Decoder created.");
+    return false;
   }
   audioCodecContext = avcodec_alloc_context3(audioCodec);
   if (audioCodecContext == nullptr) {
     spdlog::error("avcodec_alloc_context3 for audio failed");
-    return;
-  } else {
-    spdlog::debug("avcodec_alloc_context3 for audio success.");
+    return false;
   }
-  // open codec
-  if (avcodec_parameters_to_context(audioCodecContext,
-                                    audioStreamList[0]->codecpar) < 0) {
+  if (avcodec_parameters_to_context(audioCodecContext, stream->codecpar) < 0) {
     spdlog::error("avcodec_parameters_to_context failed");
     avcodec_free_context(&audioCodecContext);
-    return;
+    return false;
   }
-
   if (avcodec_open2(audioCodecContext, audioCodec, nullptr) != 0) {
     spdlog::error("avcodec_open2 failed");
     avcodec_free_context(&audioCodecContext);
+    return false;
+  }
+  spdlog::info("audio decoder opened for stream index:{} codec:{} ch:{} "
+               "sample_rate:{}",
+               stream->index, avcodec_get_name(stream->codecpar->codec_id),
+               stream->codecpar->ch_layout.nb_channels,
+               stream->codecpar->sample_rate);
+  return true;
+}
+
+void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
+  int openedIndex = selectedAudioStreamIndex.load(std::memory_order_relaxed);
+  AVStream *openedStream = selectedAudioStream();
+  if (!openAudioDecoder(openedStream)) {
     return;
   }
-  spdlog::debug("avcodec for audio open success.");
-
-  // 巻き戻す
-  // inputBufferReadIndex = 0;
 
   AVFrame *frame = av_frame_alloc();
   if (frame == nullptr) {
@@ -711,6 +735,25 @@ void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
   }
 
   while (!terminateFlag) {
+    // 主/副が切り替わったらそのストリーム用にデコーダを開き直す。積んである
+    // 旧ストリームのパケットは別コンテキスト向けなので捨てる。
+    int wantIndex = selectedAudioStreamIndex.load(std::memory_order_relaxed);
+    if (wantIndex != openedIndex) {
+      {
+        std::lock_guard<std::mutex> lock(audioPacketMtx);
+        while (!audioPacketQueue.empty()) {
+          auto stale = audioPacketQueue.front();
+          audioPacketQueue.pop_front();
+          av_packet_free(&stale);
+        }
+      }
+      openedIndex = wantIndex;
+      openedStream = selectedAudioStream();
+      if (!openAudioDecoder(openedStream)) {
+        break;
+      }
+    }
+
     AVPacket *ppacket;
     {
       std::unique_lock<std::mutex> lock(audioPacketMtx);
@@ -737,10 +780,10 @@ void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
                     "timebase:{} buf[0].size:{} buf[1].size:{} nb_samples:{} "
                     "ch:{}",
                     frame->format, frame->pts, av_q2d(frame->time_base),
-                    av_q2d(audioStreamList[0]->time_base),
-                    frameBufSize(frame, 0), frameBufSize(frame, 1),
-                    frame->nb_samples, frame->ch_layout.nb_channels);
-      frame->time_base = audioStreamList[0]->time_base;
+                    av_q2d(openedStream->time_base), frameBufSize(frame, 0),
+                    frameBufSize(frame, 1), frame->nb_samples,
+                    frame->ch_layout.nb_channels);
+      frame->time_base = openedStream->time_base;
       // 通常は最初の映像フレームが出るまで音声を積まない(起動時 A/V 同期)。
       // WebCodecs モードは映像を JS 側でデコードするため videoFrameFound が
       // 立たない。この場合は音声がクロックの基準になるので、映像を待たずに
@@ -755,7 +798,9 @@ void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
   }
   av_frame_free(&frame);
   spdlog::debug("freeing audioCodecContext");
-  avcodec_free_context(&audioCodecContext);
+  if (audioCodecContext != nullptr) {
+    avcodec_free_context(&audioCodecContext);
+  }
 }
 
 // decoder
@@ -1005,9 +1050,20 @@ void decoderThreadFunc() {
         }
       }
     }
-    if (audioStreamList.size() > 0 &&
-        (ppacket->stream_index ==
-         audioStreamList[(int)dualMonoMode % audioStreamList.size()]->index)) {
+    if (!audioStreamList.empty()) {
+      // 主/副の選択を音声デコードスレッドへ伝える (向こうで開き直す)。
+      int wantIndex = dualMonoMode.load(std::memory_order_relaxed) %
+                      (int)audioStreamList.size();
+      if (wantIndex !=
+          selectedAudioStreamIndex.load(std::memory_order_relaxed)) {
+        spdlog::info("audio stream select: {} -> {}",
+                     selectedAudioStreamIndex.load(std::memory_order_relaxed),
+                     wantIndex);
+        selectedAudioStreamIndex.store(wantIndex, std::memory_order_relaxed);
+      }
+    }
+    if (!audioStreamList.empty() &&
+        ppacket->stream_index == selectedAudioStream()->index) {
       AVPacket *clonePacket = av_packet_clone(ppacket);
       {
         std::lock_guard<std::mutex> lock(audioPacketMtx);
@@ -1225,6 +1281,21 @@ int swrOutputSize = 0;
 int channel_layout = 0;
 int sample_rate = 0;
 
+// 現在再生中の音声 PTS(秒)の推定値。AudioWorklet に積まれている未再生ぶんを
+// フレームの PTS から引く。sample_rate が取れないときはフレームの PTS をその
+// まま返す (0除算回避)。
+static double estimateAudioPlayTime(const AVFrame *audioFrame,
+                                    int bufferedSamples) {
+  double audioPtsTime = audioFrame->pts * av_q2d(audioFrame->time_base);
+  int sampleRate = audioStreamList.empty()
+                       ? 0
+                       : selectedAudioStream()->codecpar->sample_rate;
+  if (sampleRate <= 0) {
+    return audioPtsTime;
+  }
+  return audioPtsTime - (double)bufferedSamples / sampleRate;
+}
+
 void decoderMainloop() {
   const int currentBufferedAudioSamples =
       bufferedAudioSamples.load(std::memory_order_relaxed);
@@ -1363,12 +1434,9 @@ void decoderMainloop() {
   // では映像フレームが videoFrameQueue に来ない(JS 側でデコード)ため、ここで
   // 独立に計算しておき、JS の映像表示同期に使わせる。
   if (audioFrame && !audioStreamList.empty() &&
-      audioStreamList[0]->codecpar->sample_rate > 0) {
-    double audioPtsTimeForClock =
-        audioFrame->pts * av_q2d(audioFrame->time_base);
+      selectedAudioStream()->codecpar->sample_rate > 0) {
     currentAudioPlaybackTime =
-        audioPtsTimeForClock - (double)currentBufferedAudioSamples /
-                                   audioStreamList[0]->codecpar->sample_rate;
+        estimateAudioPlayTime(audioFrame, currentBufferedAudioSamples);
   }
 
   if (currentFrame && audioFrame) {
@@ -1398,14 +1466,10 @@ void decoderMainloop() {
     // VideoとAudioのPTSをクロックから時間に直す
     // TODO: クロック一回転したときの処理
     double videoPtsTime = currentFrame->pts * av_q2d(currentFrame->time_base);
-    double audioPtsTime = audioFrame->pts * av_q2d(audioFrame->time_base);
 
     // 上記から推定される、現在再生している音声のPTS（時間）
-    // double estimatedAudioPlayTime =
-    //     audioPtsTime - (double)queuedSize / ctx.openedAudioSpec.freq;
     double estimatedAudioPlayTime =
-        audioPtsTime - (double)currentBufferedAudioSamples /
-                           audioStreamList[0]->codecpar->sample_rate;
+        estimateAudioPlayTime(audioFrame, currentBufferedAudioSamples);
 
     // 1フレーム分くらいはズレてもいいからこれでいいか。フレーム真面目に考えると良くわからない。
     bool showFlag = estimatedAudioPlayTime > videoPtsTime;
@@ -1446,19 +1510,9 @@ void decoderMainloop() {
       double ptsTime = pts * av_q2d(p.timeBase);
 
       // AudioFrameは完全に見るだけ
-      // VideoとAudioのPTSをクロックから時間に直す
       // TODO: クロック一回転したときの処理
-      double audioPtsTime = audioFrame->pts * av_q2d(audioFrame->time_base);
-
-      // 上記から推定される、現在再生している音声のPTS（時間）
-      // double estimatedAudioPlayTime =
-      //     audioPtsTime - (double)queuedSize / ctx.openedAudioSpec.freq;
-      // 0除算を避けるためsample_rateがおかしいときはAudioのPTSをそのまま返す
-      int sampleRate = audioStreamList[0]->codecpar->sample_rate;
       double estimatedAudioPlayTime =
-          sampleRate
-              ? audioPtsTime - (double)currentBufferedAudioSamples / sampleRate
-              : audioPtsTime;
+          estimateAudioPlayTime(audioFrame, currentBufferedAudioSamples);
 
       auto data = emscripten::val(
           emscripten::typed_memory_view<uint8_t>(buffer.size(), &buffer[0]));
