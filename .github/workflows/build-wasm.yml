@@ -5,17 +5,20 @@ on:
     branches: [main]
     paths:
       - 'wasm/**'
+      - '.github/workflows/build-wasm.yml'
   pull_request:
     branches: [main]
     paths:
       - 'wasm/**'
+      - '.github/workflows/build-wasm.yml'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Run clang-format style check for C/C++/Protobuf programs.
         uses: jidicula/clang-format-action@v4.14.0
@@ -24,7 +27,7 @@ jobs:
           check-path: ./wasm
 
       - name: Setup emsdk
-        uses: mymindstorm/setup-emsdk@v14
+        uses: emscripten-core/setup-emsdk@v16
         with:
           version: 3.1.74
           actions-cache-folder: 'emsdk-cache'
@@ -35,7 +38,7 @@ jobs:
         run: yarn cmake:build
 
       - name: upload wasm artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: public-wasm
           path: public/wasm
