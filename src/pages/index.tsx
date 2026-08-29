@@ -25,6 +25,7 @@ import { CartesianGrid, LineChart, XAxis, YAxis, Line, Legend } from 'recharts'
 import Head from 'next/head'
 import { WasmModule, StatsData, VideoStreamInfo } from '../lib/wasmmodule'
 import { CONTAINER_PROBE_SIZE, looksLikeTlv } from '../lib/container'
+import { buildWebCodecsConfig } from '../lib/webcodecs'
 import dayjs from 'dayjs'
 
 import { Program, Service } from 'mirakurun/api'
@@ -133,56 +134,7 @@ const Page: NextPage = () => {
   // WebCodecs 用: JS の VideoDecoder(ハードウェアデコード)で映像をデコードし、
   // WASM が保持する音声クロックに同期して canvas へ描画する。対象コーデックは
   // HEVC (BS4K/8K) と H.264 (スカパープレミアム等)。構成は WASM の probe が
-  // 通知してくるストリーム情報(info)から決める。
-  const buildWebCodecsConfig = (
-    info: VideoStreamInfo
-  ): VideoDecoderConfig | null => {
-    if (info.codec === 'hevc') {
-      // hev1.<profile>.<互換フラグ>.L<general_level_idc>.<制約>。
-      // profile は 1=Main / 2=Main10、level は「レベル×30」(5.1 なら 153、
-      // 8K の 6.1 なら 183)。probe で取れないファイルがあるので、その場合は
-      // BS4K で実績のある Main10 L5.1 にフォールバックする。
-      // レベル固定だと 8K(L6.x)で構成が弾かれる。
-      const profileTag = info.profile === 1 ? '1.6' : '2.4'
-      const level = info.level > 0 ? info.level : 153
-      const config: VideoDecoderConfig = {
-        codec: `hev1.${profileTag}.L${level}.90`,
-        optimizeForLatency: true,
-      }
-      if (info.width > 0 && info.height > 0) {
-        config.codedWidth = info.width
-        config.codedHeight = info.height
-      }
-      return config
-    }
-    if (info.codec === 'h264') {
-      // Annex-B (description なし)。codec 文字列は profile/level から生成し、
-      // 不明時は High@L4.0 にフォールバックする。
-      // NOTE: optimizeForLatency は付けない。Chrome はこれで FFmpeg デコーダを
-      // low-delay にするが、B フレームを含む放送 H.264 では最初の I ピクチャの
-      // 直後に Decoding error になる。
-      const profile = info.profile > 0 ? info.profile : 100
-      const level = info.level > 0 ? info.level : 40
-      const prefix =
-        profile === 66
-          ? '42C0'
-          : profile === 77
-          ? '4D40'
-          : profile === 100
-          ? '6400'
-          : profile.toString(16).padStart(2, '0').toUpperCase() + '00'
-      const config: VideoDecoderConfig = {
-        codec: `avc1.${prefix}${level.toString(16).padStart(2, '0').toUpperCase()}`,
-      }
-      if (info.width > 0 && info.height > 0) {
-        config.codedWidth = info.width
-        config.codedHeight = info.height
-      }
-      return config
-    }
-    return null
-  }
-
+  // 通知してくるストリーム情報(info)から決める (buildWebCodecsConfig)。
   const startWebCodecs = (
     Module: WasmModule,
     canvas: HTMLCanvasElement | null,
