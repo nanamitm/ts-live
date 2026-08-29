@@ -41,6 +41,17 @@ declare interface EpgRecordedFile {
   filename: string
 }
 
+// 秒を mm:ss / h:mm:ss に整形する。
+const formatLocalTime = (seconds: number): string => {
+  if (!Number.isFinite(seconds) || seconds < 0) return '--:--'
+  const total = Math.floor(seconds)
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const sec = total % 60
+  const mm = h > 0 ? String(m).padStart(2, '0') : String(m)
+  return `${h > 0 ? `${h}:` : ''}${mm}:${String(sec).padStart(2, '0')}`
+}
+
 // グラフに保持する統計データの点数。
 const CHART_HISTORY = 300
 
@@ -88,6 +99,22 @@ const Page: NextPage = () => {
   const lastLocalFileRef = useRef<File | null>(null)
   const [localLoop, setLocalLoop] = useLocalStorage<boolean>('tsplayerLocalLoop', false)
   const localLoopRef = useRef<boolean>(false)
+  // シーク用の再生位置推定。TS/TLV には索引が無いので、実測ビットレート
+  // (供給バイト数 / 経過メディア時刻) からバイト位置と時刻を相互に換算する。
+  // 放送 TS はほぼ CBR なので、この近似で実用上十分な精度が出る。
+  const localStartOffsetRef = useRef<number>(0)
+  const localFedBytesRef = useRef<number>(0)
+  // メディア時刻の基準点と、その時点までに供給済みだったバイト数。
+  const localClockBaseRef = useRef<{ time: number; bytes: number } | null>(null)
+  const localBytesPerSecRef = useRef<number>(0)
+  const [localPosition, setLocalPosition] = useState<{
+    bytes: number
+    size: number
+    seconds: number
+    duration: number
+  } | null>(null)
+  // スライダーをドラッグしている間は、推定位置での上書きを止める。
+  const [localSeeking, setLocalSeeking] = useState<number | null>(null)
   // WebCodecs で再生不能だったとき true にして WASM ソフトデコードで再生し直す
   // (ループ/最初から再生でも維持)。新しいファイルを開いたらリセットする。
   const localForceSoftwareRef = useRef<boolean>(false)
@@ -805,13 +832,22 @@ const Page: NextPage = () => {
     return looksLikeTlv(buf)
   }
 
-  const playLocalFile = (file: File) => {
+  const playLocalFile = (file: File, startOffset = 0) => {
     if (!wasmMod) {
       console.error('WasmModule not loaded')
       return
     }
     const Module = wasmMod
     lastLocalFileRef.current = file
+    localStartOffsetRef.current = startOffset
+    localFedBytesRef.current = 0
+    localClockBaseRef.current = null
+    setLocalPosition({
+      bytes: startOffset,
+      size: file.size,
+      seconds: 0,
+      duration: 0,
+    })
     setLocalFileName(file.name)
     setPlayMode('localfile')
     // 現在の再生を止める
@@ -867,7 +903,7 @@ const Page: NextPage = () => {
           if (info.webCodecs) {
             startWebCodecs(Module, wcCanvasRef.current, info, () => {
               localForceSoftwareRef.current = true
-              playLocalFile(file)
+              playLocalFile(file, startOffset)
             })
             setWebCodecsActive(true)
           }
@@ -878,9 +914,11 @@ const Page: NextPage = () => {
       Module.setTlvMode(tlv)
       Module.setWebCodecsMode(wantWebCodecs)
 
-      console.log('start local file', file.name, file.size)
+      console.log('start local file', file.name, file.size, 'from', startOffset)
       {
-        const reader = file.stream().getReader()
+        // 指定バイト位置から供給する。TS は read_packet 側が 0x47 を探し直し、
+        // TLV は mmttlv の resync が効くので、パケット境界に合っていなくてよい。
+        const reader = file.slice(startOffset).stream().getReader()
         let ret = await reader.read()
         while (!ret.done) {
           if (aborted) {
@@ -899,6 +937,7 @@ const Page: NextPage = () => {
                 }
                 buffer.set(ret.value)
                 Module.commitInputData(ret.value.length)
+                localFedBytesRef.current += ret.value.length
                 break
               }
             } catch (ex) {
@@ -933,13 +972,62 @@ const Page: NextPage = () => {
           }
           if (!aborted && localLoopRef.current) {
             console.log('local file loop: restart', file.name)
-            playLocalFile(file)
+            playLocalFile(file, 0)
           }
         }
       }
     })().catch(ex => {
       console.log('local file read ex:', ex)
     })
+  }
+
+  // 再生位置の推定を定期的に更新する。音声クロック(メディア時刻)の進みと供給
+  // バイト数からビットレートを実測し、それでバイト位置・総時間へ換算する。
+  useEffect(() => {
+    if (playMode !== 'localfile' || !wasmMod) return
+    const file = lastLocalFileRef.current
+    if (!file) return
+    const timer = setInterval(() => {
+      const mediaTime = wasmMod.getAudioPlaybackTime()
+      if (mediaTime < 0) return
+      const fed = localFedBytesRef.current
+      const base = localClockBaseRef.current
+      if (!base) {
+        localClockBaseRef.current = { time: mediaTime, bytes: fed }
+        return
+      }
+      const elapsed = mediaTime - base.time
+      if (elapsed < 0) {
+        // メディア時刻が巻き戻った(ループ/シーク直後)。基準を取り直す。
+        localClockBaseRef.current = { time: mediaTime, bytes: fed }
+        return
+      }
+      if (elapsed > 2) {
+        // 2秒以上ぶんの実測が溜まったらビットレートを更新する。
+        localBytesPerSecRef.current = (fed - base.bytes) / elapsed
+      }
+      const bytesPerSec = localBytesPerSecRef.current
+      // 基準時刻に鳴っていたのは startOffset 付近のデータ。供給済みバイト数は
+      // バッファぶん先行しているので、位置の起点には使わない (レートの実測に
+      // だけ使う)。
+      const consumed = bytesPerSec > 0 ? elapsed * bytesPerSec : 0
+      const bytes = Math.min(localStartOffsetRef.current + consumed, file.size)
+      setLocalPosition({
+        bytes,
+        size: file.size,
+        seconds: bytesPerSec > 0 ? bytes / bytesPerSec : 0,
+        duration: bytesPerSec > 0 ? file.size / bytesPerSec : 0,
+      })
+    }, 250)
+    return () => clearInterval(timer)
+  }, [playMode, wasmMod])
+
+  const seekLocalFile = (bytes: number) => {
+    const file = lastLocalFileRef.current
+    if (!file) return
+    const offset = Math.min(Math.max(Math.floor(bytes), 0), Math.max(file.size - 1, 0))
+    console.log('local file seek to', offset, `${((offset / file.size) * 100).toFixed(1)}%`)
+    playLocalFile(file, offset)
   }
 
   useKey(
@@ -1316,7 +1404,8 @@ const Page: NextPage = () => {
                     css={css`flex: 1;`}
                     disabled={!localFileName}
                     onClick={() => {
-                      if (lastLocalFileRef.current) playLocalFile(lastLocalFileRef.current)
+                      if (lastLocalFileRef.current)
+                        playLocalFile(lastLocalFileRef.current, 0)
                     }}
                   >
                     最初から再生
@@ -1331,6 +1420,50 @@ const Page: NextPage = () => {
                     `}
                   >
                     {`再生中: ${localFileName}`}
+                  </div>
+                )}
+                {localPosition && localPosition.size > 0 && (
+                  <div css={css`margin-top: 8px;`}>
+                    <Slider
+                      aria-label="再生位置"
+                      min={0}
+                      max={localPosition.size}
+                      step={Math.max(Math.floor(localPosition.size / 1000), 1)}
+                      value={localSeeking ?? localPosition.bytes}
+                      onChange={(ev, val) => {
+                        if (typeof val === 'number') setLocalSeeking(val)
+                      }}
+                      onChangeCommitted={(ev, val) => {
+                        setLocalSeeking(null)
+                        if (typeof val === 'number') seekLocalFile(val)
+                      }}
+                    />
+                    <div
+                      css={css`
+                        display: flex;
+                        justify-content: space-between;
+                        font-size: 12px;
+                      `}
+                    >
+                      <span>
+                        {formatLocalTime(
+                          localPosition.duration > 0 && localPosition.size > 0
+                            ? ((localSeeking ?? localPosition.bytes) /
+                                localPosition.size) *
+                                localPosition.duration
+                            : 0
+                        )}
+                      </span>
+                      <span>
+                        {localPosition.duration > 0
+                          ? `${formatLocalTime(localPosition.duration)} (推定)`
+                          : `${(
+                              ((localSeeking ?? localPosition.bytes) /
+                                localPosition.size) *
+                              100
+                            ).toFixed(1)}%`}
+                      </span>
+                    </div>
                   </div>
                 )}
               </FormGroup>
