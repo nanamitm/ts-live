@@ -441,11 +441,23 @@ void resetInternal() {
   }
 }
 
+// reset() の完了フラグ。JS はこれが立つのを待ってから次の再生データを流す。
+// 以前は reset() がメインスレッドから resetInternal() を直接呼び、まだ動いて
+// いるデコードスレッドと同じ状態を触っていた (JS 側は「たぶん落ち着くだろう」
+// という 500ms の待ちで誤魔化していた)。今は片付けそのものをデコードスレッド
+// に任せ、終わったことをこのフラグで知らせる。
+std::atomic<bool> resetCompleted{true};
+
+bool isResetCompleted() { return resetCompleted.load(); }
+
 void reset() {
   spdlog::debug("reset()");
+  resetCompleted = false;
   resetedDecoder = true;
   resetedDownloader = true;
-  resetInternal();
+  // read_packet で待っているデコードスレッドを起こす。
+  std::lock_guard<std::mutex> lock(inputBufferMtx);
+  waitCv.notify_all();
 }
 
 void videoDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
@@ -813,7 +825,9 @@ void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
 // decoder
 void decoderThreadFunc() {
   spdlog::info("Decoder Thread started.");
+  // 前回の再生の後片付け。reset() を呼んだ JS はこれが終わるのを待っている。
   resetInternal();
+  resetCompleted = true;
   AVFormatContext *formatContext = nullptr;
   AVIOContext *avioContext = nullptr;
   uint8_t *ibuf = nullptr;

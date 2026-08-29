@@ -11,6 +11,7 @@ void commitInputData(size_t nextSize);
 void setCaptionCallback(emscripten::val callback);
 void setStatsCallback(emscripten::val callback);
 void reset();
+bool isResetCompleted();
 void playFile(std::string url);
 void setDualMonoMode(int mode);
 void setTlvMode(bool isTlv);

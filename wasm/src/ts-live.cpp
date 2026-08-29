@@ -82,6 +82,7 @@ EMSCRIPTEN_BINDINGS(ts_live_module) {
   emscripten::function("getNextInputBuffer", &getNextInputBuffer);
   emscripten::function("commitInputData", &commitInputData);
   emscripten::function("reset", &reset);
+  emscripten::function("isResetCompleted", &isResetCompleted);
   emscripten::function("setLogLevelDebug", &setLogLevelDebug);
   emscripten::function("setLogLevelInfo", &setLogLevelInfo);
   emscripten::function("setBufferedAudioSamples", &setBufferedAudioSamples);

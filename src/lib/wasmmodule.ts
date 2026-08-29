@@ -45,6 +45,8 @@ export declare interface WasmModule extends EmscriptenModule {
   getNextInputBuffer(size: number): Uint8Array | null
   commitInputData(size: number): void
   reset(): void
+  // reset() の後片付けはデコードスレッドで非同期に進む。完了したら true。
+  isResetCompleted(): boolean
   setAudioGain(volume: number): void
   setDualMonoMode(mode: number): void
   setTlvMode(isTlv: boolean): void

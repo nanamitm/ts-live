@@ -398,6 +398,23 @@ const Page: NextPage = () => {
     }
   }
 
+  // Module.reset() の後片付けはデコードスレッドで進むので、完了フラグが立つのを
+  // 待ってから次の再生データを流し込む。固定の待ち時間だと短すぎれば前の再生の
+  // 状態が残り、長すぎれば切替が遅くなる。フラグが来ない場合に備えて上限を置く。
+  const waitForDecoderReset = async (
+    Module: WasmModule,
+    isAborted: () => boolean
+  ) => {
+    const deadline = performance.now() + 3000
+    while (!isAborted() && performance.now() < deadline) {
+      if (Module.isResetCompleted()) return
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    if (!isAborted() && !Module.isResetCompleted()) {
+      console.warn('decoder reset did not complete in time; starting anyway')
+    }
+  }
+
   const [wakeLock, setWakeLock] = useState<WakeLockSentinel>()
   const [wasmMod, setWasmMod] = useState<WasmModule | null>(null)
   // WebGPU 非対応や WASM 読み込み失敗を握り潰さずに画面へ出す。
@@ -685,11 +702,9 @@ const Page: NextPage = () => {
 
     let stopped = false
     let ac: AbortController | null = null
-    let startTimer: ReturnType<typeof setTimeout> | null = null
     const stop = () => {
       if (stopped) return
       stopped = true
-      if (startTimer !== null) clearTimeout(startTimer)
       ac?.abort()
       Module.setVideoStreamInfoCallback(null as any)
       if (webCodecsCtrlRef.current) {
@@ -699,11 +714,12 @@ const Page: NextPage = () => {
       setWebCodecsActive(false)
       Module.reset()
     }
-    // 待機中の切替でも古い開始処理を止められるよう、タイマー登録前に停止関数を公開する。
+    // 待機中の切替でも古い開始処理を止められるよう、待ちに入る前に停止関数を公開する。
     stopFuncRef.current = stop
 
-    // 直前の reset が落ち着くまで 0.5 秒待つ。
-    startTimer = setTimeout(() => {
+    ;(async () => {
+      // 直前の reset の後片付けが終わるのを待つ。
+      await waitForDecoderReset(Module, () => stopped)
       if (stopped) return
       // 再生スタート
       if (playMode === 'live') {
@@ -795,7 +811,7 @@ const Page: NextPage = () => {
         const url = `${epgStationServer}/api/videos/${activeRecordedFileId}`
         Module.playFile(url)
       }
-    }, 500)
+    })()
 
     return () => {
       if (stopFuncRef.current === stop) stopFuncRef.current = () => {}
@@ -878,8 +894,8 @@ const Page: NextPage = () => {
       const tlv =
         localMode === 'tlv' ? true : localMode === 'ts' ? false : await detectTlvFromHeader(file)
       console.log('local file mode', file.name, { localMode, tlv })
-      // 直前の再生停止(reset)が落ち着くまで少し待つ
-      await sleep(500)
+      // 直前の再生停止(reset)の後片付けが終わるのを待つ
+      await waitForDecoderReset(Module, () => aborted)
       if (aborted) return
 
       // ローカルファイルは常に WebCodecs を試みる。実際に使うかは WASM が
