@@ -213,13 +213,26 @@ std::atomic<int> dualMonoMode{DualMonoMode::MAIN};
 // パケットを別コンテキストへ送り込んでいた。
 std::atomic<int> selectedAudioStreamIndex{0};
 
+// メインループ(decoderMainloop)が参照する値のスナップショット。
+//
+// AVStream の実体は AVFormatContext のもので、リセット時にデマルチプレクス
+// スレッドが avformat_close_input() で解放し audioStreamList も clear() する。
+// メインループから audioStreamList や AVStream を直接触ると、
+// 「empty() を通った直後に解放される」窓と、vector への無同期アクセスという
+// 二重の未定義動作になる。必要な値だけをアトミックに写し取り、メインループは
+// そちらだけを見る。
+std::atomic<int> currentAudioSampleRate{0};
+std::atomic<bool> streamsReady{false};
+
 void setDualMonoMode(int mode) {
   //
   dualMonoMode.store(mode, std::memory_order_relaxed);
 }
 
-// 選択中の音声 AVStream。呼び出し側で audioStreamList
-// が空でないことを確認する。
+// 選択中の音声 AVStream。AVFormatContext の寿命内で動くスレッド
+// (デマルチプレクス/音声デコード) からのみ呼ぶこと。メインループから呼ぶと
+// リセットと競合して解放済みメモリを読む。呼び出し側で audioStreamList が
+// 空でないことを確認する。
 AVStream *selectedAudioStream() {
   int index = selectedAudioStreamIndex.load(std::memory_order_relaxed);
   if (index < 0 || index >= (int)audioStreamList.size()) {
@@ -433,6 +446,8 @@ void resetInternal() {
     lastTtml.clear();
     lastTtmlStreamIndex = -1;
   }
+  streamsReady = false;
+  currentAudioSampleRate = 0;
   videoStream = nullptr;
   audioStreamList.clear();
   captionStream = nullptr;
@@ -734,6 +749,8 @@ static bool openAudioDecoder(AVStream *stream) {
     avcodec_free_context(&audioCodecContext);
     return false;
   }
+  currentAudioSampleRate.store(stream->codecpar->sample_rate,
+                               std::memory_order_relaxed);
   spdlog::info("audio decoder opened for stream index:{} codec:{} ch:{} "
                "sample_rate:{}",
                stream->index, avcodec_get_name(stream->codecpar->codec_id),
@@ -986,6 +1003,16 @@ void decoderThreadFunc() {
       pendingVideoStreamInfo.webCodecs = webCodecsMode;
       videoStreamInfoPending = true;
     }
+
+    // 主/副の選択を新しいストリーム構成に合わせ直し、メインループが見る値を
+    // 確定させる。ここから先、メインループは AVStream を触らずに済む。
+    selectedAudioStreamIndex.store(
+        dualMonoMode.load(std::memory_order_relaxed) %
+            (int)audioStreamList.size(),
+        std::memory_order_relaxed);
+    currentAudioSampleRate.store(selectedAudioStream()->codecpar->sample_rate,
+                                 std::memory_order_relaxed);
+    streamsReady = true;
   }
 
   std::atomic<bool> videoTerminateFlag{false};
@@ -1322,9 +1349,7 @@ int sample_rate = 0;
 static double estimateAudioPlayTime(const AVFrame *audioFrame,
                                     int bufferedSamples) {
   double audioPtsTime = audioFrame->pts * av_q2d(audioFrame->time_base);
-  int sampleRate = audioStreamList.empty()
-                       ? 0
-                       : selectedAudioStream()->codecpar->sample_rate;
+  int sampleRate = currentAudioSampleRate.load(std::memory_order_relaxed);
   if (sampleRate <= 0) {
     return audioPtsTime;
   }
@@ -1404,7 +1429,7 @@ void decoderMainloop() {
     }
   }
 
-  if (videoStream && !audioStreamList.empty() && !statsCallback.isNull()) {
+  if (streamsReady && !statsCallback.isNull()) {
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now() - startTime);
     auto data = emscripten::val::object();
@@ -1468,8 +1493,8 @@ void decoderMainloop() {
   // 音声クロック(推定再生時刻)を映像の有無に依らず更新する。WebCodecs モード
   // では映像フレームが videoFrameQueue に来ない(JS 側でデコード)ため、ここで
   // 独立に計算しておき、JS の映像表示同期に使わせる。
-  if (audioFrame && !audioStreamList.empty() &&
-      selectedAudioStream()->codecpar->sample_rate > 0) {
+  if (audioFrame &&
+      currentAudioSampleRate.load(std::memory_order_relaxed) > 0) {
     currentAudioPlaybackTime =
         estimateAudioPlayTime(audioFrame, currentBufferedAudioSamples);
   }
