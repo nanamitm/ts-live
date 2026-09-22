@@ -56,6 +56,10 @@ const formatLocalTime = (seconds: number): string => {
 // グラフに保持する統計データの点数。
 const CHART_HISTORY = 300
 
+// VideoDecoder に入れたまま消化されずに滞留してよい AU 数の上限。正常時は
+// ほぼ 0 なので、これを超えるのはデコードが実時間に追いついていないとき。
+const MAX_DECODE_QUEUE_SIZE = 30
+
 let initialized = false
 
 const Page: NextPage = () => {
@@ -277,10 +281,36 @@ const Page: NextPage = () => {
 
     // WASM から呼ばれる: アクセスユニット 1 個を VideoDecoder へ投入。
     let lastTsUs = 0
+    let backlogged = false
+    let backlogDropped = 0
     Module.setVideoAuCallback((data: Uint8Array, ptsSec: number, isKey: boolean) => {
       if (stopped) return
       // エラー後(closed)は捨てる。リトライ中の decode() 例外スパムを防ぐ。
       if (decoder.state !== 'configured') return
+      // デコーダが詰まっている間は AU を入れない。タブが非表示の間はデコード
+      // 出力の配送が絞られる一方 AU の供給は実時間で続くので、VideoDecoder の
+      // 中に数分ぶんが滞留する。復帰後はそれを順に消化することになり、4K の
+      // ように実時間の数倍でしかデコードできない映像だと、音声に追いつくまで
+      // 延々と早送りになる (2K だとすぐ消化できるので目立たない)。
+      // 表示されない AU なので捨て、次のキーフレームから作り直す。
+      if (decoder.decodeQueueSize > MAX_DECODE_QUEUE_SIZE) {
+        if (!backlogged) {
+          backlogged = true
+          console.warn(
+            'WebCodecs: decode backlog',
+            decoder.decodeQueueSize,
+            'AUs — dropping until the next key frame'
+          )
+        }
+        backlogDropped++
+        gotKey = false
+        return
+      }
+      if (backlogged) {
+        backlogged = false
+        console.warn('WebCodecs: decode backlog cleared, dropped', backlogDropped, 'AUs')
+        backlogDropped = 0
+      }
       if (!gotKey) {
         if (!isKey) {
           // 最初のキーフレームが来るまで delta は捨てる。長時間キーが来ない
