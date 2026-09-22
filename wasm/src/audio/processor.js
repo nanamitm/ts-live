@@ -13,6 +13,15 @@ class AudioFeederProcessor extends AudioWorkletProcessor {
         this.buffers1.push(e.data.buffer1)
         this.bufferedSamples += e.data.buffer0.length
         this.port.postMessage(this.bufferedSamples)
+      } else if (e.data.type === 'reset') {
+        // 再生の切り替え時。ここで捨てないと、切替直後にバッファ長ぶん
+        // (最大数百ms) 前番組の音が鳴ってから新しい音声に切り替わる。
+        this.started = false
+        this.currentBufferReadSize = 0
+        this.buffers0.length = 0
+        this.buffers1.length = 0
+        this.bufferedSamples = 0
+        this.port.postMessage(0)
       }
     }
   }

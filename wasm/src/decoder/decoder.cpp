@@ -523,6 +523,11 @@ void reset() {
   resetCompleted = false;
   resetedDecoder = true;
   resetedDownloader = true;
+  // AudioWorklet に溜まっている前番組の音声も捨てる。捨てないと、切替直後に
+  // バッファ長ぶん (最大数百ms) 前番組の音が鳴ってから新しい音声に変わる。
+  // reset() は JS からメインスレッドで呼ばれるのでここで捨ててよい
+  // (resetInternal() はデコードスレッド側なので EM_ASM の実行先がちがう)。
+  clearAudioSamples();
   // read_packet で待っているデコードスレッドを起こす。
   std::lock_guard<std::mutex> lock(inputBufferMtx);
   waitCv.notify_all();
@@ -1445,6 +1450,12 @@ void decoderMainloop() {
                 "videoPacketQueue:{} audioPacketQueue:{}",
                 videoFrameQueueSize, audioFrameQueueSize, videoPacketQueueSize,
                 audioPacketQueueSize);
+
+  // reset() の後片付けが終わるまでは何も出さない。前番組のキューに残った音声を
+  // AudioWorklet へ流してしまうと、reset() で捨てた意味がなくなる。
+  if (!resetCompleted.load()) {
+    return;
+  }
 
   // probe 済みの映像ストリーム情報を JS へ通知する(1回)。JS はこれを見て
   // VideoDecoder を構成するため、下の AU 受け渡しより必ず先に届ける。

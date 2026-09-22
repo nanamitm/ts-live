@@ -42,6 +42,9 @@ export const createProcessor = () => {
       const buffer1 = Float32Array.from(samples)
       processor.port.onmessage({ data: { type: 'feed', buffer0, buffer1 } })
     },
+    reset() {
+      processor.port.onmessage({ data: { type: 'reset' } })
+    },
     // process() を1回呼び、左右チャンネルの出力(長さ renderQuantum)を返す。
     render(renderQuantum = 128) {
       const output = [

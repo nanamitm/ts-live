@@ -53,6 +53,46 @@ test('枯渇したら無音で埋め、バッファ残量は負にならない',
   assert.deepEqual(Array.from(left), new Array(RENDER_QUANTUM).fill(0))
 })
 
+// 再生の切り替え (wasm 側の reset()) で、AudioWorklet に溜まっている前番組の
+// 音声も捨てられること。捨てられないと切替直後に前番組の音が鳴る。
+test('reset でバッファを捨て、以降は新しい音声だけを鳴らす', () => {
+  const ctx = createProcessor()
+  ctx.feed(new Array(START_THRESHOLD + 1000).fill(1))
+  ctx.render(RENDER_QUANTUM)
+  assert.ok(ctx.processor.bufferedSamples > 0)
+
+  ctx.reset()
+  assert.equal(ctx.processor.bufferedSamples, 0)
+  assert.equal(ctx.processor.buffers0.length, 0)
+  assert.equal(ctx.processor.buffers1.length, 0)
+  assert.equal(ctx.processor.started, false)
+  assert.equal(ctx.posted.at(-1), 0, 'リセット後の残量を通知する')
+
+  // 再生開始しきい値までは無音。前番組の残りは混ざらない。
+  const [silence] = ctx.render(RENDER_QUANTUM)
+  assert.deepEqual(Array.from(silence), new Array(RENDER_QUANTUM).fill(0))
+
+  ctx.feed(new Array(START_THRESHOLD + 1000).fill(2))
+  const [left] = ctx.render(RENDER_QUANTUM)
+  assert.deepEqual(Array.from(left), new Array(RENDER_QUANTUM).fill(2))
+})
+
+// 読み出し位置を持ち越すと、リセット後の最初のバッファが途中から鳴る。
+test('reset は読み出し位置も戻す', () => {
+  const ctx = createProcessor()
+  const ramp = Array.from({ length: START_THRESHOLD + 1000 }, (_, i) => i + 1)
+  ctx.feed(ramp)
+  ctx.render(RENDER_QUANTUM)
+  assert.ok(ctx.processor.currentBufferReadSize > 0)
+
+  ctx.reset()
+  assert.equal(ctx.processor.currentBufferReadSize, 0)
+
+  ctx.feed(ramp)
+  const [left] = ctx.render(RENDER_QUANTUM)
+  assert.equal(left[0], 1, '新しいバッファの先頭から鳴らす')
+})
+
 test('audio-feeder-processor として登録される', () => {
   const ctx = createProcessor()
   assert.deepEqual(ctx.registeredNames, ['audio-feeder-processor'])

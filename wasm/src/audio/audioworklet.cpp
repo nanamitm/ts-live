@@ -32,6 +32,16 @@ void feedAudioData(float *buffer0, float *buffer1, int samples) {
   // clang-format on
 }
 
+void clearAudioSamples() {
+  // clang-format off
+  EM_ASM({
+    if (Module && Module['myAudio'] && Module['myAudio']['node']) {
+      Module['myAudio']['node'].port.postMessage({type: 'reset'});
+    }
+  });
+  // clang-format on
+}
+
 void startAudioWorklet() {
   std::string scriptSource = slurp("/processor.js");
 
