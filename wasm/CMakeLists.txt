@@ -140,7 +140,10 @@ target_link_options(ts-live PRIVATE
   "SHELL:-s USE_SDL=0"
   "SHELL:-s USE_WEBGPU=1"
   "SHELL:-s FETCH=1"
-  "SHELL:-s INITIAL_MEMORY=174063616"
+  # 200MiB。実測 (2K MPEG-2 のソフトデコード / 4K HEVC の WebCodecs とも
+  # 199.2MB まで伸びる) に合わせてある。これより小さいと再生開始のたびに
+  # ヒープ拡張が走る。8K は 606MB まで伸びるので、そこは拡張に任せる。
+  "SHELL:-s INITIAL_MEMORY=209715200"
   "SHELL:-s ENVIRONMENT=web,worker"
   "SHELL:-s MODULARIZE=1 -s EXPORT_NAME=createWasmModule"
   "SHELL:-s DISABLE_DEPRECATED_FIND_EVENT_TARGET_BEHAVIOR=0"
