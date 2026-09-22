@@ -42,6 +42,18 @@ F2 キーでスクリーンキャプチャが出来ます。
 
 開発を楽にする目的なのであまり利便性とか力を入れてません。
 
+## テスト
+
+`yarn test` で JS 側のユニットテストが動きます (CI でも実行します)。
+
+TS の総時間解析 (`wasm/src/decoder/ts-duration.cpp`) だけは wasm をビルドして
+実ファイルで確かめる必要があるため、`yarn test` にも CI にも入っていません。
+ここを変更したら emsdk と ffmpeg/ffprobe のある環境で手動で実行してください。
+
+```
+bash scripts/test-ts-duration.sh
+```
+
 ## TS-Live を Docker で使う方法
 
 TS-Live の Docker コンテナは、TS-Live の html/js/wasm ファイルを https で配信すると共に、/api 以下を別ホストの mirakurun にリバースプロキシする nginx を起動します。
