@@ -778,6 +778,25 @@ void videoDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
     return;
   }
 
+  // 受信エラー後の乱れた映像を見せないための状態。
+  //
+  // ffmpeg は壊れたデータもエラー補完してフレームを出し続けるので、そのまま
+  // 描画すると壊れた参照を引き継いだ絵が次の I ピクチャまで流れる。受信が
+  // 乱れている間はそれが延々続く。WebCodecs 経路 (BS4K) はデコードエラーで
+  // 作り直して次のキーフレームから再開するので、こちらも同じく壊れたと
+  // 分かったら次のきれいなキーフレームまで捨てる (その間は直前の絵のまま)。
+  //
+  // 壊れた合図は 2 つ。パケット側は mpegts が CC 不連続・TEI で付ける
+  // AV_PKT_FLAG_CORRUPT、フレーム側はエラー補完が働いた decode_error_flags。
+  bool waitVideoKey = false;
+  // 最後に壊れていたパケットの PTS。これ以前のキーフレームは壊れたパケット
+  // から作られた可能性があるので受け付けない。
+  int64_t lastCorruptPts = AV_NOPTS_VALUE;
+  int droppedUntilKey = 0;
+  // キーフレーム判定がストリームと合わない (H.264 の非 IDR 運用など) 場合に
+  // 映像が止まったままにならないよう、捨てる枚数に上限を設ける。
+  const int MAX_DROP_UNTIL_KEY = 180;
+
   while (!terminateFlag) {
     // パイプラインが詰まったら、ここ(映像デコーダー)だけを一時停止する。
     // デマルチプレクスを止めると音声パケット供給まで止まりデッドロックする
@@ -810,6 +829,25 @@ void videoDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
       videoPacketQueue.pop_front();
     }
     AVPacket &packet = *ppacket;
+
+    if (packet.flags & AV_PKT_FLAG_CORRUPT) {
+      if (!waitVideoKey) {
+        spdlog::warn("corrupt video packet (pts:{}): drop frames until the "
+                     "next key frame",
+                     packet.pts);
+      }
+      waitVideoKey = true;
+      // パーサがまとめたパケットは PTS が DTS より前を指すことがある。
+      // 壊れた範囲を取りこぼさないよう大きい方を取る。
+      int64_t corruptTs = packet.pts;
+      if (packet.dts != AV_NOPTS_VALUE &&
+          (corruptTs == AV_NOPTS_VALUE || packet.dts > corruptTs)) {
+        corruptTs = packet.dts;
+      }
+      if (corruptTs != AV_NOPTS_VALUE) {
+        lastCorruptPts = corruptTs;
+      }
+    }
 
     int ret = avcodec_send_packet(videoCodecContext, &packet);
     if (ret != 0) {
@@ -858,6 +896,38 @@ void videoDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
       // フレームはそもそもキューに入れないほうが素直。
       if (frame->time_base.den == 0 || frame->time_base.num == 0) {
         continue;
+      }
+
+      const bool frameCorrupt = frame->decode_error_flags != 0 ||
+                                (frame->flags & AV_FRAME_FLAG_CORRUPT) != 0;
+      if (frameCorrupt && !waitVideoKey) {
+        spdlog::warn("corrupt video frame (pts:{} decode_error_flags:{}): "
+                     "drop frames until the next key frame",
+                     frame->pts, frame->decode_error_flags);
+        waitVideoKey = true;
+      }
+      if (waitVideoKey) {
+        const bool cleanKey =
+            !frameCorrupt && (frame->flags & AV_FRAME_FLAG_KEY) != 0 &&
+            (lastCorruptPts == AV_NOPTS_VALUE || frame->pts == AV_NOPTS_VALUE ||
+             frame->pts > lastCorruptPts);
+        if (cleanKey || droppedUntilKey >= MAX_DROP_UNTIL_KEY) {
+          if (cleanKey) {
+            spdlog::info("video resumed at key frame (pts:{}) after dropping "
+                         "{} frames",
+                         frame->pts, droppedUntilKey);
+          } else {
+            spdlog::warn("no clean key frame after dropping {} frames: "
+                         "resume anyway",
+                         droppedUntilKey);
+          }
+          waitVideoKey = false;
+          lastCorruptPts = AV_NOPTS_VALUE;
+          droppedUntilKey = 0;
+        } else {
+          droppedUntilKey++;
+          continue;
+        }
       }
 
       // 変換 (10bit→8bit) は専用スレッドに任せ、ここでは生フレームの参照を
