@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "../../misc-wasm/src/grabber/grabber.hpp"
 #include "audio/audioworklet.hpp"
 #include "decoder/decoder.hpp"
 #include "video/webgpu.hpp"
@@ -92,6 +93,8 @@ EMSCRIPTEN_BINDINGS(ts_live_module) {
   emscripten::function("setDualMonoMode", &setDualMonoMode);
   emscripten::function("setDeinterlace", &setDeinterlace);
   emscripten::function("setDetelecineMode", &setDetelecineMode);
+  emscripten::function("getGrabberInputBuffer", &getGrabberInputBuffer);
+  emscripten::function("grabFirstFrame", &grabFirstFrame);
   emscripten::function("resizeSwapChain", &resizeSwapChain);
   emscripten::function("setTlvMode", &setTlvMode);
   emscripten::function("setWebCodecsMode", &setWebCodecsMode);

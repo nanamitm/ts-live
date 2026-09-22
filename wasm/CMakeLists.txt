@@ -64,6 +64,8 @@ set(FFMPEG_CONFIGURE_COMMAND_LIST
     --disable-demuxers
     --enable-demuxer=mpegts
     --enable-demuxer=mmttlv
+    # grabber (MPEG-2 の生ESから1フレーム取り出す) 用。
+    --enable-demuxer=mpegvideo
     --disable-parsers
     --enable-parser=aac
     --enable-parser=aac_latm
@@ -116,8 +118,10 @@ set(FFMPEG_LIBRARIES
   ${CMAKE_BINARY_DIR}/install/lib/libswscale.a
 )
 
-file(GLOB_RECURSE SOURCES src/*.cpp)
-file(GLOB_RECURSE HEADERS src/*.hpp)
+# grabber は再生系から独立しているので、単体ビルド (ts-live-misc) にも回せる
+# よう misc-wasm 以下に置いてある。今はこちらのビルドにだけ含める。
+file(GLOB_RECURSE SOURCES src/*.cpp ../misc-wasm/src/grabber/*.cpp)
+file(GLOB_RECURSE HEADERS src/*.hpp ../misc-wasm/src/grabber/*.hpp)
 file(GLOB SHADERS src/video/shaders/*.wgsl)
 
 add_executable(ts-live ${SOURCES} ${HEADERS} ${SHADERS} src/audio/processor.js)

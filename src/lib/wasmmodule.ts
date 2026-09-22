@@ -13,6 +13,14 @@ export declare interface StatsData {
   TelecineFlag?: boolean
 }
 
+// grabFirstFrame() が返す画像。元の半分の解像度の RGBA (buffer は WASM
+// ヒープ上のビューなので、次の呼び出しまでに使い切るかコピーすること)。
+export declare interface GrabbedFrame {
+  width: number
+  height: number
+  buffer: Uint8Array
+}
+
 // probe 後に WASM から通知される映像ストリーム情報。webCodecs は「実際に
 // WebCodecs 経路を使うか」(非対応コーデックはソフトデコードへフォールバック)。
 export declare interface VideoStreamInfo {
@@ -69,6 +77,11 @@ export declare interface WasmModule extends EmscriptenModule {
   resizeSwapChain(width: number, height: number): void
   // 逆テレシネ。0=しない, 1=常にかける, 2=テレシネと判定したときだけ。
   setDetelecineMode(mode: number): void
+  // サムネイル用のフレーム取得。再生系とは独立した状態を持つので再生中でも
+  // 使える。入力は MPEG-2 の生ES のみ (TS/TLV コンテナは不可)。
+  // getGrabberInputBuffer() が返すビューへ書いてから grabFirstFrame() を呼ぶ。
+  getGrabberInputBuffer(size: number): Uint8Array
+  grabFirstFrame(size: number): GrabbedFrame | null
   setTlvMode(isTlv: boolean): void
   setWebCodecsMode(enabled: boolean): void
   setVideoAuCallback(
