@@ -60,6 +60,9 @@ export declare interface WasmModule extends EmscriptenModule {
   // 適用された方式を返す (WASM ソフトデコード経路のみ。WebCodecs 経路の映像は
   // ブラウザ側でデコード・表示するのでこの設定は効かない)。
   setDeinterlace(filter: string): string
+  // WASM 経路の描画バッファ(= #video canvas)の解像度。表示している大きさを
+  // デバイスピクセルで渡す。
+  resizeSwapChain(width: number, height: number): void
   setTlvMode(isTlv: boolean): void
   setWebCodecsMode(enabled: boolean): void
   setVideoAuCallback(

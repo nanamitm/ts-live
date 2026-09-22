@@ -56,6 +56,14 @@ const formatLocalTime = (seconds: number): string => {
 // グラフに保持する統計データの点数。
 const CHART_HISTORY = 300
 
+// WASM 経路の描画バッファの基準サイズ。canvas の縦横比はこれで決まるので、
+// 解像度だけを表示サイズに合わせて倍率で上下させる。
+const BASE_VIDEO_WIDTH = 1920
+const BASE_VIDEO_HEIGHT = 1080
+// 倍率の下限と上限。上げすぎても元の映像以上には精細にならず GPU を使うだけ。
+const MIN_VIDEO_SCALE = 1.0
+const MAX_VIDEO_SCALE = 2.0
+
 // VideoDecoder の出力が音声クロックから遅れてよい秒数の上限。正常時は
 // 先行してデコードしている(=遅れは負)ので、これを超えるのはデコーダの中に
 // 消化しきれない AU が滞留しているとき。BS4K の GOP (約2秒) より長く取る。
@@ -172,6 +180,7 @@ const Page: NextPage = () => {
   const [captionResetToken, setCaptionResetToken] = useState<number>(0)
 
   const videoCanvasRef = useRef<HTMLCanvasElement>(null)
+  const videoAreaRef = useRef<HTMLDivElement>(null)
   const captionCanvasRef = useRef<HTMLCanvasElement>(null)
   // WebCodecs (BS4K) 用の描画 canvas と再生制御
   const wcCanvasRef = useRef<HTMLCanvasElement>(null)
@@ -521,6 +530,46 @@ const Page: NextPage = () => {
     if (dualMonoMode === undefined) return
     wasmMod.setDualMonoMode(dualMonoMode)
   }, [wasmMod, dualMonoMode])
+
+  // 表示サイズが変わったら WASM 経路の描画バッファもそれに合わせる。固定の
+  // 1920x1080 のままだと、大きく表示したときはブラウザの引き伸ばしで甘くなり、
+  // 映像がそれより大きいとき(4K/8K のソフトデコード)は解像度が捨てられる。
+  useEffect(() => {
+    if (!wasmMod) return
+    const area = videoAreaRef.current
+    if (!area || typeof ResizeObserver === 'undefined') return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const apply = () => {
+      const rect = area.getBoundingClientRect()
+      if (rect.width <= 0 || rect.height <= 0) return
+      const dpr = window.devicePixelRatio || 1
+      // object-fit: contain で実際に表示される大きさ(デバイスピクセル)。
+      const fit = Math.min(
+        rect.width / BASE_VIDEO_WIDTH,
+        rect.height / BASE_VIDEO_HEIGHT
+      )
+      const scale = Math.min(
+        Math.max(fit * dpr, MIN_VIDEO_SCALE),
+        MAX_VIDEO_SCALE
+      )
+      wasmMod.resizeSwapChain(
+        Math.round(BASE_VIDEO_WIDTH * scale),
+        Math.round(BASE_VIDEO_HEIGHT * scale)
+      )
+    }
+    // ドラッグ中は何度も呼ばれる。スワップチェーンの作り直しは軽くないので
+    // 落ち着いてから一度だけ適用する。
+    const observer = new ResizeObserver(() => {
+      if (timer !== undefined) clearTimeout(timer)
+      timer = setTimeout(apply, 150)
+    })
+    observer.observe(area)
+    apply()
+    return () => {
+      observer.disconnect()
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }, [wasmMod])
 
   useEffect(() => {
     if (!wasmMod) return
@@ -1653,6 +1702,7 @@ const Page: NextPage = () => {
         </Box>
       </Drawer>
       <div
+        ref={videoAreaRef}
         css={css`
           position: relative;
           width: 100%;

@@ -17,7 +17,12 @@ struct WebGPUContext {
   int textureWidth = 0;
   int textureHeight = 0;
   WGPUDevice device = nullptr;
+  WGPUSurface surface = nullptr;
   WGPUSwapChain swapChain = nullptr;
+  // スワップチェーン(= canvas のバッファ)の大きさ。
+  // 表示サイズに合わせて作り直す。
+  int swapChainWidth = 0;
+  int swapChainHeight = 0;
   WGPUQueue queue = nullptr;
   // インターレース解除フィルタ。どれも同じバインドグループレイアウトなので、
   // パイプラインだけ差し替えて使う。
@@ -347,6 +352,41 @@ static void createPipeline() {
   wgpuShaderModuleRelease(vertMod);
 }
 
+// スワップチェーンを作り直す。emscripten の実装はここで canvas の
+// width/height も descriptor の値に合わせるので、描画バッファの解像度は
+// この関数だけで決まる。
+static void createSwapChain(int width, int height) {
+  WGPUSwapChainDescriptor swapDesc = {};
+  swapDesc.usage = WGPUTextureUsage_RenderAttachment;
+  swapDesc.format = WGPUTextureFormat_BGRA8Unorm;
+  swapDesc.width = static_cast<uint32_t>(width);
+  swapDesc.height = static_cast<uint32_t>(height);
+  swapDesc.presentMode = WGPUPresentMode_Fifo;
+
+  ctx.swapChain = wgpuDeviceCreateSwapChain(ctx.device, ctx.surface, &swapDesc);
+  ctx.swapChainWidth = width;
+  ctx.swapChainHeight = height;
+  spdlog::info("swap chain: {}x{}", width, height);
+}
+
+// 表示サイズ(デバイスピクセル)を JS から教えてもらって描画バッファを合わせる。
+// 固定サイズのままだと、表示が大きいときはブラウザによる引き伸ばしで甘くなり、
+// 逆に映像が 1920x1080 より大きいとき(4K/8K のソフトデコード)は、その解像度が
+// ここで捨てられてしまう。
+void resizeSwapChain(int width, int height) {
+  if (width <= 0 || height <= 0 || ctx.surface == nullptr) {
+    return;
+  }
+  if (width == ctx.swapChainWidth && height == ctx.swapChainHeight) {
+    return;
+  }
+  if (ctx.swapChain != nullptr) {
+    wgpuSwapChainRelease(ctx.swapChain);
+    ctx.swapChain = nullptr;
+  }
+  createSwapChain(width, height);
+}
+
 void initWebGpu() {
   ctx.device = emscripten_webgpu_get_device();
 
@@ -363,16 +403,9 @@ void initWebGpu() {
   WGPUSurfaceDescriptor surfaceDesc = {};
   surfaceDesc.nextInChain = reinterpret_cast<WGPUChainedStruct *>(&canvasDesc);
 
-  WGPUSurface surface = wgpuInstanceCreateSurface(nullptr, &surfaceDesc);
+  ctx.surface = wgpuInstanceCreateSurface(nullptr, &surfaceDesc);
 
-  WGPUSwapChainDescriptor swapDesc = {};
-  swapDesc.usage = WGPUTextureUsage_RenderAttachment;
-  swapDesc.format = WGPUTextureFormat_BGRA8Unorm;
-  swapDesc.width = 1920;
-  swapDesc.height = 1080;
-  swapDesc.presentMode = WGPUPresentMode_Fifo;
-
-  ctx.swapChain = wgpuDeviceCreateSwapChain(ctx.device, surface, &swapDesc);
+  createSwapChain(1920, 1080);
 
   // dummy texture.
   createTextures(1920, 1080);
