@@ -28,7 +28,7 @@ import { WasmModule, StatsData, VideoStreamInfo } from '../lib/wasmmodule'
 import { CONTAINER_PROBE_SIZE, looksLikeTlv } from '../lib/container'
 import { buildWebCodecsConfig } from '../lib/webcodecs'
 import { LocalPositionEstimator } from '../lib/local-position'
-import { readTsDuration } from '../lib/ts-duration'
+import { readTlvDuration, readTsDuration } from '../lib/ts-duration'
 import dayjs from 'dayjs'
 
 import { Program, Service } from 'mirakurun/api'
@@ -149,7 +149,7 @@ const Page: NextPage = () => {
   const [localReadError, setLocalReadError] = useState<string>('')
   const [localLoop, setLocalLoop] = usePersistedState<boolean>('tsplayerLocalLoop', false)
   const localLoopRef = useRef<boolean>(false)
-  // TSはPTS由来の総時間、TLVは消費レートの推定を使い、音声クロックで進める。
+  // 総時間は先頭と末尾のPTSから求め(取れなければ消費レートで推定)、音声クロックで進める。
   const localStartOffsetRef = useRef<number>(0)
   const localPositionEstimatorRef = useRef<LocalPositionEstimator | null>(null)
   // 解析した総時間の使い回し。シークやループでも playLocalFile() を通るので、
@@ -1118,21 +1118,21 @@ const Page: NextPage = () => {
       // 直前の再生停止(reset)の後片付けが終わるのを待つ
       await waitForDecoderReset(Module, () => aborted)
       if (aborted) return
-      let duration: number | undefined
-      if (!tlv) {
-        const key = `${src.name}|${src.size}|${src.lastModified}`
-        const cached = localDurationCacheRef.current
-        if (cached && cached.key === key) {
-          duration = cached.duration
-        } else {
-          duration = await readTsDuration(src, Module, () => aborted).catch(ex => {
-            console.warn('TS duration probe failed:', ex)
-            return 0
-          })
-          // 中断で打ち切った 0 は結果ではないので覚えない。
-          if (aborted) return
-          localDurationCacheRef.current = { key, duration }
-        }
+      let duration: number
+      // 同じファイルでも TS/TLV のどちらとして読むかで結果が変わる。
+      const key = `${src.name}|${src.size}|${src.lastModified}|${tlv ? 'tlv' : 'ts'}`
+      const cached = localDurationCacheRef.current
+      if (cached && cached.key === key) {
+        duration = cached.duration
+      } else {
+        const readDuration = tlv ? readTlvDuration : readTsDuration
+        duration = await readDuration(src, Module, () => aborted).catch(ex => {
+          console.warn(`${tlv ? 'TLV' : 'TS'} duration probe failed:`, ex)
+          return 0
+        })
+        // 中断で打ち切った 0 は結果ではないので覚えない。
+        if (aborted) return
+        localDurationCacheRef.current = { key, duration }
       }
       if (aborted) return
       const estimator = new LocalPositionEstimator(duration)

@@ -108,4 +108,5 @@ EMSCRIPTEN_BINDINGS(ts_live_module) {
   emscripten::function("isDemuxEnded", &isDemuxEnded);
   emscripten::function("getTsDurationInputBuffer", &getTsDurationInputBuffer);
   emscripten::function("probeTsDuration", &probeTsDuration);
+  emscripten::function("probeTlvDuration", &probeTlvDuration);
 }

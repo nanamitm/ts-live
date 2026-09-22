@@ -104,5 +104,7 @@ export declare interface WasmModule extends EmscriptenModule {
   // 先頭・末尾を連結して書き込み、再生系とは独立したFFmpegでTSのPTSを解析。
   getTsDurationInputBuffer(size: number): Uint8Array
   probeTsDuration(headSize: number, tailOffset: number, tailSize: number, fileSize: number): number
+  // 同じ入力領域で TLV を解析する。先頭の最小 PTS と末尾の最後の映像 PTS の差。
+  probeTlvDuration(headSize: number, tailOffset: number, tailSize: number, fileSize: number): number
 }
 export declare var Module: WasmModule

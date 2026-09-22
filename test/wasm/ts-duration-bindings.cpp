@@ -4,4 +4,5 @@
 EMSCRIPTEN_BINDINGS(ts_duration_test) {
   emscripten::function("getTsDurationInputBuffer", &getTsDurationInputBuffer);
   emscripten::function("probeTsDuration", &probeTsDuration);
+  emscripten::function("probeTlvDuration", &probeTlvDuration);
 }

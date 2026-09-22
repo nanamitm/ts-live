@@ -46,12 +46,18 @@ F2 キーでスクリーンキャプチャが出来ます。
 
 `yarn test` で JS 側のユニットテストが動きます (CI でも実行します)。
 
-TS の総時間解析 (`wasm/src/decoder/ts-duration.cpp`) だけは wasm をビルドして
+TS/TLV の総時間解析 (`wasm/src/decoder/ts-duration.cpp`) だけは wasm をビルドして
 実ファイルで確かめる必要があるため、`yarn test` にも CI にも入っていません。
 ここを変更したら emsdk と ffmpeg/ffprobe のある環境で手動で実行してください。
 
 ```
 bash scripts/test-ts-duration.sh
+```
+
+TLV は FFmpeg で作れないため、録画した .mmts を指定したときだけ確かめます。
+
+```
+TS_DURATION_TLV_SAMPLE=/path/to/sample.mmts bash scripts/test-ts-duration.sh
 ```
 
 ## TS-Live を Docker で使う方法

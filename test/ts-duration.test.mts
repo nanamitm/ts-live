@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readTsDuration } from '../src/lib/ts-duration.ts'
+import { readTlvDuration, readTsDuration } from '../src/lib/ts-duration.ts'
 import { LocalPositionEstimator } from '../src/lib/local-position.ts'
 
 test('TSの固定総時間は消費レートやEOFで変化しない', () => {
@@ -28,7 +28,7 @@ test('TSのシーク後も総時間を保持し、音声クロックで位置を
 })
 
 test('TSでPTSが得られなければビットレート推定に戻す', () => {
-  // 総時間が分からないからといって位置まで止めない。TLVと同じ推定に落とす。
+  // 総時間が分からないからといって位置まで止めない。ビットレート推定に落とす。
   const estimator = new LocalPositionEstimator(0)
   estimator.update(0, 0, false, false)
   estimator.update(10, 10000, false, false)
@@ -89,4 +89,29 @@ test('ファイル切替で中止された解析はWASMを呼ばない', async (
     probeTsDuration() { throw new Error('stale probe') },
   }, () => aborted)
   assert.equal(result, 0)
+})
+
+test('TLVは先頭4MBと末尾20MBを一度だけ渡す', async () => {
+  const mb = 1024 * 1024
+  const ranges: number[][] = []
+  const file = {
+    size: 5 * 1024 * mb,
+    slice(start: number, end = this.size) {
+      ranges.push([start, end])
+      return new Blob([new Uint8Array(end - start)])
+    },
+  } as Blob
+  let calls = 0
+  const duration = await readTlvDuration(file, {
+    getTsDurationInputBuffer(size) { return new Uint8Array(size) },
+    probeTlvDuration(headSize, offset, tailSize, fileSize) {
+      assert.deepEqual([headSize, offset, tailSize, fileSize],
+        [4 * mb, file.size - 20 * mb, 20 * mb, file.size])
+      return ++calls === 1 ? 0 : 3600
+    },
+  })
+  // TLV は末尾を広げて読み直さない。取れなければ不明として推定に任せる。
+  assert.equal(duration, 0)
+  assert.equal(calls, 1)
+  assert.deepEqual(ranges, [[0, 4 * mb], [file.size - 20 * mb, file.size]])
 })

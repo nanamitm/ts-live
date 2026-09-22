@@ -12,14 +12,15 @@ const dir = 'wasm/build/duration-fixtures'
 mkdirSync(dir, { recursive: true })
 const mb = 1024 * 1024
 
-function probe(bytes, fileSize = bytes.length, tailBytes = 4 * mb) {
-  const headSize = Math.min(bytes.length, 4 * mb)
+function probe(bytes, fileSize = bytes.length, tailBytes = 4 * mb, headBytes = 4 * mb,
+  fn = module.probeTsDuration) {
+  const headSize = Math.min(bytes.length, headBytes)
   const tailOffset = Math.max(headSize, bytes.length - tailBytes)
   const tailSize = bytes.length - tailOffset
   const buffer = module.getTsDurationInputBuffer(headSize + tailSize)
   buffer.set(bytes.subarray(0, headSize))
   buffer.set(bytes.subarray(tailOffset), headSize)
-  return module.probeTsDuration(headSize, fileSize - tailSize, tailSize, fileSize)
+  return fn(headSize, fileSize - tailSize, tailSize, fileSize)
 }
 
 try {
@@ -69,6 +70,27 @@ try {
   const multiBytes = readFileSync(multi)
   assert(Math.abs(probe(multiBytes, multiBytes.length, 32 * mb) - 10) < 0.1)
   console.log('PASS wider search: first program is 10s, not the other program\'s 30s')
+  // FFmpeg は mmttlv を書き出せないので、TLV は手元の録画で確かめる。
+  const tlvPath = process.env.TS_DURATION_TLV_SAMPLE
+  if (tlvPath) {
+    const tlv = readFileSync(tlvPath)
+    const probeTlv = (bytes, tail = 20 * mb, head = 4 * mb) =>
+      probe(bytes, bytes.length, tail, head, module.probeTlvDuration)
+    const whole = probeTlv(tlv, tlv.length, tlv.length)
+    const actual = probeTlv(tlv)
+    assert(whole > 0, `whole file: ${whole}`)
+    // 末尾だけで最後の映像 PTS が取れ、全体を読んだときと一致する。
+    assert(Math.abs(actual - whole) < 0.001, `head/tail=${actual}, whole=${whole}`)
+    console.log(`PASS TLV sample: head/tail=${actual.toFixed(6)}s, whole=${whole.toFixed(6)}s`)
+    const noTail = Buffer.alloc(tlv.length, 0xff)
+    tlv.copy(noTail, 0, 0, 4 * mb)
+    assert.equal(probeTlv(noTail), 0)
+    console.log('PASS TLV without tail timestamps: duration unknown')
+    assert.equal(probeTlv(readFileSync(`${dir}/cbr.ts`)), 0)
+    console.log('PASS TS read as TLV: duration unknown')
+  } else {
+    console.log('SKIP TLV: set TS_DURATION_TLV_SAMPLE to a recorded .mmts file')
+  }
   process.exit(0)
 } catch (error) {
   console.error(warnings.join('\n'))
