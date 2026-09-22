@@ -1191,6 +1191,13 @@ const Page: NextPage = () => {
           let stable = 0
           while (!aborted && localLoopRef.current) {
             await sleep(500)
+            // 一時停止によるクロック停止は終端ではない。再開後は改めて
+            // 連続した停滞を計測し、停止前の判定回数を引き継がない。
+            if (localPausedRef.current) {
+              last = -999
+              stable = 0
+              continue
+            }
             const t = Module.getAudioPlaybackTime()
             if (t >= 0 && Math.abs(t - last) < 0.05) {
               // 約1秒(2回連続)進捗が無ければ枯渇とみなす
