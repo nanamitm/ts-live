@@ -177,6 +177,7 @@ const Page: NextPage = () => {
       InputBufferSize: 0,
       AudioWorkletBufferSize: 0,
       CaptionDataQueueSize: 0,
+      HeapSizeMB: 0,
     },
   ])
   const [showCharts, setShowCharts] = useState<boolean>(false)

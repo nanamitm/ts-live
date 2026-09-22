@@ -1732,6 +1732,17 @@ void decoderMainloop() {
     std::lock_guard<std::mutex> lock(audioPacketMtx);
     audioPacketQueueSize = audioPacketQueue.size();
   }
+  // wasm のヒープは伸びる一方なので、伸びたときだけ残す。INITIAL_MEMORY を
+  // 決めるための実測用 (これを下回る値にすると再生中に拡張が走る)。
+  {
+    static size_t lastHeapSize = 0;
+    size_t heapSize = emscripten_get_heap_size();
+    if (heapSize != lastHeapSize) {
+      spdlog::info("wasm heap: {:.1f} MB", heapSize / 1048576.0);
+      lastHeapSize = heapSize;
+    }
+  }
+
   spdlog::debug("decoderMainloop videoFrameQueue:{} audioFrameQueue:{} "
                 "videoPacketQueue:{} audioPacketQueue:{}",
                 videoFrameQueueSize, audioFrameQueueSize, videoPacketQueueSize,
@@ -1816,6 +1827,7 @@ void decoderMainloop() {
     if (detelecineMode.load(std::memory_order_relaxed) != DETELECINE_NEVER) {
       data.set("TelecineFlag", telecineFlag);
     }
+    data.set("HeapSizeMB", emscripten_get_heap_size() / 1048576.0);
     data.set("CaptionDataQueueSize", captionDataQueueSize);
     statsBuffer.push_back(std::move(data));
     if (statsBuffer.size() >= 6) {

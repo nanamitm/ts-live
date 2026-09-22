@@ -7,6 +7,8 @@ export declare interface StatsData {
   AudioWorkletBufferSize: number
   InputBufferSize: number
   CaptionDataQueueSize: number
+  // wasm のヒープの現在サイズ(MB)。INITIAL_MEMORY の妥当性を見るため。
+  HeapSizeMB: number
   // 逆テレシネが有効なときだけ付く。そのフレームをテレシネとして扱ったか。
   TelecineFlag?: boolean
 }
