@@ -198,6 +198,10 @@ bool videoAuDropUntilKey = false;
 // アトミックにしてある。
 std::atomic<double> currentAudioPlaybackTime{-1.0};
 
+// 音声クロックの平滑化の内部状態 (メインスレッド専用)。
+double smoothedAudioPlayTime = -1.0;
+std::chrono::steady_clock::time_point smoothedAudioPlayTimeAt;
+
 void setWebCodecsMode(bool enabled) {
   webCodecsMode = enabled;
   spdlog::info("setWebCodecsMode: {}", enabled);
@@ -540,6 +544,8 @@ void reset() {
   // なくここで触るのは、あちらがデコードスレッド側でこれらがメインスレッドの
   // 変数のため)。
   currentPlaybackPtsTime = -1;
+  // 音声クロックの平滑化も基準を捨てる。
+  smoothedAudioPlayTime = -1.0;
   // read_packet で待っているデコードスレッドを起こす。
   std::lock_guard<std::mutex> lock(inputBufferMtx);
   waitCv.notify_all();
@@ -1503,6 +1509,35 @@ static void advancePlaybackTime(double ptsTimeSec) {
   }
 }
 
+// 音声クロックのゆらぎを均す。メインスレッドからのみ呼ぶ。
+//
+// 実測値はバッファ残量から計算するが、その通知は AudioWorklet から 20 レンダー
+// ぶん(約53ms)おきにしか来ないので、毎フレーム見ると階段状に動く。
+// このクロックは WASM 描画の表示判定にも、JS 側 WebCodecs 描画ループの
+// 表示判定にも使われるので、ゆらぎはそのまま描画間隔のムラになる。
+//
+// 前回値と経過時間から予測した値を主に使い、実測とのずれが小さいうちは実測を
+// 少しずつ混ぜて追従させる。ずれが大きいとき(切替・シーク・一時停止からの復帰)は
+// 予測を捨てて実測へ飛ぶ。
+static double smoothAudioPlayTime(double measured) {
+  auto now = std::chrono::steady_clock::now();
+  if (smoothedAudioPlayTime < 0) {
+    smoothedAudioPlayTime = measured;
+    smoothedAudioPlayTimeAt = now;
+    return smoothedAudioPlayTime;
+  }
+  double predicted =
+      smoothedAudioPlayTime +
+      std::chrono::duration<double>(now - smoothedAudioPlayTimeAt).count();
+  smoothedAudioPlayTimeAt = now;
+  if (predicted > measured - 0.5 && predicted < measured + 0.5) {
+    smoothedAudioPlayTime = predicted * 0.9 + measured * 0.1;
+  } else {
+    smoothedAudioPlayTime = measured;
+  }
+  return smoothedAudioPlayTime;
+}
+
 void decoderMainloop() {
   const int currentBufferedAudioSamples =
       bufferedAudioSamples.load(std::memory_order_relaxed);
@@ -1639,16 +1674,23 @@ void decoderMainloop() {
   // 音声クロック(推定再生時刻)を映像の有無に依らず更新する。WebCodecs モード
   // では映像フレームが videoFrameQueue に来ない(JS 側でデコード)ため、ここで
   // 独立に計算しておき、JS の映像表示同期に使わせる。
+  // この周回ぶんの値はここで一度だけ求め、以降の表示判定・字幕の時刻合わせでも
+  // 使い回す (平滑化しているので、都度計算すると値がずれる)。
+  // TODO: クロック一回転したときの処理
+  double estimatedAudioPlayTime = -1.0;
+  if (audioFrame) {
+    estimatedAudioPlayTime = smoothAudioPlayTime(
+        estimateAudioPlayTime(audioFrame, currentBufferedAudioSamples));
+  }
   if (audioFrame &&
       currentAudioSampleRate.load(std::memory_order_relaxed) > 0) {
-    double playTime =
-        estimateAudioPlayTime(audioFrame, currentBufferedAudioSamples);
-    currentAudioPlaybackTime.store(playTime, std::memory_order_relaxed);
+    currentAudioPlaybackTime.store(estimatedAudioPlayTime,
+                                   std::memory_order_relaxed);
     // 映像フレームのPTSではなく、この音声クロックを基準にする。
     // WebCodecs モードでは映像フレームが videoFrameQueue を
     // 通らない(JS側でデコードする)ため、映像基準にすると
     // 4K/2K のハードウェアデコード時に再生時刻が進まなくなる。
-    advancePlaybackTime(playTime);
+    advancePlaybackTime(estimatedAudioPlayTime);
   }
 
   if (currentFrame && audioFrame) {
@@ -1674,10 +1716,6 @@ void decoderMainloop() {
     //     wh != videoStream->codecpar->height) {
     //   set_style(videoStream->codecpar->width);
     // }
-
-    // 上記から推定される、現在再生している音声のPTS（時間）
-    double estimatedAudioPlayTime =
-        estimateAudioPlayTime(audioFrame, currentBufferedAudioSamples);
 
     // 再生時刻を過ぎたフレームはまとめて取り出し、最後の 1 枚だけを描画して
     // 残りは捨てる。1 回の呼び出しで 1 枚しか進めないと、メインループが遅く
@@ -1735,11 +1773,6 @@ void decoderMainloop() {
       double pts = (double)p.pts;
       std::vector<uint8_t> &buffer = p.data;
       double ptsTime = pts * av_q2d(p.timeBase);
-
-      // AudioFrameは完全に見るだけ
-      // TODO: クロック一回転したときの処理
-      double estimatedAudioPlayTime =
-          estimateAudioPlayTime(audioFrame, currentBufferedAudioSamples);
 
       auto data = emscripten::val(
           emscripten::typed_memory_view<uint8_t>(buffer.size(), &buffer[0]));
