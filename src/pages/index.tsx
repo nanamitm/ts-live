@@ -1175,8 +1175,15 @@ const Page: NextPage = () => {
     'F2',
     () => {
       console.log('Hotkey s pressed!!!')
-      if (!videoCanvasRef.current || !captionCanvasRef.current) return
-      const video = videoCanvasRef.current
+      // 映っているほうの canvas を撮る。WebCodecs 経路 (BS4K の HEVC など) は
+      // 別の canvas に描いているので、WASM 側だけを撮ると空の画像になる。
+      const video =
+        activeCanvas === 'webcodecs'
+          ? wcCanvasRef.current
+          : activeCanvas === 'wasm'
+          ? videoCanvasRef.current
+          : null
+      if (!video || !captionCanvasRef.current) return
       const caption = captionCanvasRef.current
       const canvas = document.createElement('canvas')
       canvas.width = video.width
@@ -1184,7 +1191,8 @@ const Page: NextPage = () => {
       const ctx = canvas.getContext('2d')!
       ctx.drawImage(video, 0, 0)
       if (showCaption) {
-        ctx.drawImage(caption, 0, 0)
+        // 字幕 canvas は 1920x1080 固定。4K の映像に重ねるので引き伸ばす。
+        ctx.drawImage(caption, 0, 0, canvas.width, canvas.height)
       }
       const a = document.createElement('a')
       a.href = canvas.toDataURL('image/png')
@@ -1192,7 +1200,7 @@ const Page: NextPage = () => {
       a.click()
     },
     {},
-    [showCaption]
+    [showCaption, activeCanvas]
   )
 
   const getServicesOptions = useCallback(() => {
