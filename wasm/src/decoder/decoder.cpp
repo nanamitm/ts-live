@@ -45,7 +45,12 @@ const size_t PROBE_SIZE = 1024 * 1024;
 const size_t DEFAULT_WIDTH = 1920;
 const size_t DEFAULT_HEIGHT = 1080;
 
-std::chrono::system_clock::time_point startTime;
+// 再生時刻(ms)。壁時計ではなく、実際に再生したPTSの進みぶんだけ積算する。
+// 一時停止中やストールしている間は進まず、チャンネル切替やシークでPTSが飛んでも
+// 巻き戻らない。統計グラフの横軸に使う。
+int64_t currentPlaybackTime = 0;
+// 積算の基準にした直近のPTS(ms)。負値は基準なし(再生開始やreset直後)。
+int64_t currentPlaybackPtsTime = -1;
 
 std::atomic<bool> resetedDecoder{false};
 std::uint8_t inputBuffer[MAX_INPUT_BUFFER];
@@ -528,6 +533,10 @@ void reset() {
   // reset() は JS からメインスレッドで呼ばれるのでここで捨ててよい
   // (resetInternal() はデコードスレッド側なので EM_ASM の実行先がちがう)。
   clearAudioSamples();
+  // 次の再生はPTSが飛ぶので、再生時刻の積算基準も捨てる (resetInternal() では
+  // なくここで触るのは、あちらがデコードスレッド側でこれらがメインスレッドの
+  // 変数のため)。
+  currentPlaybackPtsTime = -1;
   // read_packet で待っているデコードスレッドを起こす。
   std::lock_guard<std::mutex> lock(inputBufferMtx);
   waitCv.notify_all();
@@ -1423,6 +1432,19 @@ static double estimateAudioPlayTime(const AVFrame *audioFrame,
   return audioPtsTime - (double)bufferedSamples / sampleRate;
 }
 
+// 再生時刻を PTS の進みぶんだけ進める。メインスレッドからのみ呼ぶ。
+static void advancePlaybackTime(double ptsTimeSec) {
+  int64_t ptsTime = (int64_t)(ptsTimeSec * 1000);
+  if (currentPlaybackPtsTime < 0 || currentPlaybackPtsTime < ptsTime - 1000 ||
+      currentPlaybackPtsTime > ptsTime + 1000) {
+    // 基準なし、または不連続(切替・シーク・PTSの一周)なので基準を取り直す
+    currentPlaybackPtsTime = ptsTime;
+  } else if (currentPlaybackPtsTime < ptsTime) {
+    currentPlaybackTime += ptsTime - currentPlaybackPtsTime;
+    currentPlaybackPtsTime = ptsTime;
+  }
+}
+
 void decoderMainloop() {
   const int currentBufferedAudioSamples =
       bufferedAudioSamples.load(std::memory_order_relaxed);
@@ -1511,10 +1533,8 @@ void decoderMainloop() {
   }
 
   if (streamsReady && !statsCallback.isNull()) {
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now() - startTime);
     auto data = emscripten::val::object();
-    data.set("time", duration.count() / 1000.0);
+    data.set("time", currentPlaybackTime / 1000.0);
     data.set("VideoFrameQueueSize", videoFrameQueueSize);
     data.set("AudioFrameQueueSize", audioFrameQueueSize);
     data.set("AudioWorkletBufferSize", currentBufferedAudioSamples);
@@ -1578,6 +1598,11 @@ void decoderMainloop() {
       currentAudioSampleRate.load(std::memory_order_relaxed) > 0) {
     currentAudioPlaybackTime =
         estimateAudioPlayTime(audioFrame, currentBufferedAudioSamples);
+    // 映像フレームのPTSではなく、この音声クロックを基準にする。
+    // WebCodecs モードでは映像フレームが videoFrameQueue を
+    // 通らない(JS側でデコードする)ため、映像基準にすると
+    // 4K/2K のハードウェアデコード時に再生時刻が進まなくなる。
+    advancePlaybackTime(currentAudioPlaybackTime);
   }
 
   if (currentFrame && audioFrame) {

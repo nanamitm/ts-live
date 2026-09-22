@@ -45,7 +45,6 @@ void mainloop(void *arg) {
 
 int main() {
   spdlog::info("Wasm main() started.");
-  startTime = std::chrono::system_clock::now();
 
   // デコーダスレッド起動
   spdlog::info("initializing Decoder");
