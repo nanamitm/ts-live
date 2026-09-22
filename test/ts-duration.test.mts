@@ -9,7 +9,7 @@ test('TSの固定総時間は消費レートやEOFで変化しない', () => {
   estimator.update(103, 100000000, false, false)
   estimator.update(110, 100000001, true, false)
   assert.deepEqual(estimator.position(0, 12000), {
-    bytes: 1000, size: 12000, seconds: 10, duration: 120,
+    bytes: 1000, size: 12000, seconds: 10, duration: 120, exact: true,
   })
   estimator.update(110, 100000001, true, true)
   estimator.update(110, 100000001, true, false)
@@ -27,11 +27,14 @@ test('TSのシーク後も総時間を保持し、音声クロックで位置を
   assert.equal(estimator.position(6000, 12000).duration, 120)
 })
 
-test('TSでPTSが得られなければビットレート推定に戻さない', () => {
+test('TSでPTSが得られなければビットレート推定に戻す', () => {
+  // 総時間が分からないからといって位置まで止めない。TLVと同じ推定に落とす。
   const estimator = new LocalPositionEstimator(0)
   estimator.update(0, 0, false, false)
   estimator.update(10, 10000, false, false)
-  assert.equal(estimator.position(0, 60000).duration, 0)
+  assert.equal(estimator.position(0, 60000).duration, 60)
+  assert.equal(estimator.position(0, 60000).bytes, 10000)
+  assert.equal(estimator.position(0, 60000).exact, false)
 })
 
 test('短いファイルは全体を一度だけ渡す', async () => {

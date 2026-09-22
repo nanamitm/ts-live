@@ -1,10 +1,13 @@
-// TSは事前解析した総時間を使う。TLVは消費量の3秒ごとの差分を平滑化する。
+// TSは事前解析した総時間を使う。解析していない(TLV)か失敗したときは、消費量の
+// 3秒ごとの差分からレートを平滑化して総時間を推定する。
 // 表示位置は音声クロックで積算する。バイト位置との換算は概算シーク用。
 export class LocalPositionEstimator {
-  // undefined=TLVのレート推定、0=TS解析失敗、正数=PTS由来の固定総時間。
+  // PTS由来の固定総時間。undefined ならレート推定に任せる。
   private readonly duration?: number
   constructor(duration?: number) {
-    this.duration = duration
+    // 0 や負値は「解析したが総時間が取れなかった」。位置が一切進まなくなる
+    // より、従来どおりの推定を出したほうが役に立つ。
+    this.duration = duration !== undefined && duration > 0 ? duration : undefined
   }
 
   private lastTime: number | null = null
@@ -44,16 +47,19 @@ export class LocalPositionEstimator {
     this.sample = { time, bytes }
   }
 
+  // exact=true は PTS 由来の総時間。false なら表示に (推定) を付ける。
   position(startOffset: number, size: number) {
     if (this.duration !== undefined) {
-      const seconds = this.duration > 0 && size > 0
-        ? Math.min((startOffset / size) * this.duration + this.elapsed, this.duration)
-        : 0
+      const seconds =
+        size > 0
+          ? Math.min((startOffset / size) * this.duration + this.elapsed, this.duration)
+          : 0
       return {
-        bytes: this.duration > 0 ? (seconds / this.duration) * size : Math.min(startOffset, size),
+        bytes: (seconds / this.duration) * size,
         size,
         seconds,
         duration: this.duration,
+        exact: true,
       }
     }
     const bytes = Math.min(startOffset + this.consumed, size)
@@ -62,6 +68,7 @@ export class LocalPositionEstimator {
       size,
       seconds: this.rate > 0 ? bytes / this.rate : 0,
       duration: this.rate > 0 ? size / this.rate : 0,
+      exact: false,
     }
   }
 }

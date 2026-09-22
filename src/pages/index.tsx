@@ -152,12 +152,12 @@ const Page: NextPage = () => {
   // TSはPTS由来の総時間、TLVは消費レートの推定を使い、音声クロックで進める。
   const localStartOffsetRef = useRef<number>(0)
   const localPositionEstimatorRef = useRef<LocalPositionEstimator | null>(null)
-  const [localDurationFromPts, setLocalDurationFromPts] = useState(false)
   const [localPosition, setLocalPosition] = useState<{
     bytes: number
     size: number
     seconds: number
     duration: number
+    exact: boolean
   } | null>(null)
   // スライダーをドラッグしている間は、推定位置での上書きを止める。
   const [localSeeking, setLocalSeeking] = useState<number | null>(null)
@@ -1026,13 +1026,13 @@ const Page: NextPage = () => {
     Module.setPaused(false)
     localStartOffsetRef.current = startOffset
     localPositionEstimatorRef.current = null
-    setLocalDurationFromPts(false)
     setLocalReadError('')
     setLocalPosition({
       bytes: startOffset,
       size: file.size,
       seconds: 0,
       duration: 0,
+      exact: false,
     })
     setLocalFileName(file.name)
     setPlayMode('localfile')
@@ -1099,7 +1099,6 @@ const Page: NextPage = () => {
       if (aborted) return
       const estimator = new LocalPositionEstimator(duration)
       localPositionEstimatorRef.current = estimator
-      setLocalDurationFromPts(!!duration)
       setLocalPosition(estimator.position(startOffset, src.size))
 
       // ローカルファイルは常に WebCodecs を試みる。実際に使うかは WASM が
@@ -2047,7 +2046,7 @@ const Page: NextPage = () => {
               </span>
               <span css={css`margin-left: auto;`}>
                 {localPosition.duration > 0
-                  ? `${formatLocalTime(localPosition.duration)}${localDurationFromPts ? '' : ' (推定)'}`
+                  ? `${formatLocalTime(localPosition.duration)}${localPosition.exact ? '' : ' (推定)'}`
                   : `${(
                       ((localSeeking ?? localPosition.bytes) /
                         localPosition.size) *

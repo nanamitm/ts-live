@@ -11,7 +11,7 @@ test('先読み済み量を位置に加えず、EOF後も固定レートで進�
   estimator.update(104, 51500, true, false)
   estimator.update(110, 51500, true, false)
   assert.deepEqual(estimator.position(0, 60000), {
-    bytes: 10000, size: 60000, seconds: 10, duration: 60,
+    bytes: 10000, size: 60000, seconds: 10, duration: 60, exact: false,
   })
   estimator.update(120, 51500, true, false)
   assert.equal(estimator.position(0, 60000).bytes, 20000)
@@ -47,7 +47,7 @@ test('短いファイルは総時間不明のまま、シーク後は新しく�
   estimator.update(100, 10000, true, false)
   estimator.update(110, 10000, true, false)
   assert.deepEqual(estimator.position(20000, 60000), {
-    bytes: 20000, size: 60000, seconds: 0, duration: 0,
+    bytes: 20000, size: 60000, seconds: 0, duration: 0, exact: false,
   })
   const afterSeek = new LocalPositionEstimator()
   afterSeek.update(500, 1000, false, false)
