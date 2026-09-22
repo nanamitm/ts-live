@@ -457,8 +457,9 @@ emscripten::val getNextInputBuffer(size_t nextSize) {
 // inputBufferMtx を握って呼ぶこと。
 //
 // 0x47 (sync_byte) はペイロード中にも普通に現れるので、1 バイトだけで判断すると
-// 偽の同期に乗りやすい。188 バイト先も 0x47 である位置を先頭とみなす。188 バイト
-// 先がまだ届いていないときは確かめようがないので 1 バイトで判断する。
+// 偽の同期に乗りやすい。188 バイト先も 0x47 である位置を先頭とみなす。
+// 188 バイト先がまだ届いていないときは、確かめようがないので 1 バイトで
+// 判断する。
 static size_t skipToTsSync() {
   const size_t start = inputBufferReadIndex;
   // 添字を使う前に必ず範囲を確認する (読み切った位置で配列外を読まないよう
