@@ -15,7 +15,7 @@ void setBufferedAudioSamples(int samples) {
 
 void feedAudioData(float *buffer0, float *buffer1, int samples) {
   // clang-format off
-  EM_ASM({
+  int fed = EM_ASM_INT({
     if (Module && Module['myAudio'] && Module['myAudio']['ctx'] && Module['myAudio']['ctx'].state === 'suspended') {
       Module['myAudio']['ctx'].resume()
     }
@@ -27,9 +27,20 @@ void feedAudioData(float *buffer0, float *buffer1, int samples) {
         buffer0: buffer0,
         buffer1: buffer1
       }, [buffer0.buffer, buffer1.buffer]);
+      return 1;
     }
+    return 0;
   }, buffer0, buffer1, samples);
   // clang-format on
+
+  // 残量を自分でも足しておく。worklet からの通知は約53msおきにしか来ないので、
+  // 渡した直後は「まだ空」に見える。音声クロックはこの残量ぶん引いた値なので、
+  // 溜まっているぶんを引かないとクロックが先へ飛び、映像がそれを追って早送りに
+  // なる (主/副の切替や速度変更で残量を捨てた直後に必ず起きる)。
+  // 次の通知で worklet 側の実測に上書きされる。
+  if (fed) {
+    bufferedAudioSamples.fetch_add(samples, std::memory_order_relaxed);
+  }
 }
 
 void clearAudioSamples() {
