@@ -118,6 +118,13 @@ const Page: NextPage = () => {
   // 直近に開いたローカルファイル(最初から再生/ループ用)と、ループ設定。
   // ループ判定は実行中の非同期フィードから参照するため ref に同期する。
   const lastLocalFileRef = useRef<File | null>(null)
+  // File System Access API で開けたときのハンドル。input[type=file] の File は
+  // 選んだ時点のスナップショット(サイズと更新時刻)に紐づいていて、録画中の
+  // ファイルのように中身が変わると以降の読み出しが NotReadableError になる。
+  // ハンドルがあれば再生を始めるたびに取り直せるので、録画中でもシークできる。
+  const localFileHandleRef = useRef<FileSystemFileHandle | null>(null)
+  // ローカルファイルの読み出しに失敗したときの表示。
+  const [localReadError, setLocalReadError] = useState<string>('')
   const [localLoop, setLocalLoop] = useLocalStorage<boolean>('tsplayerLocalLoop', false)
   const localLoopRef = useRef<boolean>(false)
   // シーク用の再生位置推定。TS/TLV には索引が無いので、実測ビットレート
@@ -1001,6 +1008,7 @@ const Page: NextPage = () => {
     Module.setPaused(false)
     localStartOffsetRef.current = startOffset
     localFedBytesRef.current = 0
+    setLocalReadError('')
     localClockBaseRef.current = null
     setLocalPosition({
       bytes: startOffset,
@@ -1043,9 +1051,23 @@ const Page: NextPage = () => {
     // 500ms の開始待ち中に別ファイルが選ばれても、この処理を中止できるようにする。
     stopFuncRef.current = stop
     ;(async () => {
+      // ハンドルがあれば File を取り直す。録画中のファイルは選んだ後も中身が
+      // 増えるので、古い File のままだと読み出しが NotReadableError になる。
+      let src = file
+      if (localFileHandleRef.current) {
+        try {
+          src = await localFileHandleRef.current.getFile()
+          lastLocalFileRef.current = src
+          if (src.size !== file.size) {
+            setLocalPosition(prev => (prev ? { ...prev, size: src.size } : prev))
+          }
+        } catch (ex) {
+          console.warn('getFile() failed, using the previous snapshot:', ex)
+        }
+      }
       // 再生モード(TLV=BS4K / TS=2K)を確定する。auto は先頭バイトで判定。
       const tlv =
-        localMode === 'tlv' ? true : localMode === 'ts' ? false : await detectTlvFromHeader(file)
+        localMode === 'tlv' ? true : localMode === 'ts' ? false : await detectTlvFromHeader(src)
       console.log('local file mode', file.name, { localMode, tlv })
       // 直前の再生停止(reset)の後片付けが終わるのを待つ
       await waitForDecoderReset(Module, () => aborted)
@@ -1102,11 +1124,11 @@ const Page: NextPage = () => {
         })()
       }
 
-      console.log('start local file', file.name, file.size, 'from', startOffset)
+      console.log('start local file', src.name, src.size, 'from', startOffset)
       {
         // 指定バイト位置から供給する。TS は read_packet 側が 0x47 を探し直し、
         // TLV は mmttlv の resync が効くので、パケット境界に合っていなくてよい。
-        const reader = file.slice(startOffset).stream().getReader()
+        const reader = src.slice(startOffset).stream().getReader()
         let ret = await reader.read()
         while (!ret.done) {
           if (aborted) {
@@ -1137,7 +1159,7 @@ const Page: NextPage = () => {
           }
           ret = await reader.read()
         }
-        console.log('local file feed done.', file.name)
+        console.log('local file feed done.', src.name)
         // 供給終了をデコーダへ伝える。これが無いとデマルチプレクサは次のデータを
         // 待ち続け、バッファ末尾に残ったぶんが処理されないまま再生が止まる。
         if (!aborted) Module.setInputEnded()
@@ -1166,6 +1188,14 @@ const Page: NextPage = () => {
       }
     })().catch(ex => {
       console.log('local file read ex:', ex)
+      if (aborted) return
+      const name = ex instanceof DOMException ? ex.name : ''
+      setLocalReadError(
+        name === 'NotReadableError'
+          ? 'ファイルを読めなくなりました。録画中などで中身が変わったためです。' +
+              '「ファイルを開く」で選び直してください。'
+          : `ファイルの読み出しに失敗しました: ${ex}`
+      )
     })
   }
 
@@ -1231,6 +1261,37 @@ const Page: NextPage = () => {
     },
     [wasmMod]
   )
+
+  // ファイル選択。File System Access API が使えるならそちらで開いてハンドルを
+  // 覚えておく (録画中のファイルでもシークできるようにするため)。
+  const pickLocalFile = async () => {
+    const picker = (window as any).showOpenFilePicker
+    if (typeof picker === 'function') {
+      try {
+        const [handle] = await picker({
+          types: [
+            {
+              description: 'TS / TLV',
+              accept: {
+                'application/octet-stream': ['.ts', '.m2ts', '.tlv', '.mmts'],
+              },
+            },
+          ],
+          multiple: false,
+        })
+        localFileHandleRef.current = handle
+        const file = await handle.getFile()
+        localForceSoftwareRef.current = false
+        playLocalFile(file)
+        return
+      } catch (ex) {
+        if (ex instanceof DOMException && ex.name === 'AbortError') return
+        console.warn('showOpenFilePicker() failed, falling back:', ex)
+      }
+    }
+    localFileHandleRef.current = null
+    localFileInputRef.current?.click()
+  }
 
   const seekLocalFile = (bytes: number) => {
     const file = lastLocalFileRef.current
@@ -1700,6 +1761,7 @@ const Page: NextPage = () => {
                     const file = ev.target.files?.[0]
                     if (file) {
                       // 新しいファイルではまず WebCodecs から試し直す
+                      localFileHandleRef.current = null
                       localForceSoftwareRef.current = false
                       playLocalFile(file)
                     }
@@ -1720,7 +1782,9 @@ const Page: NextPage = () => {
                   <Button
                     variant="outlined"
                     css={css`flex: 1;`}
-                    onClick={() => localFileInputRef.current?.click()}
+                    onClick={() => {
+                      pickLocalFile()
+                    }}
                   >
                     ファイルを開く
                   </Button>
@@ -1852,6 +1916,27 @@ const Page: NextPage = () => {
             resetToken={captionResetToken}
           ></Caption>
         </div>
+        {localReadError && (
+          <div
+            css={css`
+              position: absolute;
+              top: 50%;
+              left: 50%;
+              transform: translate(-50%, -50%);
+              z-index: 100;
+              max-width: 80%;
+              padding: 16px 24px;
+              border-radius: 8px;
+              background: rgba(0, 0, 0, 0.75);
+              color: #ff8a80;
+              font-size: 15px;
+              line-height: 1.6;
+              text-align: center;
+            `}
+          >
+            {localReadError}
+          </div>
+        )}
         {initError && (
           <div
             css={css`
