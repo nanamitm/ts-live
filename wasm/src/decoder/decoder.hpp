@@ -23,3 +23,5 @@ void setWebCodecsMode(bool enabled);
 void setVideoAuCallback(emscripten::val callback);
 void setVideoStreamInfoCallback(emscripten::val callback);
 double getAudioPlaybackTime();
+double getConsumedInputBytes();
+bool isDemuxEnded();

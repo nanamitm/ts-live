@@ -27,6 +27,7 @@ import Head from 'next/head'
 import { WasmModule, StatsData, VideoStreamInfo } from '../lib/wasmmodule'
 import { CONTAINER_PROBE_SIZE, looksLikeTlv } from '../lib/container'
 import { buildWebCodecsConfig } from '../lib/webcodecs'
+import { LocalPositionEstimator } from '../lib/local-position'
 import dayjs from 'dayjs'
 
 import { Program, Service } from 'mirakurun/api'
@@ -147,14 +148,9 @@ const Page: NextPage = () => {
   const [localReadError, setLocalReadError] = useState<string>('')
   const [localLoop, setLocalLoop] = usePersistedState<boolean>('tsplayerLocalLoop', false)
   const localLoopRef = useRef<boolean>(false)
-  // シーク用の再生位置推定。TS/TLV には索引が無いので、実測ビットレート
-  // (供給バイト数 / 経過メディア時刻) からバイト位置と時刻を相互に換算する。
-  // 放送 TS はほぼ CBR なので、この近似で実用上十分な精度が出る。
+  // 消費バイト数でレートを推定し、音声クロックで再生位置を進める。
   const localStartOffsetRef = useRef<number>(0)
-  const localFedBytesRef = useRef<number>(0)
-  // メディア時刻の基準点と、その時点までに供給済みだったバイト数。
-  const localClockBaseRef = useRef<{ time: number; bytes: number } | null>(null)
-  const localBytesPerSecRef = useRef<number>(0)
+  const localPositionEstimatorRef = useRef<LocalPositionEstimator | null>(null)
   const [localPosition, setLocalPosition] = useState<{
     bytes: number
     size: number
@@ -1027,9 +1023,8 @@ const Page: NextPage = () => {
     setLocalPaused(false)
     Module.setPaused(false)
     localStartOffsetRef.current = startOffset
-    localFedBytesRef.current = 0
+    localPositionEstimatorRef.current = null
     setLocalReadError('')
-    localClockBaseRef.current = null
     setLocalPosition({
       bytes: startOffset,
       size: file.size,
@@ -1092,6 +1087,7 @@ const Page: NextPage = () => {
       // 直前の再生停止(reset)の後片付けが終わるのを待つ
       await waitForDecoderReset(Module, () => aborted)
       if (aborted) return
+      localPositionEstimatorRef.current = new LocalPositionEstimator()
 
       // ローカルファイルは常に WebCodecs を試みる。実際に使うかは WASM が
       // probe 後にコーデックで決める(HEVC/H.264 なら WebCodecs、MPEG-2 等は
@@ -1167,7 +1163,6 @@ const Page: NextPage = () => {
                 }
                 buffer.set(ret.value)
                 Module.commitInputData(ret.value.length)
-                localFedBytesRef.current += ret.value.length
                 break
               }
             } catch (ex) {
@@ -1226,45 +1221,20 @@ const Page: NextPage = () => {
     })
   }
 
-  // 再生位置の推定を定期的に更新する。音声クロック(メディア時刻)の進みと供給
-  // バイト数からビットレートを実測し、それでバイト位置・総時間へ換算する。
+  // reset中は計測せず、ファイル切替・シークごとに新しい推定器を使う。
   useEffect(() => {
     if (playMode !== 'localfile' || !wasmMod) return
     const timer = setInterval(() => {
-      // ローカル再生のまま別ファイルを開いた場合や、録画中ファイルの
-      // スナップショットを取り直した場合も最新のサイズを使う。
       const file = lastLocalFileRef.current
-      if (!file) return
-      const mediaTime = wasmMod.getAudioPlaybackTime()
-      if (mediaTime < 0) return
-      const fed = localFedBytesRef.current
-      const base = localClockBaseRef.current
-      if (!base) {
-        localClockBaseRef.current = { time: mediaTime, bytes: fed }
-        return
-      }
-      const elapsed = mediaTime - base.time
-      if (elapsed < 0) {
-        // メディア時刻が巻き戻った(ループ/シーク直後)。基準を取り直す。
-        localClockBaseRef.current = { time: mediaTime, bytes: fed }
-        return
-      }
-      if (elapsed > 2) {
-        // 2秒以上ぶんの実測が溜まったらビットレートを更新する。
-        localBytesPerSecRef.current = (fed - base.bytes) / elapsed
-      }
-      const bytesPerSec = localBytesPerSecRef.current
-      // 基準時刻に鳴っていたのは startOffset 付近のデータ。供給済みバイト数は
-      // バッファぶん先行しているので、位置の起点には使わない (レートの実測に
-      // だけ使う)。
-      const consumed = bytesPerSec > 0 ? elapsed * bytesPerSec : 0
-      const bytes = Math.min(localStartOffsetRef.current + consumed, file.size)
-      setLocalPosition({
-        bytes,
-        size: file.size,
-        seconds: bytesPerSec > 0 ? bytes / bytesPerSec : 0,
-        duration: bytesPerSec > 0 ? file.size / bytesPerSec : 0,
-      })
+      const estimator = localPositionEstimatorRef.current
+      if (!file || !estimator || !wasmMod.isResetCompleted()) return
+      estimator.update(
+        wasmMod.getAudioPlaybackTime(),
+        wasmMod.getConsumedInputBytes(),
+        wasmMod.isDemuxEnded(),
+        localPausedRef.current
+      )
+      setLocalPosition(estimator.position(localStartOffsetRef.current, file.size))
     }, 250)
     return () => clearInterval(timer)
   }, [playMode, wasmMod])
@@ -2059,7 +2029,7 @@ const Page: NextPage = () => {
                     ? ((localSeeking ?? localPosition.bytes) /
                         localPosition.size) *
                         localPosition.duration
-                    : 0
+                    : -1
                 )}
               </span>
               <span css={css`margin-left: auto;`}>
@@ -2069,7 +2039,7 @@ const Page: NextPage = () => {
                       ((localSeeking ?? localPosition.bytes) /
                         localPosition.size) *
                       100
-                    ).toFixed(1)}%`}
+                    ).toFixed(1)}%（総時間不明）`}
               </span>
             </div>
           </div>

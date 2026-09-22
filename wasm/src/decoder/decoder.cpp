@@ -89,6 +89,15 @@ void setPaused(bool value) {
 // ffmpeg は次のデータを待ち続け、バッファ末尾に残ったぶんが処理されないまま
 // 再生が止まる。
 std::atomic<bool> inputEnded{false};
+// 生入力の累積消費量。servicefilter による増減やバッファの詰め直しを含めない。
+std::atomic<uint64_t> consumedInputBytes{0};
+std::atomic<bool> demuxEnded{false};
+
+double getConsumedInputBytes() {
+  return static_cast<double>(consumedInputBytes.load());
+}
+
+bool isDemuxEnded() { return demuxEnded.load(); }
 
 // 入力の供給側 (JS のローカルファイル読み込みループ) から呼ぶ。
 void setInputEnded();
@@ -458,6 +467,7 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
         bufSize, inputBufferWriteIndex - inputBufferReadIndex));
     memcpy(buf, &inputBuffer[inputBufferReadIndex], copySize);
     inputBufferReadIndex += copySize;
+    consumedInputBytes += copySize;
     waitCv.notify_all();
     return copySize;
   }
@@ -474,6 +484,7 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
   }
 
   // 0x47: TS packet header sync_byte
+  const size_t readStart = inputBufferReadIndex;
   // 添字を使う前に必ず範囲を確認する (読み切った位置で配列外を読まないよう
   // 境界チェックを先に置く)。
   while (inputBufferReadIndex < inputBufferWriteIndex &&
@@ -519,6 +530,7 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
     }
   }
 
+  consumedInputBytes += inputBufferReadIndex - readStart;
   waitCv.notify_all();
   if (copySize == 0) {
     if (inputEnded && inputBufferReadIndex + 188 > inputBufferWriteIndex) {
@@ -563,6 +575,8 @@ void resetInternal() {
   {
     std::lock_guard<std::mutex> lock(inputBufferMtx);
     inputEnded = false;
+    consumedInputBytes = 0;
+    demuxEnded = false;
     // 新しい再生は必ず再生状態から始める。
     paused = false;
     inputBufferReadIndex = 0;
@@ -1530,6 +1544,8 @@ void decoderThreadFunc() {
     AVPacket *ppacket = av_packet_alloc();
     int ret = av_read_frame(formatContext, ppacket);
     if (ret != 0) {
+      if (ret == AVERROR_EOF)
+        demuxEnded = true;
       // 終端に達した後は同じログを出し続けないよう 1 回だけ記録する。
       if (ret != AVERROR_EOF || !eofReported) {
         spdlog::info("av_read_frame: {} {}", ret, av_err2str(ret));

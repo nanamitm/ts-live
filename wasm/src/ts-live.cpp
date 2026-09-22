@@ -103,4 +103,6 @@ EMSCRIPTEN_BINDINGS(ts_live_module) {
   emscripten::function("setVideoStreamInfoCallback",
                        &setVideoStreamInfoCallback);
   emscripten::function("getAudioPlaybackTime", &getAudioPlaybackTime);
+  emscripten::function("getConsumedInputBytes", &getConsumedInputBytes);
+  emscripten::function("isDemuxEnded", &isDemuxEnded);
 }

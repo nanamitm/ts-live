@@ -97,5 +97,9 @@ export declare interface WasmModule extends EmscriptenModule {
     callback: ((info: VideoStreamInfo) => void) | null
   ): void
   getAudioPlaybackTime(): number
+  // reset 完了以降にデマルチプレクサが読んだ生入力バイト数。
+  getConsumedInputBytes(): number
+  // 入力の供給終了ではなく、デマルチプレクサが EOF に到達したか。
+  isDemuxEnded(): boolean
 }
 export declare var Module: WasmModule
