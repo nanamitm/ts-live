@@ -1261,7 +1261,18 @@ const Page: NextPage = () => {
         wasmMod.isDemuxEnded(),
         localPausedRef.current
       )
-      setLocalPosition(estimator.position(localStartOffsetRef.current, file.size))
+      const next = estimator.position(localStartOffsetRef.current, file.size)
+      // 一時停止中など値が動かないときに再レンダーを起こさない。
+      setLocalPosition(prev =>
+        prev &&
+        prev.bytes === next.bytes &&
+        prev.size === next.size &&
+        prev.seconds === next.seconds &&
+        prev.duration === next.duration &&
+        prev.exact === next.exact
+          ? prev
+          : next
+      )
     }, 250)
     return () => clearInterval(timer)
   }, [playMode, wasmMod])
