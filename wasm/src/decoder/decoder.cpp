@@ -453,6 +453,27 @@ emscripten::val getNextInputBuffer(size_t nextSize) {
   return retVal;
 }
 
+// 読み出し位置を次の TS パケット先頭へ進め、飛ばしたバイト数を返す。
+// inputBufferMtx を握って呼ぶこと。
+//
+// 0x47 (sync_byte) はペイロード中にも普通に現れるので、1 バイトだけで判断すると
+// 偽の同期に乗りやすい。188 バイト先も 0x47 である位置を先頭とみなす。188 バイト
+// 先がまだ届いていないときは確かめようがないので 1 バイトで判断する。
+static size_t skipToTsSync() {
+  const size_t start = inputBufferReadIndex;
+  // 添字を使う前に必ず範囲を確認する (読み切った位置で配列外を読まないよう
+  // 境界チェックを先に置く)。
+  while (inputBufferReadIndex < inputBufferWriteIndex) {
+    if (inputBuffer[inputBufferReadIndex] == 0x47 &&
+        (inputBufferReadIndex + 188 >= inputBufferWriteIndex ||
+         inputBuffer[inputBufferReadIndex + 188] == 0x47)) {
+      break;
+    }
+    inputBufferReadIndex++;
+  }
+  return inputBufferReadIndex - start;
+}
+
 int read_packet(void *opaque, uint8_t *buf, int bufSize) {
   std::unique_lock<std::mutex> lock(inputBufferMtx);
 
@@ -502,14 +523,8 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
     return AVERROR_EXIT;
   }
 
-  // 0x47: TS packet header sync_byte
   const size_t readStart = inputBufferReadIndex;
-  // 添字を使う前に必ず範囲を確認する (読み切った位置で配列外を読まないよう
-  // 境界チェックを先に置く)。
-  while (inputBufferReadIndex < inputBufferWriteIndex &&
-         inputBuffer[inputBufferReadIndex] != 0x47) {
-    inputBufferReadIndex++;
-  }
+  size_t skippedBytes = skipToTsSync();
 
   // 前回返しきれなかったパケットがあれば消費する
   int copySize = 0;
@@ -531,6 +546,12 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
   // 出てくるのは1パケットとは限らない。色々追加される可能性がある
   while (!servicefilterRemain &&
          inputBufferReadIndex + 188 <= inputBufferWriteIndex) {
+    // 途中で 188 バイト境界がずれた入力 (切れたパケット等) を、次の呼び出し
+    // まで誤った位置のまま PID 判定に回さないよう、パケットごとに確かめる。
+    skippedBytes += skipToTsSync();
+    if (inputBufferReadIndex + 188 > inputBufferWriteIndex) {
+      break;
+    }
     servicefilter.AddPacket(&inputBuffer[inputBufferReadIndex]);
     inputBufferReadIndex += 188;
     const auto &packets = servicefilter.GetPackets();
@@ -549,6 +570,9 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
     }
   }
 
+  if (skippedBytes > 0) {
+    spdlog::warn("TS sync lost: skipped {} bytes", skippedBytes);
+  }
   consumedInputBytes += inputBufferReadIndex - readStart;
   waitCv.notify_all();
   if (copySize == 0) {
