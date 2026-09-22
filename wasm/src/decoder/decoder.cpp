@@ -763,7 +763,14 @@ void videoDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
   // 遅延でフレームバッファが枯渇して映像/音声が途切れる。デコード時間の
   // 2-3割を占めるループフィルター(デブロッキング)を省いて余裕を作る。
   // 画質は多少ブロックノイズが乗るが、リアルタイム再生を優先する。
-  videoCodecContext->skip_loop_filter = AVDISCARD_ALL;
+  // 2K (H.264 の WebCodecs からのフォールバック等) は余裕があるので省かない。
+  if ((int64_t)videoCodecContext->width * videoCodecContext->height >
+      1920 * 1088) {
+    videoCodecContext->skip_loop_filter = AVDISCARD_ALL;
+  }
+  spdlog::info("video decoder {}x{} skip_loop_filter={}",
+               videoCodecContext->width, videoCodecContext->height,
+               videoCodecContext->skip_loop_filter == AVDISCARD_ALL);
   if (avcodec_open2(videoCodecContext, videoCodec, nullptr) != 0) {
     spdlog::error("avcodec_open2 failed");
     avcodec_free_context(&videoCodecContext);
