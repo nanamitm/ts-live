@@ -33,6 +33,9 @@ void feedAudioData(float *buffer0, float *buffer1, int samples) {
 }
 
 void clearAudioSamples() {
+  // worklet からの通知を待たずに残量を 0 にしておく。待つと、その間の音声
+  // クロックが「まだ1秒ぶん積まれている」前提のままになり時刻がずれる。
+  setBufferedAudioSamples(0);
   // clang-format off
   EM_ASM({
     if (Module && Module['myAudio'] && Module['myAudio']['node']) {

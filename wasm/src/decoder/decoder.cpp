@@ -302,8 +302,24 @@ void setPlaybackRate(double rate) {
     spdlog::error("setPlaybackRate() out of range [0.1 - 100]: {}", rate);
     return;
   }
-  targetAudioTempo.store(rate, std::memory_order_relaxed);
+  if (targetAudioTempo.exchange(rate, std::memory_order_relaxed) == rate) {
+    return;
+  }
   spdlog::info("setPlaybackRate: {}", rate);
+
+  // ここまでに用意した音声は前の速度のもの。AudioWorklet には約1秒ぶんを
+  // 積んであるので、捨てずに置くと新しい速度になるまでその時間だけ待たされる。
+  // 捨てたぶん再生位置は飛ぶが、切り替えは即座に効く。
+  // (JS から呼ばれる = メインスレッドなので、ここで捨ててよい)
+  {
+    std::lock_guard<std::mutex> lock(audioFrameMtx);
+    while (!audioFrameQueue.empty()) {
+      AVFrame *frame = audioFrameQueue.front();
+      audioFrameQueue.pop_front();
+      av_frame_free(&frame);
+    }
+  }
+  clearAudioSamples();
 }
 
 // 逆テレシネ。NEVER=しない、FORCE=常にかける、AUTO=テレシネと判定したら。
