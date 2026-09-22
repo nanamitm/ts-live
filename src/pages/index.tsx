@@ -152,6 +152,10 @@ const Page: NextPage = () => {
   // TSはPTS由来の総時間、TLVは消費レートの推定を使い、音声クロックで進める。
   const localStartOffsetRef = useRef<number>(0)
   const localPositionEstimatorRef = useRef<LocalPositionEstimator | null>(null)
+  // 解析した総時間の使い回し。シークやループでも playLocalFile() を通るので、
+  // これが無いと同じファイルを開き直すたびに先頭と末尾を読み直してしまう。
+  // 録画中のファイルはサイズが変わるので、キーが変われば解析し直す。
+  const localDurationCacheRef = useRef<{ key: string; duration: number } | null>(null)
   const [localPosition, setLocalPosition] = useState<{
     bytes: number
     size: number
@@ -1091,11 +1095,22 @@ const Page: NextPage = () => {
       // 直前の再生停止(reset)の後片付けが終わるのを待つ
       await waitForDecoderReset(Module, () => aborted)
       if (aborted) return
-      const duration = tlv ? undefined : await readTsDuration(src, Module, () => aborted)
-        .catch(ex => {
-          console.warn('TS duration probe failed:', ex)
-          return 0
-        })
+      let duration: number | undefined
+      if (!tlv) {
+        const key = `${src.name}|${src.size}|${src.lastModified}`
+        const cached = localDurationCacheRef.current
+        if (cached && cached.key === key) {
+          duration = cached.duration
+        } else {
+          duration = await readTsDuration(src, Module, () => aborted).catch(ex => {
+            console.warn('TS duration probe failed:', ex)
+            return 0
+          })
+          // 中断で打ち切った 0 は結果ではないので覚えない。
+          if (aborted) return
+          localDurationCacheRef.current = { key, duration }
+        }
+      }
       if (aborted) return
       const estimator = new LocalPositionEstimator(duration)
       localPositionEstimatorRef.current = estimator
