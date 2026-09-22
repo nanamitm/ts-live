@@ -22,18 +22,15 @@ struct WebGPUContext {
   WGPUComputePipeline yadifPipeline = nullptr;
   WGPURenderPipeline pipeline = nullptr;
   WGPUBindGroupLayout yadifBindGroupLayout = nullptr, bindGroupLayout = nullptr;
-  WGPUTexture curTextureY = nullptr, curTextureU = nullptr,
-              curTextureV = nullptr;
-  WGPUTextureView curViewY = nullptr, curViewU = nullptr, curViewV = nullptr;
-  WGPUTexture prevTextureY = nullptr, prevTextureU = nullptr,
-              prevTextureV = nullptr;
-  WGPUTextureView prevViewY = nullptr, prevViewU = nullptr, prevViewV = nullptr;
-  WGPUTexture nextTextureY = nullptr, nextTextureU = nullptr,
-              nextTextureV = nullptr;
-  WGPUTextureView nextViewY = nullptr, nextViewU = nullptr, nextViewV = nullptr;
+  // prev/cur/next は 3 枚を使い回す。毎フレーム next->cur->prev とコピーする
+  // 代わりに、書き込む先を 1 枚ずつずらして、どれが prev/cur/next かを
+  // バインドグループ側で表す (textureRotation が今 next にあたる添字)。
+  int textureRotation = 0;
+  WGPUTexture textureY[3] = {}, textureU[3] = {}, textureV[3] = {};
+  WGPUTextureView viewY[3] = {}, viewU[3] = {}, viewV[3] = {};
   WGPUTexture frameTexture = nullptr;
   WGPUTextureView frameView = nullptr;
-  WGPUBindGroup yadifBindGroup = nullptr, bindGroup = nullptr;
+  WGPUBindGroup yadifBindGroup[3] = {}, bindGroup = nullptr;
   WGPUSampler sampler = nullptr;
 };
 
@@ -60,33 +57,23 @@ static WGPUShaderModule createShader(const char *const code,
 // バインドグループも毎回作り直しているので、ここで一緒に解放しないと解像度が
 // 変わるたびにリークする。
 static void releaseTextures() {
-  wgpuTextureViewRelease(ctx.curViewY);
-  wgpuTextureViewRelease(ctx.curViewU);
-  wgpuTextureViewRelease(ctx.curViewV);
-  wgpuTextureRelease(ctx.curTextureY);
-  wgpuTextureRelease(ctx.curTextureU);
-  wgpuTextureRelease(ctx.curTextureV);
-
-  wgpuTextureViewRelease(ctx.prevViewY);
-  wgpuTextureViewRelease(ctx.prevViewU);
-  wgpuTextureViewRelease(ctx.prevViewV);
-  wgpuTextureRelease(ctx.prevTextureY);
-  wgpuTextureRelease(ctx.prevTextureU);
-  wgpuTextureRelease(ctx.prevTextureV);
-
-  wgpuTextureViewRelease(ctx.nextViewY);
-  wgpuTextureViewRelease(ctx.nextViewU);
-  wgpuTextureViewRelease(ctx.nextViewV);
-  wgpuTextureRelease(ctx.nextTextureY);
-  wgpuTextureRelease(ctx.nextTextureU);
-  wgpuTextureRelease(ctx.nextTextureV);
+  for (int i = 0; i < 3; i++) {
+    wgpuTextureViewRelease(ctx.viewY[i]);
+    wgpuTextureViewRelease(ctx.viewU[i]);
+    wgpuTextureViewRelease(ctx.viewV[i]);
+    wgpuTextureRelease(ctx.textureY[i]);
+    wgpuTextureRelease(ctx.textureU[i]);
+    wgpuTextureRelease(ctx.textureV[i]);
+  }
 
   wgpuTextureViewRelease(ctx.frameView);
   wgpuTextureRelease(ctx.frameTexture);
 
-  if (ctx.yadifBindGroup != nullptr) {
-    wgpuBindGroupRelease(ctx.yadifBindGroup);
-    ctx.yadifBindGroup = nullptr;
+  for (int i = 0; i < 3; i++) {
+    if (ctx.yadifBindGroup[i] != nullptr) {
+      wgpuBindGroupRelease(ctx.yadifBindGroup[i]);
+      ctx.yadifBindGroup[i] = nullptr;
+    }
   }
   if (ctx.bindGroup != nullptr) {
     wgpuBindGroupRelease(ctx.bindGroup);
@@ -112,23 +99,22 @@ static void createTextures(int width, int height) {
   WGPUTextureDescriptor textureDesc = {};
   textureDesc.dimension = WGPUTextureDimension_2D;
   textureDesc.format = WGPUTextureFormat_R8Unorm;
-  textureDesc.usage = WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst |
-                      WGPUTextureUsage_TextureBinding;
+  // テクスチャ間コピーをやめたので CopySrc は要らない。
+  textureDesc.usage =
+      WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding;
   textureDesc.sampleCount = 1;
   textureDesc.mipLevelCount = 1;
 
   textureDesc.size = size;
-  ctx.curTextureY = wgpuDeviceCreateTexture(ctx.device, &textureDesc);
-  ctx.prevTextureY = wgpuDeviceCreateTexture(ctx.device, &textureDesc);
-  ctx.nextTextureY = wgpuDeviceCreateTexture(ctx.device, &textureDesc);
+  for (int i = 0; i < 3; i++) {
+    ctx.textureY[i] = wgpuDeviceCreateTexture(ctx.device, &textureDesc);
+  }
 
   textureDesc.size = uvSize;
-  ctx.curTextureU = wgpuDeviceCreateTexture(ctx.device, &textureDesc);
-  ctx.curTextureV = wgpuDeviceCreateTexture(ctx.device, &textureDesc);
-  ctx.prevTextureU = wgpuDeviceCreateTexture(ctx.device, &textureDesc);
-  ctx.prevTextureV = wgpuDeviceCreateTexture(ctx.device, &textureDesc);
-  ctx.nextTextureU = wgpuDeviceCreateTexture(ctx.device, &textureDesc);
-  ctx.nextTextureV = wgpuDeviceCreateTexture(ctx.device, &textureDesc);
+  for (int i = 0; i < 3; i++) {
+    ctx.textureU[i] = wgpuDeviceCreateTexture(ctx.device, &textureDesc);
+    ctx.textureV[i] = wgpuDeviceCreateTexture(ctx.device, &textureDesc);
+  }
 
   textureDesc.format = WGPUTextureFormat_RGBA8Unorm;
   textureDesc.usage = WGPUTextureUsage_CopyDst |
@@ -152,43 +138,49 @@ static void createTextures(int width, int height) {
   viewDesc.mipLevelCount = 1;
   viewDesc.aspect = WGPUTextureAspect_All;
 
-  ctx.curViewY = wgpuTextureCreateView(ctx.curTextureY, &viewDesc);
-  ctx.curViewU = wgpuTextureCreateView(ctx.curTextureU, &viewDesc);
-  ctx.curViewV = wgpuTextureCreateView(ctx.curTextureV, &viewDesc);
-  ctx.prevViewY = wgpuTextureCreateView(ctx.prevTextureY, &viewDesc);
-  ctx.prevViewU = wgpuTextureCreateView(ctx.prevTextureU, &viewDesc);
-  ctx.prevViewV = wgpuTextureCreateView(ctx.prevTextureV, &viewDesc);
-  ctx.nextViewY = wgpuTextureCreateView(ctx.nextTextureY, &viewDesc);
-  ctx.nextViewU = wgpuTextureCreateView(ctx.nextTextureU, &viewDesc);
-  ctx.nextViewV = wgpuTextureCreateView(ctx.nextTextureV, &viewDesc);
+  for (int i = 0; i < 3; i++) {
+    ctx.viewY[i] = wgpuTextureCreateView(ctx.textureY[i], &viewDesc);
+    ctx.viewU[i] = wgpuTextureCreateView(ctx.textureU[i], &viewDesc);
+    ctx.viewV[i] = wgpuTextureCreateView(ctx.textureV[i], &viewDesc);
+  }
 
   viewDesc.format = WGPUTextureFormat_RGBA8Unorm;
   ctx.frameView = wgpuTextureCreateView(ctx.frameTexture, &viewDesc);
 
+  // 書き込み先を 1 枚ずつずらすので、rotation ごとに prev/cur/next の割り当てが
+  // 変わる。バインドグループは 3 通りを作り置きしておき、描画時に選ぶ。
+  for (int i = 0; i < 3; i++) {
+    WGPUBindGroupEntry yadifEntries[] = {
+        {.binding = 0, .sampler = ctx.sampler},
+        {.binding = 1, .textureView = ctx.frameView},
+        {.binding = 2, .textureView = ctx.viewY[(i + 2) % 3]}, // cur
+        {.binding = 3, .textureView = ctx.viewU[(i + 2) % 3]},
+        {.binding = 4, .textureView = ctx.viewV[(i + 2) % 3]},
+        {.binding = 5, .textureView = ctx.viewY[(i + 1) % 3]}, // prev
+        {.binding = 6, .textureView = ctx.viewU[(i + 1) % 3]},
+        {.binding = 7, .textureView = ctx.viewV[(i + 1) % 3]},
+        {.binding = 8, .textureView = ctx.viewY[i]}, // next
+        {.binding = 9, .textureView = ctx.viewU[i]},
+        {.binding = 10, .textureView = ctx.viewV[i]},
+    };
+    WGPUBindGroupDescriptor yadifBgDesc = {};
+    yadifBgDesc.layout = ctx.yadifBindGroupLayout;
+    yadifBgDesc.entryCount = sizeof(yadifEntries) / sizeof(yadifEntries[0]);
+    yadifBgDesc.entries = yadifEntries;
+    ctx.yadifBindGroup[i] = wgpuDeviceCreateBindGroup(ctx.device, &yadifBgDesc);
+  }
+
   WGPUBindGroupEntry bgEntries[] = {
       {.binding = 0, .sampler = ctx.sampler},
       {.binding = 1, .textureView = ctx.frameView},
-      {.binding = 2, .textureView = ctx.curViewY},
-      {.binding = 3, .textureView = ctx.curViewU},
-      {.binding = 4, .textureView = ctx.curViewV},
-      {.binding = 5, .textureView = ctx.prevViewY},
-      {.binding = 6, .textureView = ctx.prevViewU},
-      {.binding = 7, .textureView = ctx.prevViewV},
-      {.binding = 8, .textureView = ctx.nextViewY},
-      {.binding = 9, .textureView = ctx.nextViewU},
-      {.binding = 10, .textureView = ctx.nextViewV},
   };
   WGPUBindGroupDescriptor bgDesc = {};
-  bgDesc.layout = ctx.yadifBindGroupLayout;
+  bgDesc.layout = ctx.bindGroupLayout;
   bgDesc.entryCount = sizeof(bgEntries) / sizeof(bgEntries[0]);
   bgDesc.entries = bgEntries;
-
-  ctx.yadifBindGroup = wgpuDeviceCreateBindGroup(ctx.device, &bgDesc);
-
-  bgDesc.entryCount = 2;
-  bgDesc.layout = ctx.bindGroupLayout;
   ctx.bindGroup = wgpuDeviceCreateBindGroup(ctx.device, &bgDesc);
 
+  ctx.textureRotation = 0;
   ctx.textureWidth = width;
   ctx.textureHeight = height;
 }
@@ -438,17 +430,21 @@ void drawWebGpu(AVFrame *frame) {
       .aspect = WGPUTextureAspect::WGPUTextureAspect_All,
   };
 
-  copyTexture.texture = ctx.nextTextureY;
+  // 今回のフレームを next として書き込む。1 枚ずらすことで、前回の next が
+  // cur に、前々回の next が prev になる。
+  ctx.textureRotation = (ctx.textureRotation + 1) % 3;
+
+  copyTexture.texture = ctx.textureY[ctx.textureRotation];
   wgpuQueueWriteTexture(ctx.queue, &copyTexture, frame->data[0],
                         (size_t)frame->height * frame->linesize[0],
                         &textureDataLayout, &copySize);
 
-  copyTexture.texture = ctx.nextTextureU;
+  copyTexture.texture = ctx.textureU[ctx.textureRotation];
   wgpuQueueWriteTexture(ctx.queue, &copyTexture, frame->data[1],
                         (size_t)(frame->height / 2) * frame->linesize[1],
                         &textureDataLayoutU, &copySizeuv);
 
-  copyTexture.texture = ctx.nextTextureV;
+  copyTexture.texture = ctx.textureV[ctx.textureRotation];
   wgpuQueueWriteTexture(ctx.queue, &copyTexture, frame->data[2],
                         (size_t)(frame->height / 2) * frame->linesize[2],
                         &textureDataLayoutV, &copySizeuv);
@@ -456,7 +452,8 @@ void drawWebGpu(AVFrame *frame) {
   WGPUComputePassEncoder compPass =
       wgpuCommandEncoderBeginComputePass(encoder, &compPassDesc);
   wgpuComputePassEncoderSetPipeline(compPass, ctx.yadifPipeline);
-  wgpuComputePassEncoderSetBindGroup(compPass, 0, ctx.yadifBindGroup, 0, 0);
+  wgpuComputePassEncoderSetBindGroup(
+      compPass, 0, ctx.yadifBindGroup[ctx.textureRotation], 0, 0);
   // 1 invocation が輝度 2x2 画素を処理し、ワークグループは 16x4。切り捨てで
   // 割ると幅/高さが端数のとき右端・下端が処理されないため切り上げる (範囲外
   // の textureStore は WGSL 仕様上無視される)。
@@ -474,44 +471,6 @@ void drawWebGpu(AVFrame *frame) {
 
   wgpuRenderPassEncoderEnd(pass);
   wgpuRenderPassEncoderRelease(pass); // release pass
-
-  // current => prev
-  WGPUImageCopyTexture copySrc = {
-      .mipLevel = 0,
-      .origin = origin,
-      .aspect = WGPUTextureAspect::WGPUTextureAspect_All,
-  };
-  WGPUImageCopyTexture copyDst = {
-      .mipLevel = 0,
-      .origin = origin,
-      .aspect = WGPUTextureAspect::WGPUTextureAspect_All,
-  };
-
-  copySrc.texture = ctx.curTextureY;
-  copyDst.texture = ctx.prevTextureY;
-  wgpuCommandEncoderCopyTextureToTexture(encoder, &copySrc, &copyDst,
-                                         &copySize);
-  copySrc.texture = ctx.curTextureU;
-  copyDst.texture = ctx.prevTextureU;
-  wgpuCommandEncoderCopyTextureToTexture(encoder, &copySrc, &copyDst,
-                                         &copySizeuv);
-  copySrc.texture = ctx.curTextureV;
-  copyDst.texture = ctx.prevTextureV;
-  wgpuCommandEncoderCopyTextureToTexture(encoder, &copySrc, &copyDst,
-                                         &copySizeuv);
-
-  copySrc.texture = ctx.nextTextureY;
-  copyDst.texture = ctx.curTextureY;
-  wgpuCommandEncoderCopyTextureToTexture(encoder, &copySrc, &copyDst,
-                                         &copySize);
-  copySrc.texture = ctx.nextTextureU;
-  copyDst.texture = ctx.curTextureU;
-  wgpuCommandEncoderCopyTextureToTexture(encoder, &copySrc, &copyDst,
-                                         &copySizeuv);
-  copySrc.texture = ctx.nextTextureV;
-  copyDst.texture = ctx.curTextureV;
-  wgpuCommandEncoderCopyTextureToTexture(encoder, &copySrc, &copyDst,
-                                         &copySizeuv);
 
   WGPUCommandBuffer commands =
       wgpuCommandEncoderFinish(encoder, nullptr); // create commands
