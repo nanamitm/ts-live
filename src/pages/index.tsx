@@ -68,7 +68,14 @@ const Page: NextPage = () => {
   const { debug } = router.query
 
   const [debugLog, setDebugLog] = useState<boolean>(false)
-  const [webCodecsActive, setWebCodecsActive] = useState<boolean>(false)
+  // どちらの canvas を見せるか。'none' は「この再生ではまだ何も描いていない」。
+  // 描画経路は probe (videoStreamInfo) で決まるので、再生の開始・切り替え・
+  // シークの間はどちらとも決まらない。その間に前の再生で描いた絵を見せないため、
+  // 決まるまでは両方隠す (WebGPU 側の canvas は最後に描いた絵を保持し続けるので、
+  // 隠さないと 4K の再生中に 2K の絵が透けて見える)。
+  const [activeCanvas, setActiveCanvas] = useState<'none' | 'wasm' | 'webcodecs'>(
+    'none'
+  )
 
   const [drawer, setDrawer] = useState<boolean>(true)
   const [touched, setTouched] = useState<boolean>(false)
@@ -754,7 +761,7 @@ const Page: NextPage = () => {
         webCodecsCtrlRef.current.stop()
         webCodecsCtrlRef.current = null
       }
-      setWebCodecsActive(false)
+      setActiveCanvas('none')
       Module.reset()
     }
     // 待機中の切替でも古い開始処理を止められるよう、待ちに入る前に停止関数を公開する。
@@ -787,11 +794,12 @@ const Page: NextPage = () => {
                 liveForceSoftwareServiceRef.current = activeService.id
                 setWebCodecsRetryToken(t => t + 1)
               })
-              setWebCodecsActive(true)
             }
+            setActiveCanvas(info.webCodecs ? 'webcodecs' : 'wasm')
           })
         } else {
           Module.setVideoStreamInfoCallback(null as any)
+          setActiveCanvas('wasm')
         }
         Module.setTlvMode(isBS4K)
         Module.setWebCodecsMode(wantWebCodecs)
@@ -942,7 +950,7 @@ const Page: NextPage = () => {
         webCodecsCtrlRef.current.stop()
         webCodecsCtrlRef.current = null
       }
-      setWebCodecsActive(false)
+      setActiveCanvas('none')
       Module.reset()
     }
     // 500ms の開始待ち中に別ファイルが選ばれても、この処理を中止できるようにする。
@@ -970,11 +978,12 @@ const Page: NextPage = () => {
               localForceSoftwareRef.current = true
               playLocalFile(file, startOffset)
             })
-            setWebCodecsActive(true)
           }
+          setActiveCanvas(info.webCodecs ? 'webcodecs' : 'wasm')
         })
       } else {
         Module.setVideoStreamInfoCallback(null as any)
+        setActiveCanvas('wasm')
       }
       Module.setTlvMode(tlv)
       Module.setWebCodecsMode(wantWebCodecs)
@@ -1600,6 +1609,9 @@ const Page: NextPage = () => {
         `}
       >
         <canvas
+          // WebGPU のコンテキストは WASM 側が握っているので、hidden
+          // (display: none) ではなく visibility で隠す。レイアウトから外すと
+          // スワップチェーンの構成に影響しかねないため。
           css={css`
             position: absolute;
             top: 50%;
@@ -1607,6 +1619,7 @@ const Page: NextPage = () => {
             max-width: 100%;
             max-height: 100%;
             z-index: 1;
+            visibility: ${activeCanvas === 'wasm' ? 'visible' : 'hidden'};
           `}
           id="video"
           ref={videoCanvasRef}
@@ -1634,7 +1647,7 @@ const Page: NextPage = () => {
           tabIndex={-1}
           width={3840}
           height={2160}
-          hidden={!webCodecsActive}
+          hidden={activeCanvas !== 'webcodecs'}
           onClick={() => setDrawer(true)}
           onContextMenu={ev => ev.preventDefault()}
           style={{
