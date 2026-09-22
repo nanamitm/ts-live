@@ -42,6 +42,28 @@ F2 キーでスクリーンキャプチャが出来ます。
 
 開発を楽にする目的なのであまり利便性とか力を入れてません。
 
+## WASM のビルド
+
+`wasm/` 以下の C++ を変更したら、ビルドして `public/wasm` を更新します。
+Emscripten は CI (`.github/workflows/build-wasm.yml`) と同じ 3.1.74 を使ってください。
+初回は FFmpeg などの依存もビルドするので時間がかかります。
+
+```
+yarn cmake:config
+yarn cmake:build
+```
+
+手元に emsdk が無い場合は、公式イメージでリポジトリを `/work` にマウントしてビルドできます。
+`wasm/build` の CMake キャッシュは構成したときのパスを覚えているので、同じビルド
+ディレクトリはいつも同じマウント先 (`/work`) で使ってください。
+
+```
+docker run --rm -u "$(id -u):$(id -g)" -v "$PWD":/work -w /work emscripten/emsdk:3.1.74 \
+  bash -c 'mkdir -p wasm/build && cd wasm/build && emcmake cmake -DCMAKE_BUILD_TYPE=Release .. && cd /work && cmake --build wasm/build --parallel 8 && cmake --install wasm/build --prefix public/wasm'
+```
+
+2 回目以降は `cmake --build` と `cmake --install` だけで済みます。
+
 ## テスト
 
 `yarn test` で JS 側のユニットテストが動きます (CI でも実行します)。
