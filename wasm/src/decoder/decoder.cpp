@@ -289,6 +289,12 @@ std::atomic<int> selectedAudioStreamIndex{0};
 std::atomic<int> currentAudioSampleRate{0};
 std::atomic<bool> streamsReady{false};
 
+// 音声を捨てたので、映像も同じだけ飛ばしたい。メインループが次の周回で音声
+// クロックを読み直し、そこを videoSkipUntilPtsTime に据える。
+std::atomic<bool> audioDiscarded{false};
+// この時刻より前の映像は表示せずに捨てる。-1 は「捨てない」。
+std::atomic<double> videoSkipUntilPtsTime{-1.0};
+
 // 用意済みの音声を捨てる。AudioWorklet には約1秒ぶんを積んであるので、
 // 捨てずに置くと設定を変えてもその時間だけ古い音が鳴り続ける。捨てたぶん音は
 // 途切れるが、切り替えは即座に効く。
@@ -303,6 +309,10 @@ static void dropPendingAudio() {
     }
   }
   clearAudioSamples();
+  // 捨てたぶん音声クロックは先へ飛ぶ。映像パイプラインには飛んだぶんの過去の
+  // フレームが残っていて、そのまま出すと映像だけが早送りで追いかけることに
+  // なるので、表示せずに捨てる目印を立てる。
+  audioDiscarded.store(true, std::memory_order_relaxed);
 }
 
 void setDualMonoMode(int mode) {
@@ -695,6 +705,8 @@ void reset() {
   videoPtsAdjustment = 0;
   lastShownVideoPtsTime = -1;
   secondFieldPending = false;
+  audioDiscarded.store(false, std::memory_order_relaxed);
+  videoSkipUntilPtsTime.store(-1.0, std::memory_order_relaxed);
   // read_packet で待っているデコードスレッドを起こす。
   std::lock_guard<std::mutex> lock(inputBufferMtx);
   waitCv.notify_all();
@@ -1070,6 +1082,21 @@ void videoConvertThreadFunc(std::atomic<bool> &terminateFlag) {
                      telecineFrameCount);
     } else if (telecinePrevFrame != nullptr) {
       av_frame_free(&telecinePrevFrame);
+    }
+
+    // 音声を捨てて時刻が飛んだ直後ぶん。デコードは参照のために続ける必要が
+    // あるが、表示はしない (テレシネ検出の後で捨てるのは prev/cur の並びを
+    // 崩さないため)。
+    double skipUntil = videoSkipUntilPtsTime.load(std::memory_order_relaxed);
+    if (skipUntil >= 0) {
+      double ptsTime = outFrame->pts * av_q2d(outFrame->time_base);
+      // 10 秒以上離れているのは追いかけ遅れではなく PTS の不連続なので、
+      // 目印を捨てる (さもないと二度と表示できなくなる)。
+      if (ptsTime < skipUntil && ptsTime > skipUntil - 10.0) {
+        av_frame_free(&outFrame);
+        continue;
+      }
+      videoSkipUntilPtsTime.store(-1.0, std::memory_order_relaxed);
     }
 
     {
@@ -2069,6 +2096,13 @@ void decoderMainloop() {
     // 通らない(JS側でデコードする)ため、映像基準にすると
     // 4K/2K のハードウェアデコード時に再生時刻が進まなくなる。
     advancePlaybackTime(estimatedAudioPlayTime);
+    // 音声を捨てた直後の周回。ここでのクロックが飛んだ先なので、これより前の
+    // 映像は出さないことにする。
+    if (estimatedAudioPlayTime >= 0 &&
+        audioDiscarded.exchange(false, std::memory_order_relaxed)) {
+      videoSkipUntilPtsTime.store(estimatedAudioPlayTime,
+                                  std::memory_order_relaxed);
+    }
   }
 
   if (secondFieldPending) {
