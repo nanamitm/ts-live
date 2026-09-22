@@ -736,6 +736,62 @@ void reset() {
   waitCv.notify_all();
 }
 
+// 一定時間あたりのログ行数を絞る。受信エラーが続く間はデコーダーが
+// パケット・マクロブロックごとに警告を出すので、そのまま流すとコンソールが
+// 埋まり、他のログ (映像を捨てた/再開した等) が見つからなくなる。
+// 窓 (window) ごとに maxLines 行まで通し、それを超えたぶんは数だけ数えて、
+// 次に通すときに suppressed で返す。
+class LogRateLimiter {
+public:
+  LogRateLimiter(int maxLines, std::chrono::milliseconds window)
+      : maxLines_(maxLines), window_(window) {}
+
+  bool allow(long &suppressed) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto now = std::chrono::steady_clock::now();
+    if (now - windowStart_ >= window_) {
+      windowStart_ = now;
+      lines_ = 0;
+    }
+    if (lines_ >= maxLines_) {
+      suppressed_++;
+      return false;
+    }
+    lines_++;
+    suppressed = suppressed_;
+    suppressed_ = 0;
+    return true;
+  }
+
+private:
+  std::mutex mtx_;
+  const int maxLines_;
+  const std::chrono::milliseconds window_;
+  std::chrono::steady_clock::time_point windowStart_{};
+  int lines_ = 0;
+  long suppressed_ = 0;
+};
+
+// 失敗は 1 秒に 1 行まで。映像と音声は別々に数える。
+static LogRateLimiter videoSendFailureLog(1, std::chrono::seconds(1));
+static LogRateLimiter audioSendFailureLog(1, std::chrono::seconds(1));
+
+static void logSendPacketFailure(LogRateLimiter &limiter, const char *kind,
+                                 int ret) {
+  long suppressed = 0;
+  if (!limiter.allow(suppressed)) {
+    return;
+  }
+  if (suppressed > 0) {
+    spdlog::warn("avcodec_send_packet({}) failed: {} {} (+{} more since last "
+                 "report)",
+                 kind, ret, av_err2str(ret), suppressed);
+  } else {
+    spdlog::warn("avcodec_send_packet({}) failed: {} {}", kind, ret,
+                 av_err2str(ret));
+  }
+}
+
 void videoDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
   // find decoder
   const AVCodec *videoCodec =
@@ -882,9 +938,7 @@ void videoDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
 
     int ret = avcodec_send_packet(videoCodecContext, &packet);
     if (ret != 0) {
-      spdlog::error("avcodec_send_packet(video) failed: {} {}", ret,
-                    av_err2str(ret));
-      // return;
+      logSendPacketFailure(videoSendFailureLog, "video", ret);
     }
     while (avcodec_receive_frame(videoCodecContext, frame) == 0) {
       // spdlog::debug() は関数呼び出しなので、ログレベルに関わらず引数が必ず
@@ -1364,9 +1418,7 @@ void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
 
     int ret = avcodec_send_packet(audioCodecContext, &packet);
     if (ret != 0) {
-      spdlog::error("avcodec_send_packet(audio) failed: {} {}", ret,
-                    av_err2str(ret));
-      // return;
+      logSendPacketFailure(audioSendFailureLog, "audio", ret);
     }
     while (avcodec_receive_frame(audioCodecContext, frame) == 0) {
       // buf[1] はモノラル(=1プレーン)やパック形式では nullptr。引数は常に
@@ -1916,6 +1968,20 @@ static void tsLiveAvLogCallback(void *avcl, int level, const char *fmt,
     } else {
       lastLine = line;
       repeatCount = 0;
+    }
+  }
+
+  // 受信エラー中は "ac-tex damaged at x y" のように毎回違う行がマクロブロック
+  // ごとに出るので、上の同一行の間引きでは減らない。1 秒あたりの行数で絞る。
+  // info 以下は量が少なく、デバッグで全部見たいので対象外。
+  if (level <= AV_LOG_WARNING) {
+    static LogRateLimiter warnLimiter(20, std::chrono::seconds(1));
+    long suppressed = 0;
+    if (!warnLimiter.allow(suppressed)) {
+      return;
+    }
+    if (suppressed > 0) {
+      spdlog::warn("[ffmpeg] ({} messages suppressed)", suppressed);
     }
   }
 
