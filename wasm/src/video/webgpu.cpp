@@ -468,10 +468,13 @@ void drawWebGpu(AVFrame *frame, bool deinterlaceFlag, bool bwdifFlag) {
 
   WGPUComputePassEncoder compPass =
       wgpuCommandEncoderBeginComputePass(encoder, &compPassDesc);
-  wgpuComputePassEncoderSetPipeline(compPass, !deinterlaceFlag
-                                                  ? ctx.passthruPipeline
-                                              : bwdifFlag ? ctx.bwdifPipeline
-                                                          : ctx.yadifPipeline);
+  WGPUComputePipeline filterPipeline = ctx.yadifPipeline;
+  if (!deinterlaceFlag) {
+    filterPipeline = ctx.passthruPipeline;
+  } else if (bwdifFlag) {
+    filterPipeline = ctx.bwdifPipeline;
+  }
+  wgpuComputePassEncoderSetPipeline(compPass, filterPipeline);
   wgpuComputePassEncoderSetBindGroup(
       compPass, 0, ctx.filterBindGroup[ctx.textureRotation], 0, 0);
   // 1 invocation が輝度 2x2 画素を処理し、ワークグループは 16x4。切り捨てで

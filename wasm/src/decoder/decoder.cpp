@@ -288,9 +288,13 @@ std::string setDeinterlace(std::string filter) {
   }
   deinterlaceMode.store(mode, std::memory_order_relaxed);
   spdlog::info("setDeinterlace: {}", filter);
-  return mode == DeinterlaceMode::YADIF   ? "yadif"
-         : mode == DeinterlaceMode::BWDIF ? "bwdif"
-                                          : "none";
+  if (mode == DeinterlaceMode::YADIF) {
+    return "yadif";
+  }
+  if (mode == DeinterlaceMode::BWDIF) {
+    return "bwdif";
+  }
+  return "none";
 }
 
 // 選択中の音声 AVStream。AVFormatContext の寿命内で動くスレッド
