@@ -1667,8 +1667,9 @@ const Page: NextPage = () => {
             position: absolute;
             top: 50%;
             left: 50%;
-            max-width: 100%;
-            max-height: 100%;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
             z-index: 1;
             visibility: ${activeCanvas === 'wasm' ? 'visible' : 'hidden'};
           `}
@@ -1689,8 +1690,9 @@ const Page: NextPage = () => {
             position: absolute;
             top: 50%;
             left: 50%;
-            max-width: 100%;
-            max-height: 100%;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
             z-index: 2;
           `}
           id="videoWC"

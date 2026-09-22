@@ -520,8 +520,10 @@ const Caption: React.FC<Props> = ({
         position: absolute;
         top: 50%;
         left: 50%;
-        max-width: 100%;
-        max-height: 100%;
+        width: 100%;
+        height: 100%;
+        /* 映像 canvas と同じ拡縮でないと字幕の位置がずれる。 */
+        object-fit: contain;
         transform: translate(-50%, -50%);
         z-index: 2;
       `}
