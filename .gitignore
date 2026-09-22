@@ -45,3 +45,5 @@ public/bs4k-sample.hevc
 # 配信物ではないので追跡しない。
 /public/wasm/include/
 /public/wasm/lib/
+# Debug ビルドの source map (数十MB になるためコミットしない)。
+/public/wasm/ts-live.wasm.map

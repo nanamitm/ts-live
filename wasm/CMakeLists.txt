@@ -148,7 +148,11 @@ target_link_options(ts-live PRIVATE
   )
 
 if("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
+  # ブラウザの DevTools が wasm のフレームを C++ の行に解決できるようにする。
+  # Release では付けない: .wasm.map は数十MB になり、public/wasm 以下の成果物は
+  # コミットしているため。
   target_link_options(ts-live PRIVATE
+    "-gsource-map"
     "SHELL:-s ASSERTIONS=2"
     "SHELL:-s EXCEPTION_DEBUG=1"
   )
@@ -161,3 +165,6 @@ endif()
 
 install(TARGETS ts-live DESTINATION .)
 install(FILES ${CMAKE_BINARY_DIR}/ts-live.wasm DESTINATION .)
+if("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
+  install(FILES ${CMAKE_BINARY_DIR}/ts-live.wasm.map DESTINATION .)
+endif()
