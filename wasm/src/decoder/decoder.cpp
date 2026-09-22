@@ -289,9 +289,30 @@ std::atomic<int> selectedAudioStreamIndex{0};
 std::atomic<int> currentAudioSampleRate{0};
 std::atomic<bool> streamsReady{false};
 
+// 用意済みの音声を捨てる。AudioWorklet には約1秒ぶんを積んであるので、
+// 捨てずに置くと設定を変えてもその時間だけ古い音が鳴り続ける。捨てたぶん音は
+// 途切れるが、切り替えは即座に効く。
+// (JS から呼ばれる = メインスレッドなので、ここで捨ててよい)
+static void dropPendingAudio() {
+  {
+    std::lock_guard<std::mutex> lock(audioFrameMtx);
+    while (!audioFrameQueue.empty()) {
+      AVFrame *frame = audioFrameQueue.front();
+      audioFrameQueue.pop_front();
+      av_frame_free(&frame);
+    }
+  }
+  clearAudioSamples();
+}
+
 void setDualMonoMode(int mode) {
-  //
-  dualMonoMode.store(mode, std::memory_order_relaxed);
+  if (dualMonoMode.exchange(mode, std::memory_order_relaxed) == mode) {
+    return;
+  }
+  spdlog::info("setDualMonoMode: {}", mode);
+  // デコード待ちのパケットは音声デコードスレッドが捨てる。ここで捨てるのは
+  // デコード済みの、まだ鳴っていない主音声(または副音声)ぶん。
+  dropPendingAudio();
 }
 
 // 再生速度。音声は atempo フィルタで伸縮し、映像は音声クロックに従うので
@@ -315,20 +336,8 @@ void setPlaybackRate(double rate) {
     return;
   }
   spdlog::info("setPlaybackRate: {}", rate);
-
-  // ここまでに用意した音声は前の速度のもの。AudioWorklet には約1秒ぶんを
-  // 積んであるので、捨てずに置くと新しい速度になるまでその時間だけ待たされる。
-  // 捨てたぶん再生位置は飛ぶが、切り替えは即座に効く。
-  // (JS から呼ばれる = メインスレッドなので、ここで捨ててよい)
-  {
-    std::lock_guard<std::mutex> lock(audioFrameMtx);
-    while (!audioFrameQueue.empty()) {
-      AVFrame *frame = audioFrameQueue.front();
-      audioFrameQueue.pop_front();
-      av_frame_free(&frame);
-    }
-  }
-  clearAudioSamples();
+  // ここまでに用意した音声は前の速度のもの。
+  dropPendingAudio();
 }
 
 // 逆テレシネ。NEVER=しない、FORCE=常にかける、AUTO=テレシネと判定したら。
