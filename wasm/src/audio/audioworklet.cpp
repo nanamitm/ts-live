@@ -68,15 +68,23 @@ void startAudioWorklet() {
       audioNode.connect(gainNode);
       gainNode.connect(audioContext.destination);
       console.log('AudioSetup OK');
-      Module['myAudio'] = {ctx: audioContext, node: audioNode, gain: gainNode};
+      // ここへ来るまでは非同期で、その間の setAudioGain() は鳴らす先が無い。
+      // 指定された音量は Module.myAudio.gainValue に控えてあるので、
+      // 作り直しで消さないよう引き継いでから反映する。
+      const pendingGain =
+          Module['myAudio'] && Module['myAudio']['gainValue'] !== undefined
+              ? Module['myAudio']['gainValue']
+              : 1.0;
+      Module['myAudio'] = {
+        ctx: audioContext,
+        node: audioNode,
+        gain: gainNode,
+        gainValue: pendingGain
+      };
       audioContext.resume();
       audioNode.port.onmessage = e => {Module.setBufferedAudioSamples(e.data)};
       console.log('latency', Module['myAudio']['ctx'].baseLatency);
-      if (Module.myAudio.gainValue === undefined) {
-        Module.myAudio.gainValue = 1.0;
-      }
-      Module.myAudio.gain.gain.setValueAtTime(Module.myAudio.gainValue,
-                                                Module.myAudio.ctx.currentTime);
+      gainNode.gain.setValueAtTime(pendingGain, audioContext.currentTime);
     })();
   }, scriptSource.c_str());
   // clang-format on
@@ -86,9 +94,18 @@ void setAudioGain(double val) {
   // clang-format off
   EM_ASM(
       {
-        if (Module.myAudio && Module.myAudio.gain)
-          Module.myAudio.gain.gain.setValueAtTime($0,
-                                                Module.myAudio.ctx.currentTime);
+        // AudioWorklet の用意は非同期なので、ここへ来た時点ではまだ
+        // gain が無いことがある (ページを開いた直後など)。指定された値を
+        // 控えておき、用意ができた時点で startAudioWorklet() が反映する。
+        // 控えないと、保存しておいた音量やミュートが初回だけ効かない。
+        if (!Module['myAudio']) {
+          Module['myAudio'] = {};
+        }
+        Module['myAudio']['gainValue'] = $0;
+        if (Module['myAudio']['gain']) {
+          Module['myAudio']['gain'].gain.setValueAtTime(
+              $0, Module['myAudio']['ctx'].currentTime);
+        }
       },
       val);
   // clang-format on
