@@ -7,6 +7,8 @@ export declare interface StatsData {
   AudioWorkletBufferSize: number
   InputBufferSize: number
   CaptionDataQueueSize: number
+  // 逆テレシネが有効なときだけ付く。そのフレームをテレシネとして扱ったか。
+  TelecineFlag?: boolean
 }
 
 // probe 後に WASM から通知される映像ストリーム情報。webCodecs は「実際に
@@ -63,6 +65,8 @@ export declare interface WasmModule extends EmscriptenModule {
   // WASM 経路の描画バッファ(= #video canvas)の解像度。表示している大きさを
   // デバイスピクセルで渡す。
   resizeSwapChain(width: number, height: number): void
+  // 逆テレシネ。0=しない, 1=常にかける, 2=テレシネと判定したときだけ。
+  setDetelecineMode(mode: number): void
   setTlvMode(isTlv: boolean): void
   setWebCodecsMode(enabled: boolean): void
   setVideoAuCallback(

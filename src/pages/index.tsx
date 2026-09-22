@@ -149,6 +149,12 @@ const Page: NextPage = () => {
   const [localMode, setLocalMode] = useLocalStorage<string>('tsplayerLocalMode', 'auto')
   const [playMode, setPlayMode] = useState<string>('live')
   const [dualMonoMode, setDualMonoMode] = useLocalStorage<number>('tsplayerDualMonoMode', 0)
+  // 逆テレシネ (0=しない, 1=常に, 2=自動)。インターレース解除と同じく WASM
+  // ソフトデコード経路にのみ効く。
+  const [detelecineMode, setDetelecineMode] = useLocalStorage<number>(
+    'tsplayerDetelecineMode',
+    0
+  )
   // インターレース解除の方式。WASM ソフトデコード経路にのみ効く。
   const [deinterlace, setDeinterlaceSetting] = useLocalStorage<string>(
     'tsplayerDeinterlace',
@@ -570,6 +576,12 @@ const Page: NextPage = () => {
       if (timer !== undefined) clearTimeout(timer)
     }
   }, [wasmMod])
+
+  useEffect(() => {
+    if (!wasmMod) return
+    if (detelecineMode === undefined) return
+    wasmMod.setDetelecineMode(detelecineMode)
+  }, [wasmMod, detelecineMode])
 
   useEffect(() => {
     if (!wasmMod) return
@@ -1479,6 +1491,32 @@ const Page: NextPage = () => {
               <MenuItem value="yadif">yadif</MenuItem>
               <MenuItem value="bwdif">bwdif (やや軽い)</MenuItem>
               <MenuItem value="none">なし</MenuItem>
+            </Select>
+          </FormControl>
+          <FormControl
+            fullWidth
+            css={css`
+              margin-top: 24px;
+              width: 100%;
+            `}
+          >
+            <InputLabel id="detelecine-label">逆テレシネ</InputLabel>
+            <Select
+              css={css`
+                width: 100%;
+              `}
+              label="逆テレシネ"
+              labelId="detelecine-label"
+              value={detelecineMode ?? 0}
+              onChange={ev => {
+                if (typeof ev.target.value === 'number') {
+                  setDetelecineMode(ev.target.value)
+                }
+              }}
+            >
+              <MenuItem value={0}>しない</MenuItem>
+              <MenuItem value={2}>自動 (フィルム素材を判定)</MenuItem>
+              <MenuItem value={1}>常にかける</MenuItem>
             </Select>
           </FormControl>
           <FormGroup>

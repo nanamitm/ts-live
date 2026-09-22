@@ -3,6 +3,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <emscripten/bind.h>
@@ -22,6 +23,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/log.h>
@@ -198,6 +200,12 @@ bool videoAuDropUntilKey = false;
 // アトミックにしてある。
 std::atomic<double> currentAudioPlaybackTime{-1.0};
 
+// 表示判定をずらす量(秒)と、直前に表示したフレームの PTS (メインスレッド専用)。
+double videoPtsAdjustment = 0;
+double lastShownVideoPtsTime = -1;
+// 直近のフレームをテレシネとして扱ったか (統計表示用)。
+bool telecineFlag = false;
+
 // 音声クロックの平滑化の内部状態 (メインスレッド専用)。
 double smoothedAudioPlayTime = -1.0;
 std::chrono::steady_clock::time_point smoothedAudioPlayTimeAt;
@@ -266,6 +274,23 @@ std::atomic<bool> streamsReady{false};
 void setDualMonoMode(int mode) {
   //
   dualMonoMode.store(mode, std::memory_order_relaxed);
+}
+
+// 逆テレシネ。NEVER=しない、FORCE=常にかける、AUTO=テレシネと判定したら。
+enum DetelecineMode {
+  DETELECINE_NEVER = 0,
+  DETELECINE_FORCE = 1,
+  DETELECINE_AUTO = 2
+};
+std::atomic<int> detelecineMode{DETELECINE_NEVER};
+
+void setDetelecineMode(int mode) {
+  if (mode < DETELECINE_NEVER || mode > DETELECINE_AUTO) {
+    spdlog::error("setDetelecineMode() unsupported mode: {}", mode);
+    return;
+  }
+  detelecineMode.store(mode, std::memory_order_relaxed);
+  spdlog::info("setDetelecineMode: {}", mode);
 }
 
 // インターレース解除の方式。メインループ(描画)だけが読むが、設定は JS から
@@ -575,6 +600,9 @@ void reset() {
   currentPlaybackPtsTime = -1;
   // 音声クロックの平滑化も基準を捨てる。
   smoothedAudioPlayTime = -1.0;
+  // 表示判定のずらし量も、次の再生の最初のフレームで取り直す。
+  videoPtsAdjustment = 0;
+  lastShownVideoPtsTime = -1;
   // read_packet で待っているデコードスレッドを起こす。
   std::lock_guard<std::mutex> lock(inputBufferMtx);
   waitCv.notify_all();
@@ -781,6 +809,77 @@ static int dropUndisplayedVideoFrames(double playTime) {
   return dropped;
 }
 
+// テレシネ(2-3プルダウン)の周期を推定し、結果をフレームのメタデータに残す。
+// 変換スレッドから、表示順に並んだ yuv420p のフレームに対して呼ぶこと。
+//
+// vf_idet 相当のことを目的に絞って自前でやる。上下フィールドそれぞれについて
+// 前フレームとの差分絶対値和を取り、「片方のフィールドだけがほぼ変化していない」
+// = フィールドの繰り返しがあった、とみなして 5 フレーム周期のどこで起きたかを
+// 数える。判定の重みは変化の大きさ(静止画では当てにならないので)に応じる。
+static void detectTelecine(AVFrame *frame, AVFrame *&prevFrame,
+                           double (&telecineDetectCounts)[5], int &frameCount) {
+  if (prevFrame && frame->width == prevFrame->width &&
+      frame->height == prevFrame->height) {
+    int64_t topDiff = 0;
+    int64_t bottomDiff = 0;
+    for (int i = 0; i < 3; i++) {
+      // 周期の推測が目的なので、フレームごとに半分の行だけ見て済ませる
+      int odd = frameCount % 2;
+      int w = frame->width / (i ? 2 : 1);
+      int h = frame->height / (i ? 2 : 1) / (2 - odd);
+      for (int y = h / 2 * odd; y < h; y++) {
+        const uint8_t *prev = prevFrame->data[i] + y * prevFrame->linesize[i];
+        const uint8_t *cur = frame->data[i] + y * frame->linesize[i];
+        int sad = 0;
+        for (int x = 0; x < w; x++) {
+          sad += std::abs((int)cur[x] - (int)prev[x]);
+        }
+        (y % 2 ? bottomDiff : topDiff) += sad;
+      }
+    }
+
+    // 前後フレームが最も変化したときに概ね 1 になるような値
+    double reliability = std::max(topDiff, bottomDiff) /
+                         (0.5 * 0.5 * 1.5 * 255 * frame->width * frame->height);
+    // じゅうぶん変化していると判断するしきい値を定めてこれを信頼度とする
+    reliability = std::min(reliability, 0.01) * 100;
+    if (bottomDiff > 3 * topDiff) {
+      // repeated-top
+      telecineDetectCounts[frameCount % 5] += reliability;
+    } else if (topDiff > 3 * bottomDiff) {
+      // repeated-bottom
+      telecineDetectCounts[(frameCount + 3) % 5] += reliability;
+    }
+    for (int i = 0; i < 5; i++) {
+      // 信頼度に応じて半減期を∞～30フレームとする。2^(-1/30)≒0.977
+      telecineDetectCounts[i] *= 1 - (1 - 0.977) * reliability;
+    }
+
+    // テレシネの周期を記録する
+    int cycleAdjust = 0;
+    for (int i = 0; i < 5; i++) {
+      if (telecineDetectCounts[i] > telecineDetectCounts[cycleAdjust]) {
+        cycleAdjust = i;
+      }
+    }
+    av_dict_set_int(&frame->metadata, "ts-live.frame_cycle",
+                    (frameCount + 5 - cycleAdjust) % 5, 0);
+
+    // テレシネっぽいかどうか記録する。
+    // 安定のために前回の判定によってしきい値を変える
+    if (telecineDetectCounts[cycleAdjust] >
+        (av_dict_get(prevFrame->metadata, "ts-live.is_telecine", nullptr, 0)
+             ? 1
+             : 4)) {
+      av_dict_set(&frame->metadata, "ts-live.is_telecine", "1", 0);
+    }
+    frameCount = (frameCount + 1) % 10;
+  }
+
+  av_frame_free(&prevFrame);
+  prevFrame = av_frame_clone(frame);
+}
+
 // 10bit→8bit 変換専用スレッド。videoConvertQueue から生フレームを取り出し、
 // 必要なら 8bit yuv420p に変換して videoFrameQueue へ送る。デコード・描画と
 // 並列に動くことで、各段が単独で実時間を維持できる。
@@ -791,6 +890,14 @@ void videoConvertThreadFunc(std::atomic<bool> &terminateFlag) {
   SwsContext *swsContext = nullptr;
   AVPixelFormat swsSrcFormat = AV_PIX_FMT_NONE;
   int swsWidth = 0, swsHeight = 0;
+
+  // テレシネ検出用。デコードスレッドではなくここでやるのは、10bit 素材が
+  // yuv420p に揃うのが変換後だから。
+  AVFrame *telecinePrevFrame = nullptr;
+  // 5 フレーム周期のどこに repeated-top があるか (idet と同じく半減期を使う)
+  double telecineDetectCounts[5] = {};
+  // 👆を参照するためのカウンタ
+  int telecineFrameCount = 0;
 
   while (!terminateFlag) {
     // 下流 (描画待ちの videoFrameQueue) が溜まっていたら抑制する。
@@ -865,12 +972,22 @@ void videoConvertThreadFunc(std::atomic<bool> &terminateFlag) {
     }
     av_frame_free(&raw);
 
+    if (detelecineMode.load(std::memory_order_relaxed) != DETELECINE_NEVER &&
+        (AVPixelFormat)outFrame->format == AV_PIX_FMT_YUV420P) {
+      detectTelecine(outFrame, telecinePrevFrame, telecineDetectCounts,
+                     telecineFrameCount);
+    } else if (telecinePrevFrame != nullptr) {
+      av_frame_free(&telecinePrevFrame);
+    }
+
     {
       std::lock_guard<std::mutex> lock(videoFrameMtx);
       videoFrameFound = true;
       videoFrameQueue.push_back(outFrame);
     }
   }
+
+  av_frame_free(&telecinePrevFrame);
 
   if (swsContext != nullptr) {
     sws_freeContext(swsContext);
@@ -1671,6 +1788,9 @@ void decoderMainloop() {
       std::lock_guard<std::mutex> lock(captionDataMtx);
       captionDataQueueSize = captionDataQueue.size();
     }
+    if (detelecineMode.load(std::memory_order_relaxed) != DETELECINE_NEVER) {
+      data.set("TelecineFlag", telecineFlag);
+    }
     data.set("CaptionDataQueueSize", captionDataQueueSize);
     statsBuffer.push_back(std::move(data));
     if (statsBuffer.size() >= 6) {
@@ -1759,7 +1879,10 @@ void decoderMainloop() {
       while (!videoFrameQueue.empty()) {
         AVFrame *head = videoFrameQueue.front();
         // まだ再生時刻に達していないフレームはキューに残す。
-        if (head->pts * av_q2d(head->time_base) >= estimatedAudioPlayTime) {
+        // videoPtsAdjustment のぶんずらすのは、表示されるのが「1つ前に
+        // 取り込んだフレーム」だから (yadif も passthru も cur を出す)。
+        if (head->pts * av_q2d(head->time_base) + videoPtsAdjustment >=
+            estimatedAudioPlayTime) {
           break;
         }
         videoFrameQueue.pop_front();
@@ -1776,14 +1899,52 @@ void decoderMainloop() {
       if (droppedFrames > 0) {
         spdlog::debug("dropped {} late video frames", droppedFrames);
       }
+
+      // このフレームが本来表示されるべき長さ。外れ値と不連続は捨てる。
+      double ptsTime = frameToShow->pts * av_q2d(frameToShow->time_base);
+      double frameDuration = 0;
+      if (lastShownVideoPtsTime >= 0) {
+        double diff = ptsTime - lastShownVideoPtsTime;
+        frameDuration = diff < 0 ? 0 : diff > 0.2 ? 0.2 : diff;
+      }
+      lastShownVideoPtsTime = ptsTime;
+
+      // 逆テレシネ: 5 フレームのうち重複している 1 枚を画面に出さないことで
+      // 24fps 相当に戻す。取り込み自体は行う (prev/cur/next を崩さないため)。
+      bool renderFlag = true;
+      telecineFlag = false;
+      const int detelecine = detelecineMode.load(std::memory_order_relaxed);
+      if (detelecine != DETELECINE_NEVER) {
+        AVDictionaryEntry *entry = av_dict_get(
+            frameToShow->metadata, "ts-live.frame_cycle", nullptr, 0);
+        if (entry != nullptr) {
+          telecineFlag =
+              detelecine == DETELECINE_FORCE ||
+              av_dict_get(frameToShow->metadata, "ts-live.is_telecine", nullptr,
+                          0) != nullptr;
+          if (telecineFlag) {
+            // 残る 4 枚が等間隔に出るよう、表示判定のずらし量を周期で変える
+            long cycle = strtol(entry->value, nullptr, 10);
+            videoPtsAdjustment =
+                frameDuration * ((cycle == 0 ? 5 : cycle * 2) - 8) / 8;
+            renderFlag = cycle != 1;
+          }
+        }
+      }
+      if (!telecineFlag) {
+        videoPtsAdjustment = -frameDuration;
+      }
+
       // 10bit→8bit 変換は映像デコーダースレッド側で済ませてあるので、
       // メインループ(=描画スレッド)は描画に専念する。ここで 4K の swscale を
       // やると描画レートが実時間を割り、映像が音声から遅れていく。
       const DeinterlaceMode mode =
           deinterlaceMode.load(std::memory_order_relaxed);
-      drawWebGpu(frameToShow, mode != DeinterlaceMode::NONE,
+      drawWebGpu(frameToShow, renderFlag, mode != DeinterlaceMode::NONE,
                  mode == DeinterlaceMode::BWDIF);
-      displayedFrameCount.fetch_add(1, std::memory_order_relaxed);
+      if (renderFlag) {
+        displayedFrameCount.fetch_add(1, std::memory_order_relaxed);
+      }
 
       av_frame_free(&frameToShow);
     }

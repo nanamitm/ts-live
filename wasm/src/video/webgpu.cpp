@@ -411,33 +411,15 @@ void initWebGpu() {
   createTextures(1920, 1080);
 }
 
-void drawWebGpu(AVFrame *frame, bool deinterlaceFlag, bool bwdifFlag) {
+// renderFlag が false のときはテクスチャの取り込みだけ行い、画面には出さない。
+// 逆テレシネで重複フレームを飛ばすときに使う。取り込み自体を飛ばすと
+// prev/cur/next の並びが崩れるので、スキップするのは描画だけ。
+void drawWebGpu(AVFrame *frame, bool renderFlag, bool deinterlaceFlag,
+                bool bwdifFlag) {
   if (frame->width != ctx.textureWidth || frame->height != ctx.textureHeight) {
     releaseTextures();
     createTextures(frame->width, frame->height);
   }
-
-  WGPUTextureView backBufView =
-      wgpuSwapChainGetCurrentTextureView(ctx.swapChain); // create textureView
-
-  WGPURenderPassColorAttachment colorDesc = {};
-  colorDesc.view = backBufView;
-  colorDesc.loadOp = WGPULoadOp_Clear;
-  colorDesc.storeOp = WGPUStoreOp_Store;
-  colorDesc.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
-  colorDesc.clearValue.r = 0.0f;
-  colorDesc.clearValue.g = 0.0f;
-  colorDesc.clearValue.b = 0.0f;
-  colorDesc.clearValue.a = 1.0f;
-
-  WGPUComputePassDescriptor compPassDesc = {};
-
-  WGPURenderPassDescriptor renderPassDesc = {};
-  renderPassDesc.colorAttachmentCount = 1;
-  renderPassDesc.colorAttachments = &colorDesc;
-
-  WGPUCommandEncoder encoder =
-      wgpuDeviceCreateCommandEncoder(ctx.device, nullptr); // create encoder
 
   WGPUExtent3D copySize = {
       .width = static_cast<uint32_t>(frame->width),
@@ -498,6 +480,32 @@ void drawWebGpu(AVFrame *frame, bool deinterlaceFlag, bool bwdifFlag) {
   wgpuQueueWriteTexture(ctx.queue, &copyTexture, frame->data[2],
                         (size_t)(frame->height / 2) * frame->linesize[2],
                         &textureDataLayoutV, &copySizeuv);
+
+  if (!renderFlag) {
+    return;
+  }
+
+  WGPUTextureView backBufView =
+      wgpuSwapChainGetCurrentTextureView(ctx.swapChain); // create textureView
+
+  WGPURenderPassColorAttachment colorDesc = {};
+  colorDesc.view = backBufView;
+  colorDesc.loadOp = WGPULoadOp_Clear;
+  colorDesc.storeOp = WGPUStoreOp_Store;
+  colorDesc.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+  colorDesc.clearValue.r = 0.0f;
+  colorDesc.clearValue.g = 0.0f;
+  colorDesc.clearValue.b = 0.0f;
+  colorDesc.clearValue.a = 1.0f;
+
+  WGPUComputePassDescriptor compPassDesc = {};
+
+  WGPURenderPassDescriptor renderPassDesc = {};
+  renderPassDesc.colorAttachmentCount = 1;
+  renderPassDesc.colorAttachments = &colorDesc;
+
+  WGPUCommandEncoder encoder =
+      wgpuDeviceCreateCommandEncoder(ctx.device, nullptr); // create encoder
 
   WGPUComputePassEncoder compPass =
       wgpuCommandEncoderBeginComputePass(encoder, &compPassDesc);

@@ -91,6 +91,7 @@ EMSCRIPTEN_BINDINGS(ts_live_module) {
   emscripten::function("setAudioGain", &setAudioGain);
   emscripten::function("setDualMonoMode", &setDualMonoMode);
   emscripten::function("setDeinterlace", &setDeinterlace);
+  emscripten::function("setDetelecineMode", &setDetelecineMode);
   emscripten::function("resizeSwapChain", &resizeSwapChain);
   emscripten::function("setTlvMode", &setTlvMode);
   emscripten::function("setWebCodecsMode", &setWebCodecsMode);

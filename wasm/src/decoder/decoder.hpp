@@ -16,6 +16,7 @@ bool isResetCompleted();
 void playFile(std::string url);
 void setDualMonoMode(int mode);
 std::string setDeinterlace(std::string filter);
+void setDetelecineMode(int mode);
 void setTlvMode(bool isTlv);
 void setWebCodecsMode(bool enabled);
 void setVideoAuCallback(emscripten::val callback);
