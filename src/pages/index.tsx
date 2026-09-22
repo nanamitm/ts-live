@@ -141,6 +141,11 @@ const Page: NextPage = () => {
   const [localMode, setLocalMode] = useLocalStorage<string>('tsplayerLocalMode', 'auto')
   const [playMode, setPlayMode] = useState<string>('live')
   const [dualMonoMode, setDualMonoMode] = useLocalStorage<number>('tsplayerDualMonoMode', 0)
+  // インターレース解除の方式。WASM ソフトデコード経路にのみ効く。
+  const [deinterlace, setDeinterlaceSetting] = useLocalStorage<string>(
+    'tsplayerDeinterlace',
+    'yadif'
+  )
   const [volume, setVolume] = useLocalStorage<number>('tsplayerVolume', 1.0)
   const [mute, setMute] = useLocalStorage<boolean>('tsplayerMute', false)
 
@@ -516,6 +521,17 @@ const Page: NextPage = () => {
     if (dualMonoMode === undefined) return
     wasmMod.setDualMonoMode(dualMonoMode)
   }, [wasmMod, dualMonoMode])
+
+  useEffect(() => {
+    if (!wasmMod) return
+    if (deinterlace === undefined) return
+    const applied = wasmMod.setDeinterlace(deinterlace)
+    if (applied !== deinterlace) {
+      // 未対応の値が保存されていた場合。実際に適用された方式へ戻す。
+      console.warn('setDeinterlace:', deinterlace, '->', applied)
+      setDeinterlaceSetting(applied)
+    }
+  }, [wasmMod, deinterlace, setDeinterlaceSetting])
 
   useEffect(() => {
     if (!wasmMod) return
@@ -1387,6 +1403,32 @@ const Page: NextPage = () => {
             >
               <MenuItem value={0}>主</MenuItem>
               <MenuItem value={1}>副</MenuItem>
+            </Select>
+          </FormControl>
+          <FormControl
+            fullWidth
+            css={css`
+              margin-top: 24px;
+              width: 100%;
+            `}
+          >
+            <InputLabel id="deinterlace-label">インターレース解除</InputLabel>
+            <Select
+              css={css`
+                width: 100%;
+              `}
+              label="インターレース解除"
+              labelId="deinterlace-label"
+              value={deinterlace ?? 'yadif'}
+              onChange={ev => {
+                if (typeof ev.target.value === 'string') {
+                  setDeinterlaceSetting(ev.target.value)
+                }
+              }}
+            >
+              <MenuItem value="yadif">yadif</MenuItem>
+              <MenuItem value="bwdif">bwdif (やや軽い)</MenuItem>
+              <MenuItem value="none">なし</MenuItem>
             </Select>
           </FormControl>
           <FormGroup>

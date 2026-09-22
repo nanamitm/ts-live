@@ -19,9 +19,13 @@ struct WebGPUContext {
   WGPUDevice device = nullptr;
   WGPUSwapChain swapChain = nullptr;
   WGPUQueue queue = nullptr;
-  WGPUComputePipeline yadifPipeline = nullptr;
+  // インターレース解除フィルタ。どれも同じバインドグループレイアウトなので、
+  // パイプラインだけ差し替えて使う。
+  WGPUComputePipeline passthruPipeline = nullptr, yadifPipeline = nullptr,
+                      bwdifPipeline = nullptr;
   WGPURenderPipeline pipeline = nullptr;
-  WGPUBindGroupLayout yadifBindGroupLayout = nullptr, bindGroupLayout = nullptr;
+  WGPUBindGroupLayout filterBindGroupLayout = nullptr,
+                      bindGroupLayout = nullptr;
   // prev/cur/next は 3 枚を使い回す。毎フレーム next->cur->prev とコピーする
   // 代わりに、書き込む先を 1 枚ずつずらして、どれが prev/cur/next かを
   // バインドグループ側で表す (textureRotation が今 next にあたる添字)。
@@ -30,7 +34,7 @@ struct WebGPUContext {
   WGPUTextureView viewY[3] = {}, viewU[3] = {}, viewV[3] = {};
   WGPUTexture frameTexture = nullptr;
   WGPUTextureView frameView = nullptr;
-  WGPUBindGroup yadifBindGroup[3] = {}, bindGroup = nullptr;
+  WGPUBindGroup filterBindGroup[3] = {}, bindGroup = nullptr;
   WGPUSampler sampler = nullptr;
 };
 
@@ -70,9 +74,9 @@ static void releaseTextures() {
   wgpuTextureRelease(ctx.frameTexture);
 
   for (int i = 0; i < 3; i++) {
-    if (ctx.yadifBindGroup[i] != nullptr) {
-      wgpuBindGroupRelease(ctx.yadifBindGroup[i]);
-      ctx.yadifBindGroup[i] = nullptr;
+    if (ctx.filterBindGroup[i] != nullptr) {
+      wgpuBindGroupRelease(ctx.filterBindGroup[i]);
+      ctx.filterBindGroup[i] = nullptr;
     }
   }
   if (ctx.bindGroup != nullptr) {
@@ -150,7 +154,7 @@ static void createTextures(int width, int height) {
   // 書き込み先を 1 枚ずつずらすので、rotation ごとに prev/cur/next の割り当てが
   // 変わる。バインドグループは 3 通りを作り置きしておき、描画時に選ぶ。
   for (int i = 0; i < 3; i++) {
-    WGPUBindGroupEntry yadifEntries[] = {
+    WGPUBindGroupEntry filterEntries[] = {
         {.binding = 0, .sampler = ctx.sampler},
         {.binding = 1, .textureView = ctx.frameView},
         {.binding = 2, .textureView = ctx.viewY[(i + 2) % 3]}, // cur
@@ -163,11 +167,12 @@ static void createTextures(int width, int height) {
         {.binding = 9, .textureView = ctx.viewU[i]},
         {.binding = 10, .textureView = ctx.viewV[i]},
     };
-    WGPUBindGroupDescriptor yadifBgDesc = {};
-    yadifBgDesc.layout = ctx.yadifBindGroupLayout;
-    yadifBgDesc.entryCount = sizeof(yadifEntries) / sizeof(yadifEntries[0]);
-    yadifBgDesc.entries = yadifEntries;
-    ctx.yadifBindGroup[i] = wgpuDeviceCreateBindGroup(ctx.device, &yadifBgDesc);
+    WGPUBindGroupDescriptor filterBgDesc = {};
+    filterBgDesc.layout = ctx.filterBindGroupLayout;
+    filterBgDesc.entryCount = sizeof(filterEntries) / sizeof(filterEntries[0]);
+    filterBgDesc.entries = filterEntries;
+    ctx.filterBindGroup[i] =
+        wgpuDeviceCreateBindGroup(ctx.device, &filterBgDesc);
   }
 
   WGPUBindGroupEntry bgEntries[] = {
@@ -192,12 +197,20 @@ static void createPipeline() {
   std::string fragWgsl =
 #include "shaders/simple.frag.wgsl"
       ;
+  std::string passthruWgsl =
+#include "shaders/passthru.compute.wgsl"
+      ;
   std::string yadifWgsl =
 #include "shaders/yadif.frag.wgsl"
+      ;
+  std::string bwdifWgsl =
+#include "shaders/bwdif.compute.wgsl"
       ;
 
   WGPUShaderModule vertMod = createShader(vertWgsl.c_str());
   WGPUShaderModule fragMod = createShader(fragWgsl.c_str());
+  WGPUShaderModule passthruMod = createShader(passthruWgsl.c_str());
+  WGPUShaderModule bwdifMod = createShader(bwdifWgsl.c_str());
   WGPUShaderModule yadifMod = createShader(yadifWgsl.c_str());
 
   WGPUSamplerBindingLayout samplerLayout = {};
@@ -252,7 +265,7 @@ static void createPipeline() {
   WGPUBindGroupLayoutDescriptor bglDesc = {};
   bglDesc.entryCount = sizeof(bglEntries) / sizeof(bglEntries[0]);
   bglDesc.entries = bglEntries;
-  ctx.yadifBindGroupLayout =
+  ctx.filterBindGroupLayout =
       wgpuDeviceCreateBindGroupLayout(ctx.device, &bglDesc);
 
   bglEntries[1] = {
@@ -266,8 +279,8 @@ static void createPipeline() {
 
   WGPUPipelineLayoutDescriptor layoutDesc = {};
   layoutDesc.bindGroupLayoutCount = 1;
-  layoutDesc.bindGroupLayouts = &ctx.yadifBindGroupLayout;
-  WGPUPipelineLayout yadifPipelineLayout =
+  layoutDesc.bindGroupLayouts = &ctx.filterBindGroupLayout;
+  WGPUPipelineLayout filterPipelineLayout =
       wgpuDeviceCreatePipelineLayout(ctx.device, &layoutDesc);
 
   layoutDesc.bindGroupLayouts = &ctx.bindGroupLayout;
@@ -313,17 +326,21 @@ static void createPipeline() {
 
   ctx.pipeline = wgpuDeviceCreateRenderPipeline(ctx.device, &desc);
 
-  WGPUProgrammableStageDescriptor compStageDesc = {
-      .module = yadifMod,
-      .entryPoint = "main",
+  const auto createFilterPipeline = [&](WGPUShaderModule module) {
+    WGPUProgrammableStageDescriptor compStageDesc = {
+        .module = module,
+        .entryPoint = "main",
+    };
+    WGPUComputePipelineDescriptor compDesc = {.layout = filterPipelineLayout,
+                                              .compute = compStageDesc};
+    return wgpuDeviceCreateComputePipeline(ctx.device, &compDesc);
   };
-  WGPUComputePipelineDescriptor compDesc = {.layout = yadifPipelineLayout,
-                                            .compute = compStageDesc};
-
-  ctx.yadifPipeline = wgpuDeviceCreateComputePipeline(ctx.device, &compDesc);
+  ctx.passthruPipeline = createFilterPipeline(passthruMod);
+  ctx.yadifPipeline = createFilterPipeline(yadifMod);
+  ctx.bwdifPipeline = createFilterPipeline(bwdifMod);
 
   // partial clean-up (just move to the end, no?)
-  wgpuPipelineLayoutRelease(yadifPipelineLayout);
+  wgpuPipelineLayoutRelease(filterPipelineLayout);
   wgpuPipelineLayoutRelease(pipelineLayout);
 
   wgpuShaderModuleRelease(fragMod);
@@ -361,7 +378,7 @@ void initWebGpu() {
   createTextures(1920, 1080);
 }
 
-void drawWebGpu(AVFrame *frame) {
+void drawWebGpu(AVFrame *frame, bool deinterlaceFlag, bool bwdifFlag) {
   if (frame->width != ctx.textureWidth || frame->height != ctx.textureHeight) {
     releaseTextures();
     createTextures(frame->width, frame->height);
@@ -451,9 +468,12 @@ void drawWebGpu(AVFrame *frame) {
 
   WGPUComputePassEncoder compPass =
       wgpuCommandEncoderBeginComputePass(encoder, &compPassDesc);
-  wgpuComputePassEncoderSetPipeline(compPass, ctx.yadifPipeline);
+  wgpuComputePassEncoderSetPipeline(compPass, !deinterlaceFlag
+                                                  ? ctx.passthruPipeline
+                                              : bwdifFlag ? ctx.bwdifPipeline
+                                                          : ctx.yadifPipeline);
   wgpuComputePassEncoderSetBindGroup(
-      compPass, 0, ctx.yadifBindGroup[ctx.textureRotation], 0, 0);
+      compPass, 0, ctx.filterBindGroup[ctx.textureRotation], 0, 0);
   // 1 invocation が輝度 2x2 画素を処理し、ワークグループは 16x4。切り捨てで
   // 割ると幅/高さが端数のとき右端・下端が処理されないため切り上げる (範囲外
   // の textureStore は WGSL 仕様上無視される)。

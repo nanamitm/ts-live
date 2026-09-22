@@ -56,6 +56,10 @@ export declare interface WasmModule extends EmscriptenModule {
   isResetCompleted(): boolean
   setAudioGain(volume: number): void
   setDualMonoMode(mode: number): void
+  // インターレース解除の方式を 'yadif' | 'bwdif' | 'none' で指定し、実際に
+  // 適用された方式を返す (WASM ソフトデコード経路のみ。WebCodecs 経路の映像は
+  // ブラウザ側でデコード・表示するのでこの設定は効かない)。
+  setDeinterlace(filter: string): string
   setTlvMode(isTlv: boolean): void
   setWebCodecsMode(enabled: boolean): void
   setVideoAuCallback(

@@ -268,6 +268,31 @@ void setDualMonoMode(int mode) {
   dualMonoMode.store(mode, std::memory_order_relaxed);
 }
 
+// インターレース解除の方式。メインループ(描画)だけが読むが、設定は JS から
+// 来るのでアトミックにしておく。
+enum class DeinterlaceMode { NONE, YADIF, BWDIF };
+std::atomic<DeinterlaceMode> deinterlaceMode{DeinterlaceMode::YADIF};
+
+// 指定した方式を適用し、実際に適用された方式の名前を返す。名前は ffmpeg の
+// フィルタ指定に合わせてあり、未対応の指定は無視して現在の設定を返す。
+std::string setDeinterlace(std::string filter) {
+  DeinterlaceMode mode = deinterlaceMode.load(std::memory_order_relaxed);
+  if (filter == "none") {
+    mode = DeinterlaceMode::NONE;
+  } else if (!filter.compare(0, 5, "yadif") &&
+             (filter.size() == 5 || filter[5] == '=')) {
+    mode = DeinterlaceMode::YADIF;
+  } else if (!filter.compare(0, 5, "bwdif") &&
+             (filter.size() == 5 || filter[5] == '=')) {
+    mode = DeinterlaceMode::BWDIF;
+  }
+  deinterlaceMode.store(mode, std::memory_order_relaxed);
+  spdlog::info("setDeinterlace: {}", filter);
+  return mode == DeinterlaceMode::YADIF   ? "yadif"
+         : mode == DeinterlaceMode::BWDIF ? "bwdif"
+                                          : "none";
+}
+
 // 選択中の音声 AVStream。AVFormatContext の寿命内で動くスレッド
 // (デマルチプレクス/音声デコード) からのみ呼ぶこと。メインループから呼ぶと
 // リセットと競合して解放済みメモリを読む。呼び出し側で audioStreamList が
@@ -1750,7 +1775,10 @@ void decoderMainloop() {
       // 10bit→8bit 変換は映像デコーダースレッド側で済ませてあるので、
       // メインループ(=描画スレッド)は描画に専念する。ここで 4K の swscale を
       // やると描画レートが実時間を割り、映像が音声から遅れていく。
-      drawWebGpu(frameToShow);
+      const DeinterlaceMode mode =
+          deinterlaceMode.load(std::memory_order_relaxed);
+      drawWebGpu(frameToShow, mode != DeinterlaceMode::NONE,
+                 mode == DeinterlaceMode::BWDIF);
       displayedFrameCount.fetch_add(1, std::memory_order_relaxed);
 
       av_frame_free(&frameToShow);
