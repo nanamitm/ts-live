@@ -77,6 +77,10 @@ export declare interface WasmModule extends EmscriptenModule {
   resizeSwapChain(width: number, height: number): void
   // 逆テレシネ。0=しない, 1=常にかける, 2=テレシネと判定したときだけ。
   setDetelecineMode(mode: number): void
+  // 再生速度 (0.1〜100)。音声を伸縮し、映像は音声クロックに従う。0.5 未満は
+  // 音が出ない (無音で引き伸ばす)。ライブでは供給が実時間なので 1.0 より速く
+  // すると足りなくなる。
+  setPlaybackRate(rate: number): void
   // サムネイル用のフレーム取得。再生系とは独立した状態を持つので再生中でも
   // 使える。入力は MPEG-2 の生ES のみ (TS/TLV コンテナは不可)。
   // getGrabberInputBuffer() が返すビューへ書いてから grabFirstFrame() を呼ぶ。

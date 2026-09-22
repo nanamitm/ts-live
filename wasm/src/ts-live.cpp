@@ -93,6 +93,7 @@ EMSCRIPTEN_BINDINGS(ts_live_module) {
   emscripten::function("setDualMonoMode", &setDualMonoMode);
   emscripten::function("setDeinterlace", &setDeinterlace);
   emscripten::function("setDetelecineMode", &setDetelecineMode);
+  emscripten::function("setPlaybackRate", &setPlaybackRate);
   emscripten::function("getGrabberInputBuffer", &getGrabberInputBuffer);
   emscripten::function("grabFirstFrame", &grabFirstFrame);
   emscripten::function("resizeSwapChain", &resizeSwapChain);

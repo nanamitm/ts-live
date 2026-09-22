@@ -80,6 +80,13 @@ set(FFMPEG_CONFIGURE_COMMAND_LIST
     --disable-protocols
     --disable-devices
     --disable-filters
+    # 倍速再生 (atempo)。aformat/aresample はリサンプルと
+    # ステレオ化のために必要。
+    --enable-filter=abuffer
+    --enable-filter=abuffersink
+    --enable-filter=aformat
+    --enable-filter=aresample
+    --enable-filter=atempo
 )
 list(JOIN FFMPEG_CONFIGURE_COMMAND_LIST " " FFMPEG_CONFIGURE_COMMAND)
 

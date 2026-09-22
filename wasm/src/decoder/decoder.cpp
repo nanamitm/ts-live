@@ -14,15 +14,21 @@
 #include <emscripten/val.h>
 #include <mutex>
 #include <spdlog/spdlog.h>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "../audio/audioworklet.hpp"
 #include "../video/webgpu.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
+#include <libavutil/bprint.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/dict.h>
 #include <libavutil/error.h>
@@ -277,6 +283,27 @@ std::atomic<bool> streamsReady{false};
 void setDualMonoMode(int mode) {
   //
   dualMonoMode.store(mode, std::memory_order_relaxed);
+}
+
+// 再生速度。音声は atempo フィルタで伸縮し、映像は音声クロックに従うので
+// 自動的についてくる。targetAudioTempo は JS から、currentAudioTempo は
+// 音声デコードスレッドが実際に適用した値。
+std::atomic<double> targetAudioTempo{1.0};
+std::atomic<double> currentAudioTempo{1.0};
+
+// atempo の対応範囲は [0.5, 100]。0.5 未満は「範囲内に収まる倍率で atempo を
+// かけ、足りない分は無音を水増しして引き伸ばす」ことで実現する (音は出ない)。
+static int audioTempoDivisor(double tempo) {
+  return tempo < 0.5 ? (int)(1 / tempo) : 1;
+}
+
+void setPlaybackRate(double rate) {
+  if (!(rate >= 0.1 && rate <= 100.0)) {
+    spdlog::error("setPlaybackRate() out of range [0.1 - 100]: {}", rate);
+    return;
+  }
+  targetAudioTempo.store(rate, std::memory_order_relaxed);
+  spdlog::info("setPlaybackRate: {}", rate);
 }
 
 // 逆テレシネ。NEVER=しない、FORCE=常にかける、AUTO=テレシネと判定したら。
@@ -1020,6 +1047,60 @@ void videoConvertThreadFunc(std::atomic<bool> &terminateFlag) {
   }
 }
 
+// 音声を伸縮するフィルタグラフを作る。出力は常に 48000Hz/fltp/stereo。
+// 失敗したら nullptr (呼び出し側は素通しに戻す)。
+static AVFilterGraph *
+allocAudioFilterGraph(double tempo, int sampleRate, AVSampleFormat format,
+                      const AVChannelLayout &chLayout,
+                      AVFilterContext *&abufferContext,
+                      AVFilterContext *&abuffersinkContext) {
+  const AVFilter *abuffer = avfilter_get_by_name("abuffer");
+  const AVFilter *abuffersink = avfilter_get_by_name("abuffersink");
+  const AVFilter *aformat = avfilter_get_by_name("aformat");
+  const AVFilter *atempo = avfilter_get_by_name("atempo");
+  if (!abuffer || !abuffersink || !aformat || !atempo) {
+    spdlog::error("audio filter not found");
+    return nullptr;
+  }
+  AVFilterGraph *graph = avfilter_graph_alloc();
+  if (!graph) {
+    return nullptr;
+  }
+
+  AVFilterContext *aformatContext;
+  AVBPrint desc;
+  av_bprint_init(&desc, 0, AV_BPRINT_SIZE_UNLIMITED);
+  if (av_channel_layout_describe_bprint(&chLayout, &desc) < 0) {
+    av_bprint_finalize(&desc, nullptr);
+  } else {
+    std::string args =
+        fmt::format("sample_rate={}:sample_fmt={}:channel_layout={}",
+                    sampleRate, av_get_sample_fmt_name(format), desc.str);
+    av_bprint_finalize(&desc, nullptr);
+    if (avfilter_graph_create_filter(&abufferContext, abuffer, "af_in",
+                                     args.c_str(), nullptr, graph) >= 0 &&
+        avfilter_graph_create_filter(&abuffersinkContext, abuffersink, "af_out",
+                                     nullptr, nullptr, graph) >= 0 &&
+        avfilter_graph_create_filter(
+            &aformatContext, aformat, "af_format",
+            "sample_rates=48000:sample_fmts=fltp:channel_layouts=stereo",
+            nullptr, graph) >= 0) {
+      AVFilterContext *atempoContext;
+      if (avfilter_graph_create_filter(&atempoContext, atempo, "af_tempo",
+                                       fmt::format("{}", tempo).c_str(),
+                                       nullptr, graph) >= 0 &&
+          avfilter_link(abufferContext, 0, atempoContext, 0) >= 0 &&
+          avfilter_link(atempoContext, 0, aformatContext, 0) >= 0 &&
+          avfilter_link(aformatContext, 0, abuffersinkContext, 0) >= 0 &&
+          avfilter_graph_config(graph, nullptr) >= 0) {
+        return graph;
+      }
+    }
+  }
+  avfilter_graph_free(&graph);
+  return nullptr;
+}
+
 // 指定した音声ストリーム用にデコーダを開き直す。主/副の切替時に呼ぶ。
 static bool openAudioDecoder(AVStream *stream) {
   if (audioCodecContext != nullptr) {
@@ -1068,6 +1149,18 @@ void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
     avcodec_free_context(&audioCodecContext);
     return;
   }
+
+  // 等速のときはフィルタを通さず、今までどおりそのままキューへ積む。
+  // 倍速のときだけ atempo のグラフを通し、48000Hz/fltp/stereo に揃えて積む
+  // (メインループはそのまま AudioWorklet へ流せる)。
+  double graphTempo = 1.0;
+  int graphSampleRate = 0;
+  int graphFormat = -1;
+  AVChannelLayout graphChLayout = {};
+  AVFilterGraph *filterGraph = nullptr;
+  AVFilterContext *abufferContext = nullptr;
+  AVFilterContext *abuffersinkContext = nullptr;
+  AVFrame *filtFrame = av_frame_alloc();
 
   while (!terminateFlag) {
     // 主/副が切り替わったらそのストリーム用にデコーダを開き直す。積んである
@@ -1128,14 +1221,69 @@ void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
       // 立たない。この場合は音声がクロックの基準になるので、映像を待たずに
       // 積む。
       if (videoFrameFound || webCodecsMode) {
-        AVFrame *cloneFrame = av_frame_clone(frame);
-        std::lock_guard<std::mutex> lock(audioFrameMtx);
-        audioFrameQueue.push_back(cloneFrame);
+        // 速度が変わったか、音声の形式が変わったらグラフを作り直す
+        // (主/副の切替でも形式は変わり得る)。
+        double tempo = targetAudioTempo.load(std::memory_order_relaxed);
+        double appliedTempo = tempo * audioTempoDivisor(tempo);
+        if (graphTempo != tempo || graphSampleRate != frame->sample_rate ||
+            graphFormat != frame->format ||
+            av_channel_layout_compare(&graphChLayout, &frame->ch_layout) != 0) {
+          graphTempo = tempo;
+          graphSampleRate = frame->sample_rate;
+          graphFormat = frame->format;
+          av_channel_layout_copy(&graphChLayout, &frame->ch_layout);
+          avfilter_graph_free(&filterGraph);
+          if (appliedTempo != 1.0) {
+            filterGraph = allocAudioFilterGraph(
+                appliedTempo, graphSampleRate, (AVSampleFormat)graphFormat,
+                graphChLayout, abufferContext, abuffersinkContext);
+            if (filterGraph == nullptr) {
+              spdlog::error("allocAudioFilterGraph({}) failed", appliedTempo);
+            }
+          }
+          // appliedTempo が 1.0 になる倍率 (0.25 など) では atempo が要らない。
+          // グラフを作れなかったときだけ等速に戻す (でないと時計がずれる)。
+          const bool tempoOk = appliedTempo == 1.0 || filterGraph != nullptr;
+          currentAudioTempo.store(tempoOk ? tempo : 1.0,
+                                  std::memory_order_relaxed);
+          // フィルタを通すと 48000Hz になる。音声クロックの計算に使う。
+          currentAudioSampleRate.store(filterGraph != nullptr ? 48000
+                                                              : graphSampleRate,
+                                       std::memory_order_relaxed);
+        }
+
+        if (filterGraph != nullptr) {
+          // PTS はそのままで、サンプル数だけを増減させる。
+          int64_t pts = frame->pts;
+          int filtRet = av_buffersrc_add_frame(abufferContext, frame);
+          if (filtRet < 0) {
+            spdlog::error("av_buffersrc_add_frame(audio) failed: {} {}",
+                          filtRet, av_err2str(filtRet));
+          } else {
+            while (av_buffersink_get_frame(abuffersinkContext, filtFrame) >=
+                   0) {
+              filtFrame->pts = pts;
+              filtFrame->time_base = openedStream->time_base;
+              AVFrame *cloneFrame = av_frame_clone(filtFrame);
+              av_frame_unref(filtFrame);
+              std::lock_guard<std::mutex> lock(audioFrameMtx);
+              audioFrameQueue.push_back(cloneFrame);
+            }
+          }
+        } else {
+          AVFrame *cloneFrame = av_frame_clone(frame);
+          std::lock_guard<std::mutex> lock(audioFrameMtx);
+          audioFrameQueue.push_back(cloneFrame);
+        }
       }
     }
     av_packet_free(&ppacket);
   }
   av_frame_free(&frame);
+  av_frame_free(&filtFrame);
+  avfilter_graph_free(&filterGraph);
+  av_channel_layout_uninit(&graphChLayout);
+  currentAudioTempo.store(1.0, std::memory_order_relaxed);
   spdlog::debug("freeing audioCodecContext");
   if (audioCodecContext != nullptr) {
     avcodec_free_context(&audioCodecContext);
@@ -1665,7 +1813,9 @@ static double estimateAudioPlayTime(const AVFrame *audioFrame,
   if (sampleRate <= 0) {
     return audioPtsTime;
   }
-  return audioPtsTime - (double)bufferedSamples / sampleRate;
+  // 倍速中はサンプル 1 つが tempo 倍のメディア時間に相当する。
+  double tempo = currentAudioTempo.load(std::memory_order_relaxed);
+  return audioPtsTime - (double)bufferedSamples * tempo / sampleRate;
 }
 
 // 再生時刻を PTS の進みぶんだけ進める。メインスレッドからのみ呼ぶ。
@@ -2056,6 +2206,22 @@ void decoderMainloop() {
     if (frame->sample_rate <= 0 || inChannels <= 0) {
       spdlog::warn("skip audio frame: sample_rate:{} channels:{}",
                    frame->sample_rate, inChannels);
+      av_frame_free(&frame);
+      continue;
+    }
+
+    // 0.5 倍未満は atempo の範囲外。範囲に収まるぶんはフィルタで伸ばし、
+    // 残りはここで無音を水増しして引き伸ばす (音は出ないが映像は追従する)。
+    const int tempoDiv =
+        audioTempoDivisor(currentAudioTempo.load(std::memory_order_relaxed));
+    if (tempoDiv > 1) {
+      static std::vector<float> silence;
+      if ((int)silence.size() < frame->nb_samples) {
+        silence.assign(frame->nb_samples, 0.0f);
+      }
+      for (int i = 0; i < tempoDiv; i++) {
+        feedAudioData(silence.data(), silence.data(), frame->nb_samples);
+      }
       av_frame_free(&frame);
       continue;
     }

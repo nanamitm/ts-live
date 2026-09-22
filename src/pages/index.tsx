@@ -149,6 +149,9 @@ const Page: NextPage = () => {
   const [localMode, setLocalMode] = useLocalStorage<string>('tsplayerLocalMode', 'auto')
   const [playMode, setPlayMode] = useState<string>('live')
   const [dualMonoMode, setDualMonoMode] = useLocalStorage<number>('tsplayerDualMonoMode', 0)
+  // 再生速度。ライブで速くすると供給が追いつかないので、保存はせず毎回 1.0
+  // から始める。
+  const [playbackRate, setPlaybackRate] = useState<number>(1.0)
   // 逆テレシネ (0=しない, 1=常に, 2=自動)。インターレース解除と同じく WASM
   // ソフトデコード経路にのみ効く。
   const [detelecineMode, setDetelecineMode] = useLocalStorage<number>(
@@ -577,6 +580,11 @@ const Page: NextPage = () => {
       if (timer !== undefined) clearTimeout(timer)
     }
   }, [wasmMod])
+
+  useEffect(() => {
+    if (!wasmMod) return
+    wasmMod.setPlaybackRate(playbackRate)
+  }, [wasmMod, playbackRate])
 
   useEffect(() => {
     if (!wasmMod) return
@@ -1520,6 +1528,36 @@ const Page: NextPage = () => {
               <MenuItem value={0}>しない</MenuItem>
               <MenuItem value={2}>自動 (フィルム素材を判定)</MenuItem>
               <MenuItem value={1}>常にかける</MenuItem>
+            </Select>
+          </FormControl>
+          <FormControl
+            fullWidth
+            css={css`
+              margin-top: 24px;
+              width: 100%;
+            `}
+          >
+            <InputLabel id="playbackrate-label">再生速度</InputLabel>
+            <Select
+              css={css`
+                width: 100%;
+              `}
+              label="再生速度"
+              labelId="playbackrate-label"
+              value={playbackRate}
+              onChange={ev => {
+                if (typeof ev.target.value === 'number') {
+                  setPlaybackRate(ev.target.value)
+                }
+              }}
+            >
+              <MenuItem value={0.25}>0.25x (無音)</MenuItem>
+              <MenuItem value={0.5}>0.5x</MenuItem>
+              <MenuItem value={0.75}>0.75x</MenuItem>
+              <MenuItem value={1.0}>1.0x</MenuItem>
+              <MenuItem value={1.25}>1.25x</MenuItem>
+              <MenuItem value={1.5}>1.5x</MenuItem>
+              <MenuItem value={2.0}>2.0x</MenuItem>
             </Select>
           </FormControl>
           <FormGroup>
