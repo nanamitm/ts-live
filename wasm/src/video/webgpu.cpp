@@ -26,8 +26,10 @@ struct WebGPUContext {
   WGPUQueue queue = nullptr;
   // インターレース解除フィルタ。どれも同じバインドグループレイアウトなので、
   // パイプラインだけ差し替えて使う。
-  WGPUComputePipeline passthruPipeline = nullptr, yadifPipeline = nullptr,
-                      bwdifPipeline = nullptr;
+  // yadif/bwdif は残すフィールド(parity)ごとに 2 本ずつ持つ。倍レート出力では
+  // 同じフレームを両方で描く。
+  WGPUComputePipeline passthruPipeline = nullptr;
+  WGPUComputePipeline yadifPipeline[2] = {}, bwdifPipeline[2] = {};
   WGPURenderPipeline pipeline = nullptr;
   WGPUBindGroupLayout filterBindGroupLayout = nullptr,
                       bindGroupLayout = nullptr;
@@ -331,18 +333,25 @@ static void createPipeline() {
 
   ctx.pipeline = wgpuDeviceCreateRenderPipeline(ctx.device, &desc);
 
-  const auto createFilterPipeline = [&](WGPUShaderModule module) {
+  const auto createFilterPipeline = [&](WGPUShaderModule module,
+                                        const WGPUConstantEntry *parity) {
     WGPUProgrammableStageDescriptor compStageDesc = {
         .module = module,
         .entryPoint = "main",
+        .constantCount = parity ? 1u : 0u,
+        .constants = parity,
     };
     WGPUComputePipelineDescriptor compDesc = {.layout = filterPipelineLayout,
                                               .compute = compStageDesc};
     return wgpuDeviceCreateComputePipeline(ctx.device, &compDesc);
   };
-  ctx.passthruPipeline = createFilterPipeline(passthruMod);
-  ctx.yadifPipeline = createFilterPipeline(yadifMod);
-  ctx.bwdifPipeline = createFilterPipeline(bwdifMod);
+  ctx.passthruPipeline = createFilterPipeline(passthruMod, nullptr);
+  for (int i = 0; i < 2; i++) {
+    WGPUConstantEntry parityEntry = {.key = "parity",
+                                     .value = static_cast<double>(i)};
+    ctx.yadifPipeline[i] = createFilterPipeline(yadifMod, &parityEntry);
+    ctx.bwdifPipeline[i] = createFilterPipeline(bwdifMod, &parityEntry);
+  }
 
   // partial clean-up (just move to the end, no?)
   wgpuPipelineLayoutRelease(filterPipelineLayout);
@@ -411,11 +420,31 @@ void initWebGpu() {
   createTextures(1920, 1080);
 }
 
+static void drawWebGpuUpload(AVFrame *frame);
+static void drawWebGpuRender(bool secondField, bool deinterlaceFlag,
+                             bool bwdifFlag);
+
 // renderFlag が false のときはテクスチャの取り込みだけ行い、画面には出さない。
 // 逆テレシネで重複フレームを飛ばすときに使う。取り込み自体を飛ばすと
 // prev/cur/next の並びが崩れるので、スキップするのは描画だけ。
+//
+// frame が nullptr のときは取り込みを行わず、直前に取り込んだフレームの
+// もう一方のフィールドを描く (倍レート出力)。
 void drawWebGpu(AVFrame *frame, bool renderFlag, bool deinterlaceFlag,
                 bool bwdifFlag) {
+  if (frame != nullptr) {
+    drawWebGpuUpload(frame);
+  }
+
+  if (!renderFlag) {
+    return;
+  }
+
+  drawWebGpuRender(frame == nullptr, deinterlaceFlag, bwdifFlag);
+}
+
+// フレームを prev/cur/next のリングへ取り込む。
+static void drawWebGpuUpload(AVFrame *frame) {
   if (frame->width != ctx.textureWidth || frame->height != ctx.textureHeight) {
     releaseTextures();
     createTextures(frame->width, frame->height);
@@ -480,11 +509,11 @@ void drawWebGpu(AVFrame *frame, bool renderFlag, bool deinterlaceFlag,
   wgpuQueueWriteTexture(ctx.queue, &copyTexture, frame->data[2],
                         (size_t)(frame->height / 2) * frame->linesize[2],
                         &textureDataLayoutV, &copySizeuv);
+}
 
-  if (!renderFlag) {
-    return;
-  }
-
+// 取り込み済みのテクスチャから 1 枚描いて画面に出す。
+static void drawWebGpuRender(bool secondField, bool deinterlaceFlag,
+                             bool bwdifFlag) {
   WGPUTextureView backBufView =
       wgpuSwapChainGetCurrentTextureView(ctx.swapChain); // create textureView
 
@@ -509,11 +538,12 @@ void drawWebGpu(AVFrame *frame, bool renderFlag, bool deinterlaceFlag,
 
   WGPUComputePassEncoder compPass =
       wgpuCommandEncoderBeginComputePass(encoder, &compPassDesc);
-  WGPUComputePipeline filterPipeline = ctx.yadifPipeline;
+  const int parity = secondField ? 1 : 0;
+  WGPUComputePipeline filterPipeline = ctx.yadifPipeline[parity];
   if (!deinterlaceFlag) {
     filterPipeline = ctx.passthruPipeline;
   } else if (bwdifFlag) {
-    filterPipeline = ctx.bwdifPipeline;
+    filterPipeline = ctx.bwdifPipeline[parity];
   }
   wgpuComputePassEncoderSetPipeline(compPass, filterPipeline);
   wgpuComputePassEncoderSetBindGroup(

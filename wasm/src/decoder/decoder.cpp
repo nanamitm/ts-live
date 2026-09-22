@@ -205,6 +205,8 @@ double videoPtsAdjustment = 0;
 double lastShownVideoPtsTime = -1;
 // 直近のフレームをテレシネとして扱ったか (統計表示用)。
 bool telecineFlag = false;
+// 倍レート出力で、次の呼び出しでもう一方のフィールドを出す番かどうか。
+bool secondFieldPending = false;
 
 // 音声クロックの平滑化の内部状態 (メインスレッド専用)。
 double smoothedAudioPlayTime = -1.0;
@@ -295,8 +297,18 @@ void setDetelecineMode(int mode) {
 
 // インターレース解除の方式。メインループ(描画)だけが読むが、設定は JS から
 // 来るのでアトミックにしておく。
-enum class DeinterlaceMode { NONE, YADIF, BWDIF };
+// 末尾が _1 のものは倍レート出力 (ffmpeg の yadif=1 / bwdif=1 と同じ
+// send_field)。1 フレームから 2 枚のフィールドを起こして順に出す。
+enum class DeinterlaceMode { NONE, YADIF, YADIF_1, BWDIF, BWDIF_1 };
 std::atomic<DeinterlaceMode> deinterlaceMode{DeinterlaceMode::YADIF};
+
+static bool isBwdif(DeinterlaceMode mode) {
+  return mode == DeinterlaceMode::BWDIF || mode == DeinterlaceMode::BWDIF_1;
+}
+
+static bool isSendField(DeinterlaceMode mode) {
+  return mode == DeinterlaceMode::YADIF_1 || mode == DeinterlaceMode::BWDIF_1;
+}
 
 // 指定した方式を適用し、実際に適用された方式の名前を返す。名前は ffmpeg の
 // フィルタ指定に合わせてあり、未対応の指定は無視して現在の設定を返す。
@@ -306,18 +318,30 @@ std::string setDeinterlace(std::string filter) {
     mode = DeinterlaceMode::NONE;
   } else if (!filter.compare(0, 5, "yadif") &&
              (filter.size() == 5 || filter[5] == '=')) {
-    mode = DeinterlaceMode::YADIF;
+    mode = filter.size() > 6 && filter[6] == '1' &&
+                   (filter.size() == 7 || filter[7] == ',')
+               ? DeinterlaceMode::YADIF_1
+               : DeinterlaceMode::YADIF;
   } else if (!filter.compare(0, 5, "bwdif") &&
              (filter.size() == 5 || filter[5] == '=')) {
-    mode = DeinterlaceMode::BWDIF;
+    mode = filter.size() > 6 && filter[6] == '1' &&
+                   (filter.size() == 7 || filter[7] == ',')
+               ? DeinterlaceMode::BWDIF_1
+               : DeinterlaceMode::BWDIF;
   }
   deinterlaceMode.store(mode, std::memory_order_relaxed);
   spdlog::info("setDeinterlace: {}", filter);
   if (mode == DeinterlaceMode::YADIF) {
     return "yadif";
   }
+  if (mode == DeinterlaceMode::YADIF_1) {
+    return "yadif=1";
+  }
   if (mode == DeinterlaceMode::BWDIF) {
     return "bwdif";
+  }
+  if (mode == DeinterlaceMode::BWDIF_1) {
+    return "bwdif=1";
   }
   return "none";
 }
@@ -603,6 +627,7 @@ void reset() {
   // 表示判定のずらし量も、次の再生の最初のフレームで取り直す。
   videoPtsAdjustment = 0;
   lastShownVideoPtsTime = -1;
+  secondFieldPending = false;
   // read_packet で待っているデコードスレッドを起こす。
   std::lock_guard<std::mutex> lock(inputBufferMtx);
   waitCv.notify_all();
@@ -1842,7 +1867,15 @@ void decoderMainloop() {
     advancePlaybackTime(estimatedAudioPlayTime);
   }
 
-  if (currentFrame && audioFrame) {
+  if (secondFieldPending) {
+    // 倍レート出力の 2 枚目。取り込み済みのテクスチャをもう一方のパリティで
+    // 読み直すだけなので、フレームは要らないしキューからも取らない。
+    secondFieldPending = false;
+    const DeinterlaceMode mode =
+        deinterlaceMode.load(std::memory_order_relaxed);
+    drawWebGpu(nullptr, true, mode != DeinterlaceMode::NONE, isBwdif(mode));
+    displayedFrameCount.fetch_add(1, std::memory_order_relaxed);
+  } else if (currentFrame && audioFrame) {
     // 次のVideoFrameをまずは見る（条件を満たせばpopする）
     // AudioFrameは完全に見るだけ
     // spdlog::info("found Current Frame {}x{} bufferSize:{}",
@@ -1941,9 +1974,12 @@ void decoderMainloop() {
       const DeinterlaceMode mode =
           deinterlaceMode.load(std::memory_order_relaxed);
       drawWebGpu(frameToShow, renderFlag, mode != DeinterlaceMode::NONE,
-                 mode == DeinterlaceMode::BWDIF);
+                 isBwdif(mode));
       if (renderFlag) {
         displayedFrameCount.fetch_add(1, std::memory_order_relaxed);
+        // 倍レート出力なら、次の呼び出しでもう一方のフィールドを出す。
+        // 逆テレシネ中は 24fps に戻すのが目的なので倍には増やさない。
+        secondFieldPending = !telecineFlag && isSendField(mode);
       }
 
       av_frame_free(&frameToShow);

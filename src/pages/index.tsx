@@ -1489,7 +1489,9 @@ const Page: NextPage = () => {
               }}
             >
               <MenuItem value="yadif">yadif</MenuItem>
+              <MenuItem value="yadif=1">yadif=1 (倍レート)</MenuItem>
               <MenuItem value="bwdif">bwdif (やや軽い)</MenuItem>
+              <MenuItem value="bwdif=1">bwdif=1 (倍レート)</MenuItem>
               <MenuItem value="none">なし</MenuItem>
             </Select>
           </FormControl>

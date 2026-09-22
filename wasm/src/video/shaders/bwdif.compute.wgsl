@@ -11,6 +11,8 @@ R"(
 @group(0) @binding(9) var nextU : texture_2d<f32>;
 @group(0) @binding(10) var nextV : texture_2d<f32>;
 
+override parity: bool;
+
 const coef_lf = vec2<f32>(4309.0, 213.0) / (1 << 13);
 const coef_hf = vec3<f32>(5570.0, 3801.0, 1016.0) / (1 << 15);
 const coef_sp = vec2<f32>(5077.0, 981.0) / (1 << 13);
@@ -40,8 +42,7 @@ fn min3(a: f32, b: f32, c: f32) -> f32 {
 
 fn filter_(cur_prefs3: f32, cur_prefs: f32, cur_mrefs: f32, cur_mrefs3: f32,
            prev2_prefs4: f32, prev2_prefs2: f32, prev2_0: f32, prev2_mrefs2: f32, prev2_mrefs4: f32,
-           prev_prefs: f32, prev_mrefs: f32,
-           // next_prefs: f32, next_mrefs: f32,
+           prev_prefs: f32, prev_mrefs: f32, next_prefs: f32, next_mrefs: f32,
            next2_prefs4: f32, next2_prefs2: f32, next2_0: f32, next2_mrefs2: f32, next2_mrefs4: f32) -> f32 {
 
   // FFmpeg/libavfilter/vf_bwdif_cuda.cu (clip_max == 1.0 の場合) を参考にした。
@@ -52,10 +53,9 @@ fn filter_(cur_prefs3: f32, cur_prefs: f32, cur_mrefs: f32, cur_mrefs3: f32,
 
   let temporal_diff0 = abs(prev2_0 - next2_0);
   let temporal_diff1 = avg(abs(prev_mrefs - c), abs(prev_prefs - e));
-  // let temporal_diff2 = avg(abs(next_mrefs - c), abs(next_prefs - e));
+  let temporal_diff2 = avg(abs(next_mrefs - c), abs(next_prefs - e));
 
-  // var diff = max3(temporal_diff0 * 0.5, temporal_diff1, temporal_diff2);
-  var diff = max(temporal_diff0 * 0.5, temporal_diff1);
+  var diff = max3(temporal_diff0 * 0.5, temporal_diff1, temporal_diff2);
   if (diff == 0.0) {
     return d;
   }
@@ -81,11 +81,12 @@ fn filter_(cur_prefs3: f32, cur_prefs: f32, cur_mrefs: f32, cur_mrefs3: f32,
 }
 
 fn bwdif(cur: texture_2d<f32>, prev: texture_2d<f32>, next: texture_2d<f32>, x: u32, y: u32, h: u32) -> f32 {
-  if (y % 2 == 0) {
+  if (y % 2 == select(0u, 1u, parity)) {
     return load(cur, x, y);
   }
 
   // 画像端はミラーリング
+  let my1 = select(y - 1, y + 1, y < 1);
   let my2 = select(y - 2, y + 2, y < 2);
   let my3 = select(y - 3, y + 3, y < 3);
   let my4 = select(y - 4, y + 4, y < 4);
@@ -94,12 +95,34 @@ fn bwdif(cur: texture_2d<f32>, prev: texture_2d<f32>, next: texture_2d<f32>, x: 
   let py3 = select(y + 3, y - 3, y >= h - 3);
   let py4 = select(y + 4, y - 4, y >= h - 4);
 
-  // is_second_field == false の場合
+  if (parity) {
+    return filter_(
+      load(cur, x, py3),
+      load(cur, x, py1),
+      load(cur, x, my1),
+      load(cur, x, my3),
 
+      load(cur, x, py4),
+      load(cur, x, py2),
+      load(cur, x, y),
+      load(cur, x, my2),
+      load(cur, x, my4),
+
+      load(prev, x, py1),
+      load(prev, x, my1),
+      load(next, x, py1),
+      load(next, x, my1),
+
+      load(next, x, py4),
+      load(next, x, py2),
+      load(next, x, y),
+      load(next, x, my2),
+      load(next, x, my4));
+  }
   return filter_(
     load(cur, x, py3),
     load(cur, x, py1),
-    load(cur, x, y - 1),
+    load(cur, x, my1),
     load(cur, x, my3),
 
     load(prev, x, py4),
@@ -109,15 +132,15 @@ fn bwdif(cur: texture_2d<f32>, prev: texture_2d<f32>, next: texture_2d<f32>, x: 
     load(prev, x, my4),
 
     load(prev, x, py1),
-    load(prev, x, y - 1),
-    // load(cur, x, py1),
-    // load(cur, x, y - 1),
+    load(prev, x, my1),
+    load(next, x, py1),
+    load(next, x, my1),
 
-    load(next, x, py4),
-    load(next, x, py2),
-    load(next, x, y),
-    load(next, x, my2),
-    load(next, x, my4));
+    load(cur, x, py4),
+    load(cur, x, py2),
+    load(cur, x, y),
+    load(cur, x, my2),
+    load(cur, x, my4));
 }
 
 fn yuv2rgba(y: f32, u: f32, v: f32) -> vec4<f32> {

@@ -11,6 +11,10 @@ R"(
 @group(0) @binding(9) var nextU : texture_2d<f32>;
 @group(0) @binding(10) var nextV : texture_2d<f32>;
 
+// false: cur の上位フィールド(偶数行)を残す。true: 下位フィールド(奇数行)を残す。
+// 倍レート出力(send_field)のとき、同じフレームを両方のパリティで 2 回描く。
+override parity: bool;
+
 fn to_coord(tex: texture_2d<f32>, fragUV: vec2<f32>) -> vec2<i32> {
   var dim = textureDimensions(tex);
   return vec2<i32>(
@@ -100,19 +104,39 @@ fn min3(a: f32, b: f32, c: f32) -> f32 {
 }
 
 fn yadif(cur: texture_2d<f32>, prev: texture_2d<f32>, next: texture_2d<f32>, x: i32, y: i32) -> f32 {
-  if (y % 2 == 0) {
+  if (y % 2 == select(0i, 1i, parity)) {
     return load(cur, x, y);
   } else {
     var c = load(cur, x, y - 1);
-    var d = avg(load(prev, x, y), load(cur, x, y));
     var e = load(cur, x, y + 1);
-    var tmp_diff0 = absd(load(prev, x, y), load(cur, x, y)) / 2.0;
-    var tmp_diff1 = avg(absd(load(prev, x, y - 1), c), absd(load(prev, x, y + 1), e));
-    var tmp_diff2 = avg(absd(load(next, x, y - 1), c), absd(load(next, x, y + 1), e));
+
+    // 補間するフィールドの時間的な隣。cur の上位フィールドを残すとき(parity=false)
+    // 埋めるのはその時刻の下位フィールドなので、隣は prev と cur の下位フィールド。
+    // 下位フィールドを残すとき(parity=true)は cur と next になる。
+    // (FFmpeg の yadif が parity で prev2/next2 を選ぶのと同じ)
+    var d: f32;
+    var tmp_diff0: f32;
+    var tmp_diff1: f32;
+    var tmp_diff2: f32;
+    var b: f32;
+    var f: f32;
+    if (parity) {
+      d = avg(load(cur, x, y), load(next, x, y));
+      tmp_diff0 = absd(load(cur, x, y), load(next, x, y)) / 2.0;
+      tmp_diff1 = avg(absd(load(cur, x, y - 1), c), absd(load(cur, x, y + 1), e));
+      tmp_diff2 = avg(absd(load(next, x, y - 1), c), absd(load(next, x, y + 1), e));
+      b = avg(load(cur, x, y - 2), load(next, x, y - 2));
+      f = avg(load(cur, x, y + 2), load(next, x, y + 2));
+    } else {
+      d = avg(load(prev, x, y), load(cur, x, y));
+      tmp_diff0 = absd(load(prev, x, y), load(cur, x, y)) / 2.0;
+      tmp_diff1 = avg(absd(load(prev, x, y - 1), c), absd(load(prev, x, y + 1), e));
+      tmp_diff2 = avg(absd(load(cur, x, y - 1), c), absd(load(cur, x, y + 1), e));
+      b = avg(load(prev, x, y - 2), load(cur, x, y - 2));
+      f = avg(load(prev, x, y + 2), load(cur, x, y + 2));
+    }
     var diff = max3(tmp_diff0, tmp_diff1, tmp_diff2);
 
-    var b = avg(load(prev, x, y - 2), load(cur, x, y - 2));
-    var f = avg(load(prev, x, y + 2), load(cur, x, y + 2));
     var max_ = max3(d - e, d -c, min(b -c, f - e));
     var min_ = min3(d - e, d -c, max(b -c, f - e));
     diff = max3(diff, min_, -max_);
