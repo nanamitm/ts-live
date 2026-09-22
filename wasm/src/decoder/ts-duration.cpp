@@ -12,6 +12,12 @@ namespace {
 // 再生系のリングバッファや AVFormatContext とは共有しない。
 std::vector<uint8_t> input;
 
+// 最大数十MBの一時領域を次の解析まで持ち越さない。どの経路で抜けても
+// 手放せるよう、確保した側ではなくスコープの終わりで解放する。
+struct InputRelease {
+  ~InputRelease() { std::vector<uint8_t>().swap(input); }
+};
+
 struct ProbeInput {
   int64_t headSize, tailOffset, tailSize, fileSize;
   int64_t pos = 0;
@@ -67,6 +73,7 @@ emscripten::val getTsDurationInputBuffer(size_t size) {
 
 double probeTsDuration(size_t headSize, double tailOffset, size_t tailSize,
                        double fileSize) {
+  InputRelease release;
   // バイト位置は 4GB を超えうるので、JS Number から int64_t に渡す。
   if (!std::isfinite(fileSize) || !std::isfinite(tailOffset) || fileSize < 1 ||
       fileSize > 9007199254740991.0 || tailOffset < 0 ||
@@ -120,7 +127,5 @@ double probeTsDuration(size_t headSize, double tailOffset, size_t tailSize,
   avformat_close_input(&format);
   av_freep(&io->buffer);
   avio_context_free(&io);
-  // 最大数十MBの一時領域を次の再生まで保持しない。
-  std::vector<uint8_t>().swap(input);
   return duration;
 }
