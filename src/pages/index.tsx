@@ -56,6 +56,26 @@ const formatLocalTime = (seconds: number): string => {
 // グラフに保持する統計データの点数。
 const CHART_HISTORY = 300
 
+// localStorage に保存した設定を、静的書き出しした HTML と食い違わせずに使う。
+//
+// このページはビルド時に既定値で HTML へ書き出される。react-use の
+// useLocalStorage は最初のレンダーで保存値をそのまま返すので、保存値が既定と
+// 違うと hydration 時点で食い違い、React は属性のずれを直さない。結果として
+// 例えば hidden 属性が書き出し時のまま残り、「設定は保存されているのに最初の
+// 1 回だけ効かない」ことになる。
+//
+// そこで最初のレンダーでは既定値を返し、マウント後に保存値へ切り替える。
+// これなら切り替えが React にとって本物の更新になり、DOM へ反映される。
+const usePersistedState = <T,>(
+  key: string,
+  initialValue?: T
+): [T | undefined, (value: T) => void] => {
+  const [stored, setStored] = useLocalStorage<T>(key, initialValue)
+  const [mounted, setMounted] = useState(false)
+  useEffect(() => setMounted(true), [])
+  return [mounted ? stored : initialValue, setStored as (value: T) => void]
+}
+
 // WASM 経路の描画バッファの基準サイズ。canvas の縦横比はこれで決まるので、
 // 解像度だけを表示サイズに合わせて倍率で上下させる。
 const BASE_VIDEO_WIDTH = 1920
@@ -92,18 +112,18 @@ const Page: NextPage = () => {
   // の形で開かれたときに自動再生するための、対象サービス ID。
   const [pendingServiceId, setPendingServiceId] = useState<number | null>(null)
 
-  const [mirakurunServer, setMirakurunServer] = useLocalStorage<string>('mirakurunServer', '')
+  const [mirakurunServer, setMirakurunServer] = usePersistedState<string>('mirakurunServer', '')
   const [mirakurunOk, setMirakurunOk] = useState<boolean>(false)
   const [mirakurunVersion, setMirakurunVersion] = useState<string>('unknown')
   const [tvServices, setTvServices] = useState<Array<Service>>([])
-  const [activeService, setActiveService] = useLocalStorage<Service>(
+  const [activeService, setActiveService] = usePersistedState<Service>(
     'tsplayerActiveService',
     undefined
   )
   const [programs, setPrograms] = useState<Array<Program>>([])
   const [currentProgram, setCurrentProgram] = useState<Program>()
 
-  const [epgStationServer, setEpgStationServer] = useLocalStorage<string>(
+  const [epgStationServer, setEpgStationServer] = usePersistedState<string>(
     'tsplayerEpgStationServer',
     undefined
   )
@@ -114,7 +134,7 @@ const Page: NextPage = () => {
   // ローカルファイル(デバッグ用)再生の選択状態。BS4K の TLV/HEVC を既定にする。
   const localFileInputRef = useRef<HTMLInputElement>(null)
   const [localFileName, setLocalFileName] = useState<string>('')
-  const [localTlvMode, setLocalTlvMode] = useLocalStorage<boolean>('tsplayerLocalTlvMode', true)
+  const [localTlvMode, setLocalTlvMode] = usePersistedState<boolean>('tsplayerLocalTlvMode', true)
   // 直近に開いたローカルファイル(最初から再生/ループ用)と、ループ設定。
   // ループ判定は実行中の非同期フィードから参照するため ref に同期する。
   const lastLocalFileRef = useRef<File | null>(null)
@@ -125,7 +145,7 @@ const Page: NextPage = () => {
   const localFileHandleRef = useRef<FileSystemFileHandle | null>(null)
   // ローカルファイルの読み出しに失敗したときの表示。
   const [localReadError, setLocalReadError] = useState<string>('')
-  const [localLoop, setLocalLoop] = useLocalStorage<boolean>('tsplayerLocalLoop', false)
+  const [localLoop, setLocalLoop] = usePersistedState<boolean>('tsplayerLocalLoop', false)
   const localLoopRef = useRef<boolean>(false)
   // シーク用の再生位置推定。TS/TLV には索引が無いので、実測ビットレート
   // (供給バイト数 / 経過メディア時刻) からバイト位置と時刻を相互に換算する。
@@ -153,25 +173,25 @@ const Page: NextPage = () => {
   const localForceSoftwareRef = useRef<boolean>(false)
   // ローカル再生のコンテナ種別。'auto'=先頭バイトで TS(2K)/TLV(BS4K)を自動判定、
   // 'ts'=2K(通常TS)固定、'tlv'=BS4K(TLV/HEVC)固定。
-  const [localMode, setLocalMode] = useLocalStorage<string>('tsplayerLocalMode', 'auto')
+  const [localMode, setLocalMode] = usePersistedState<string>('tsplayerLocalMode', 'auto')
   const [playMode, setPlayMode] = useState<string>('live')
-  const [dualMonoMode, setDualMonoMode] = useLocalStorage<number>('tsplayerDualMonoMode', 0)
+  const [dualMonoMode, setDualMonoMode] = usePersistedState<number>('tsplayerDualMonoMode', 0)
   // 再生速度。ライブで速くすると供給が追いつかないので、保存はせず毎回 1.0
   // から始める。
   const [playbackRate, setPlaybackRate] = useState<number>(1.0)
   // 逆テレシネ (0=しない, 1=常に, 2=自動)。インターレース解除と同じく WASM
   // ソフトデコード経路にのみ効く。
-  const [detelecineMode, setDetelecineMode] = useLocalStorage<number>(
+  const [detelecineMode, setDetelecineMode] = usePersistedState<number>(
     'tsplayerDetelecineMode',
     0
   )
   // インターレース解除の方式。WASM ソフトデコード経路にのみ効く。
-  const [deinterlace, setDeinterlaceSetting] = useLocalStorage<string>(
+  const [deinterlace, setDeinterlaceSetting] = usePersistedState<string>(
     'tsplayerDeinterlace',
     'yadif'
   )
-  const [volume, setVolume] = useLocalStorage<number>('tsplayerVolume', 1.0)
-  const [mute, setMute] = useLocalStorage<boolean>('tsplayerMute', false)
+  const [volume, setVolume] = usePersistedState<number>('tsplayerVolume', 1.0)
+  const [mute, setMute] = usePersistedState<boolean>('tsplayerMute', false)
 
   const stopFuncRef = useRef<() => void>(() => {})
   const stopPlayback = useCallback(() => {
@@ -191,7 +211,7 @@ const Page: NextPage = () => {
     },
   ])
   const [showCharts, setShowCharts] = useState<boolean>(false)
-  const [showCaption, setShowCaption] = useLocalStorage<boolean>('tsplayerShowCaption', false)
+  const [showCaption, setShowCaption] = usePersistedState<boolean>('tsplayerShowCaption', false)
   // 再生を切り替えるたびに加算し、Caption に字幕クリアを促すトークン。ローカル
   // ファイル切替のように service が変わらないケースで前ファイルの字幕を消す。
   const [captionResetToken, setCaptionResetToken] = useState<number>(0)
