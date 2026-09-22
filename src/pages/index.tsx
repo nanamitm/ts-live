@@ -231,6 +231,13 @@ const Page: NextPage = () => {
   // 同じサービスを WASM ソフトウェアデコードで再起動する。
   const liveForceSoftwareServiceRef = useRef<number | null>(null)
   const [webCodecsRetryToken, setWebCodecsRetryToken] = useState(0)
+  // ライブのストリームが途切れたら同じサービスを再生し直す。連続で失敗する
+  // ときは間隔を広げる (チューナー不足で 503 が続く場合など)。
+  const [liveReconnectToken, setLiveReconnectToken] = useState(0)
+  const liveReconnectRef = useRef<{ serviceId: number | null; attempts: number }>({
+    serviceId: null,
+    attempts: 0,
+  })
 
   // WebCodecs 用: JS の VideoDecoder(ハードウェアデコード)で映像をデコードし、
   // WASM が保持する音声クロックに同期して canvas へ描画する。対象コーデックは
@@ -870,7 +877,11 @@ const Page: NextPage = () => {
 
     // 視聴中のスリープを避ける
     if (!wakeLock) {
-      navigator.wakeLock.request('screen').then(lock => setWakeLock(lock))
+      // 拒否されても再生は続ける (非表示タブ・権限なし・再接続時など)。
+      navigator.wakeLock
+        .request('screen')
+        .then(lock => setWakeLock(lock))
+        .catch(() => {})
     }
 
     // ARIB字幕パケットそのものを受け取るコールバック
@@ -886,9 +897,11 @@ const Page: NextPage = () => {
 
     let stopped = false
     let ac: AbortController | null = null
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     const stop = () => {
       if (stopped) return
       stopped = true
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer)
       ac?.abort()
       Module.setVideoStreamInfoCallback(null as any)
       if (webCodecsCtrlRef.current) {
@@ -943,6 +956,29 @@ const Page: NextPage = () => {
         Module.setWebCodecsMode(wantWebCodecs)
         const url = `${mirakurunServer}/api/services/${activeService.id}/stream?decode=1`
         console.log('start fetch', url, Module)
+        const reconnect = liveReconnectRef.current
+        if (reconnect.serviceId !== activeService.id) {
+          reconnect.serviceId = activeService.id
+          reconnect.attempts = 0
+        }
+        // ストリームが終わった・切れたときに再生し直す。デコーダーは途中から
+        // つなぐより作り直すほうが確実なので、effect ごとやり直す。
+        // 待ち時間を延ばすのはデータが 1 バイトも来ない失敗が続くときだけ
+        // (データを受け取れたら attempts は 0 に戻している)。
+        const scheduleReconnect = (reason: unknown) => {
+          if (stopped) return
+          const delay = Math.min(1000 * 2 ** reconnect.attempts, 10000)
+          reconnect.attempts++
+          console.warn(
+            'live stream ended:',
+            reason,
+            `— reconnecting in ${delay / 1000}s (attempt ${reconnect.attempts})`
+          )
+          reconnectTimer = setTimeout(() => {
+            reconnectTimer = null
+            if (!stopped) setLiveReconnectToken(t => t + 1)
+          }, delay)
+        }
         // NOTE: カスタムヘッダーを付けると CORS preflight が必須になり、HTTPS(公開)
         // オリジンから LAN 上の HTTP Mirakurun への Local Network Access が
         // preflight 経路で拒否される (Chrome)。ヘッダーを付けず simple request に
@@ -951,6 +987,9 @@ const Page: NextPage = () => {
           signal: ac.signal,
         })
           .then(async response => {
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status}`)
+            }
             if (!response.body) {
               console.error('response body is not supplied.')
               return
@@ -964,6 +1003,7 @@ const Page: NextPage = () => {
                 return
               }
               if (ret.value) {
+                reconnect.attempts = 0
                 try {
                   while (true) {
                     if (stopped) return
@@ -987,9 +1027,12 @@ const Page: NextPage = () => {
               }
               ret = await reader.read()
             }
+            scheduleReconnect('end of stream')
           })
           .catch(ex => {
-            if (!stopped) console.error('stream fetch failed:', ex)
+            if (stopped) return
+            console.error('stream fetch failed:', ex)
+            scheduleReconnect(ex)
           })
       } else if (playMode === 'file') {
         // 直前の再生のモードが残らないよう明示的にリセットする(EPGStation の
@@ -1019,6 +1062,7 @@ const Page: NextPage = () => {
     playMode,
     wasmMod,
     webCodecsRetryToken,
+    liveReconnectToken,
     stopPlayback,
   ])
 
