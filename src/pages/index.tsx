@@ -1230,9 +1230,11 @@ const Page: NextPage = () => {
   // バイト数からビットレートを実測し、それでバイト位置・総時間へ換算する。
   useEffect(() => {
     if (playMode !== 'localfile' || !wasmMod) return
-    const file = lastLocalFileRef.current
-    if (!file) return
     const timer = setInterval(() => {
+      // ローカル再生のまま別ファイルを開いた場合や、録画中ファイルの
+      // スナップショットを取り直した場合も最新のサイズを使う。
+      const file = lastLocalFileRef.current
+      if (!file) return
       const mediaTime = wasmMod.getAudioPlaybackTime()
       if (mediaTime < 0) return
       const fed = localFedBytesRef.current
