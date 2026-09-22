@@ -101,5 +101,8 @@ export declare interface WasmModule extends EmscriptenModule {
   getConsumedInputBytes(): number
   // 入力の供給終了ではなく、デマルチプレクサが EOF に到達したか。
   isDemuxEnded(): boolean
+  // 先頭・末尾を連結して書き込み、再生系とは独立したFFmpegでTSのPTSを解析。
+  getTsDurationInputBuffer(size: number): Uint8Array
+  probeTsDuration(headSize: number, tailOffset: number, tailSize: number, fileSize: number): number
 }
 export declare var Module: WasmModule

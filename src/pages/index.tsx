@@ -28,6 +28,7 @@ import { WasmModule, StatsData, VideoStreamInfo } from '../lib/wasmmodule'
 import { CONTAINER_PROBE_SIZE, looksLikeTlv } from '../lib/container'
 import { buildWebCodecsConfig } from '../lib/webcodecs'
 import { LocalPositionEstimator } from '../lib/local-position'
+import { readTsDuration } from '../lib/ts-duration'
 import dayjs from 'dayjs'
 
 import { Program, Service } from 'mirakurun/api'
@@ -148,9 +149,10 @@ const Page: NextPage = () => {
   const [localReadError, setLocalReadError] = useState<string>('')
   const [localLoop, setLocalLoop] = usePersistedState<boolean>('tsplayerLocalLoop', false)
   const localLoopRef = useRef<boolean>(false)
-  // 消費バイト数でレートを推定し、音声クロックで再生位置を進める。
+  // TSはPTS由来の総時間、TLVは消費レートの推定を使い、音声クロックで進める。
   const localStartOffsetRef = useRef<number>(0)
   const localPositionEstimatorRef = useRef<LocalPositionEstimator | null>(null)
+  const [localDurationFromPts, setLocalDurationFromPts] = useState(false)
   const [localPosition, setLocalPosition] = useState<{
     bytes: number
     size: number
@@ -1024,6 +1026,7 @@ const Page: NextPage = () => {
     Module.setPaused(false)
     localStartOffsetRef.current = startOffset
     localPositionEstimatorRef.current = null
+    setLocalDurationFromPts(false)
     setLocalReadError('')
     setLocalPosition({
       bytes: startOffset,
@@ -1072,6 +1075,7 @@ const Page: NextPage = () => {
       if (localFileHandleRef.current) {
         try {
           src = await localFileHandleRef.current.getFile()
+          if (aborted) return
           lastLocalFileRef.current = src
           if (src.size !== file.size) {
             setLocalPosition(prev => (prev ? { ...prev, size: src.size } : prev))
@@ -1087,7 +1091,16 @@ const Page: NextPage = () => {
       // 直前の再生停止(reset)の後片付けが終わるのを待つ
       await waitForDecoderReset(Module, () => aborted)
       if (aborted) return
-      localPositionEstimatorRef.current = new LocalPositionEstimator()
+      const duration = tlv ? undefined : await readTsDuration(src, Module, () => aborted)
+        .catch(ex => {
+          console.warn('TS duration probe failed:', ex)
+          return 0
+        })
+      if (aborted) return
+      const estimator = new LocalPositionEstimator(duration)
+      localPositionEstimatorRef.current = estimator
+      setLocalDurationFromPts(!!duration)
+      setLocalPosition(estimator.position(startOffset, src.size))
 
       // ローカルファイルは常に WebCodecs を試みる。実際に使うかは WASM が
       // probe 後にコーデックで決める(HEVC/H.264 なら WebCodecs、MPEG-2 等は
@@ -2034,7 +2047,7 @@ const Page: NextPage = () => {
               </span>
               <span css={css`margin-left: auto;`}>
                 {localPosition.duration > 0
-                  ? `${formatLocalTime(localPosition.duration)} (推定)`
+                  ? `${formatLocalTime(localPosition.duration)}${localDurationFromPts ? '' : ' (推定)'}`
                   : `${(
                       ((localSeeking ?? localPosition.bytes) /
                         localPosition.size) *

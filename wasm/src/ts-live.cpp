@@ -13,6 +13,7 @@
 #include "../../misc-wasm/src/grabber/grabber.hpp"
 #include "audio/audioworklet.hpp"
 #include "decoder/decoder.hpp"
+#include "decoder/ts-duration.hpp"
 #include "video/webgpu.hpp"
 
 extern "C" {
@@ -105,4 +106,6 @@ EMSCRIPTEN_BINDINGS(ts_live_module) {
   emscripten::function("getAudioPlaybackTime", &getAudioPlaybackTime);
   emscripten::function("getConsumedInputBytes", &getConsumedInputBytes);
   emscripten::function("isDemuxEnded", &isDemuxEnded);
+  emscripten::function("getTsDurationInputBuffer", &getTsDurationInputBuffer);
+  emscripten::function("probeTsDuration", &probeTsDuration);
 }
