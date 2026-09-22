@@ -518,6 +518,25 @@ const Page: NextPage = () => {
     }
   }
 
+  // WASM 経路の canvas は、この再生の最初のフレームを描いてから見せる。WebGPU
+  // 側の canvas は前の再生で最後に描いた絵を保持しているので、すぐ見せると
+  // 新しい映像が出るまでその古い絵が映ってしまう (4K→2K の切替など)。
+  const showWasmCanvasOnFirstFrame = (
+    Module: WasmModule,
+    isAborted: () => boolean
+  ) => {
+    const baseFrames = Module.getDisplayedFrameCount()
+    ;(async () => {
+      while (!isAborted()) {
+        if (Module.getDisplayedFrameCount() > baseFrames) {
+          setActiveCanvas('wasm')
+          return
+        }
+        await new Promise(resolve => setTimeout(resolve, 20))
+      }
+    })()
+  }
+
   const [wakeLock, setWakeLock] = useState<WakeLockSentinel>()
   const [wasmMod, setWasmMod] = useState<WasmModule | null>(null)
   // WebGPU 非対応や WASM 読み込み失敗を握り潰さずに画面へ出す。
@@ -910,11 +929,15 @@ const Page: NextPage = () => {
                 setWebCodecsRetryToken(t => t + 1)
               })
             }
-            setActiveCanvas(info.webCodecs ? 'webcodecs' : 'wasm')
+            if (info.webCodecs) {
+              setActiveCanvas('webcodecs')
+            } else {
+              showWasmCanvasOnFirstFrame(Module, () => stopped)
+            }
           })
         } else {
           Module.setVideoStreamInfoCallback(null as any)
-          setActiveCanvas('wasm')
+          showWasmCanvasOnFirstFrame(Module, () => stopped)
         }
         Module.setTlvMode(isBS4K)
         Module.setWebCodecsMode(wantWebCodecs)
@@ -974,7 +997,7 @@ const Page: NextPage = () => {
         Module.setVideoStreamInfoCallback(null as any)
         Module.setTlvMode(false)
         Module.setWebCodecsMode(false)
-        setActiveCanvas('wasm')
+        showWasmCanvasOnFirstFrame(Module, () => stopped)
         const url = `${epgStationServer}/api/videos/${activeRecordedFileId}`
         Module.playFile(url)
       }
@@ -1131,11 +1154,15 @@ const Page: NextPage = () => {
               playLocalFile(file, startOffset)
             })
           }
-          setActiveCanvas(info.webCodecs ? 'webcodecs' : 'wasm')
+          if (info.webCodecs) {
+            setActiveCanvas('webcodecs')
+          } else {
+            showWasmCanvasOnFirstFrame(Module, () => aborted)
+          }
         })
       } else {
         Module.setVideoStreamInfoCallback(null as any)
-        setActiveCanvas('wasm')
+        showWasmCanvasOnFirstFrame(Module, () => aborted)
       }
       Module.setTlvMode(tlv)
       Module.setWebCodecsMode(wantWebCodecs)
