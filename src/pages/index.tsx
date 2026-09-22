@@ -875,6 +875,7 @@ const Page: NextPage = () => {
         Module.setVideoStreamInfoCallback(null as any)
         Module.setTlvMode(false)
         Module.setWebCodecsMode(false)
+        setActiveCanvas('wasm')
         const url = `${epgStationServer}/api/videos/${activeRecordedFileId}`
         Module.playFile(url)
       }
