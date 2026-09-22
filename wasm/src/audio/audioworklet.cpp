@@ -49,7 +49,15 @@ void startAudioWorklet() {
   EM_ASM({
     (async function(){
       const audioContext = new AudioContext({sampleRate: 48000});
-      await audioContext.audioWorklet.addModule(`data:text/javascript,${encodeURI(UTF8ToString($0))}`);
+      // データURIだとスクリプト全体がURLに載る。長さ制限やCSPの都合が悪いので
+      // Blob URL で渡す。
+      const moduleUrl = URL.createObjectURL(
+          new Blob([UTF8ToString($0)], {type: 'text/javascript'}));
+      try {
+        await audioContext.audioWorklet.addModule(moduleUrl);
+      } finally {
+        URL.revokeObjectURL(moduleUrl);
+      }
       const audioNode = new AudioWorkletNode(
           audioContext, 'audio-feeder-processor',
           {numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2]});
