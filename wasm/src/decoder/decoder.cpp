@@ -194,8 +194,9 @@ std::mutex videoAuMtx;
 bool videoAuDropUntilKey = false;
 
 // メインループが更新する「現在の推定音声再生時刻(秒)」。JS 側の映像表示を
-// これに同期させる (音声クロック)。
-double currentAudioPlaybackTime = -1.0;
+// これに同期させる (音声クロック)。変換スレッドも表示済み判定に読むので
+// アトミックにしてある。
+std::atomic<double> currentAudioPlaybackTime{-1.0};
 
 void setWebCodecsMode(bool enabled) {
   webCodecsMode = enabled;
@@ -210,7 +211,9 @@ void setVideoStreamInfoCallback(emscripten::val callback) {
   videoStreamInfoCallback = callback;
 }
 
-double getAudioPlaybackTime() { return currentAudioPlaybackTime; }
+double getAudioPlaybackTime() {
+  return currentAudioPlaybackTime.load(std::memory_order_relaxed);
+}
 
 std::string playFileUrl;
 std::thread downloaderThread;
@@ -470,7 +473,7 @@ void resetInternal() {
     videoAuQueue.clear();
     videoAuDropUntilKey = false;
   }
-  currentAudioPlaybackTime = -1.0;
+  currentAudioPlaybackTime.store(-1.0, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(videoFrameMtx);
     while (!videoFrameQueue.empty()) {
@@ -683,6 +686,13 @@ void videoDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
       frame->time_base.den = videoStream->time_base.den;
       frame->time_base.num = videoStream->time_base.num;
 
+      // time_base が 0/0 な不正フレームはここで捨てる。以前は下流 (メイン
+      // ループ) がキューを覗くたびにふるいに掛けていたが、時刻が計算できない
+      // フレームはそもそもキューに入れないほうが素直。
+      if (frame->time_base.den == 0 || frame->time_base.num == 0) {
+        continue;
+      }
+
       // 変換 (10bit→8bit) は専用スレッドに任せ、ここでは生フレームの参照を
       // 中間キューへ渡すだけ。これでデコードスレッドは変換に時間を取られず
       // フル速度でデコードでき、変換 (4K swscale) は別スレッドで並列に進む。
@@ -701,6 +711,41 @@ void videoDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
   avcodec_free_context(&videoCodecContext);
 }
 
+// 描画待ちキュー (videoFrameQueue) の上限。これを超えたら変換を抑制する。
+const size_t MAX_VIDEO_FRAME_QUEUE_SIZE = 16;
+
+// 表示されないまま溜まったフレームを捨てる。videoFrameMtx を握って呼ぶこと。
+//
+// キューが上限に達しているのに中身が全部再生時刻を過ぎている = メインループが
+// フレームを引き取っていない。タブが非表示の間は fps 指定のメインループが
+// setTimeout で回るためブラウザに約 1Hz まで絞られる (音声は AudioWorklet 側で
+// 実時間のまま進む) ので、ここが数百フレームぶん詰まる。
+//
+// 捨てずに待つと、パイプラインの前進がメインループ任せになる (変換が止まり、
+// 映像デコードが止まり、最後はデマルチプレクスが映像パケットの上限で止まる)。
+// どうせ表示されないフレームなので、先頭 1 枚だけ残して捨てる。残すのが最新の
+// 1 枚ではなく先頭なのは、メインループが先頭の参照をロック外で持っているため。
+// 残した 1 枚も表示時刻を過ぎているので、メインループ側の間引きですぐ消える。
+static int dropUndisplayedVideoFrames(double playTime) {
+  if (playTime < 0 || videoFrameQueue.size() < MAX_VIDEO_FRAME_QUEUE_SIZE) {
+    return 0;
+  }
+  for (const AVFrame *frame : videoFrameQueue) {
+    if (frame->pts * av_q2d(frame->time_base) >= playTime) {
+      // まだ表示時刻前のフレームがある = メインループは追いついている
+      return 0;
+    }
+  }
+  int dropped = 0;
+  while (videoFrameQueue.size() > 1) {
+    AVFrame *frame = videoFrameQueue.back();
+    videoFrameQueue.pop_back();
+    av_frame_free(&frame);
+    dropped++;
+  }
+  return dropped;
+}
+
 // 10bit→8bit 変換専用スレッド。videoConvertQueue から生フレームを取り出し、
 // 必要なら 8bit yuv420p に変換して videoFrameQueue へ送る。デコード・描画と
 // 並列に動くことで、各段が単独で実時間を維持できる。
@@ -716,11 +761,17 @@ void videoConvertThreadFunc(std::atomic<bool> &terminateFlag) {
     // 下流 (描画待ちの videoFrameQueue) が溜まっていたら抑制する。
     while (!terminateFlag) {
       size_t vq;
+      int dropped;
       {
         std::lock_guard<std::mutex> lock(videoFrameMtx);
+        dropped = dropUndisplayedVideoFrames(
+            currentAudioPlaybackTime.load(std::memory_order_relaxed));
         vq = videoFrameQueue.size();
       }
-      if (vq <= 16) {
+      if (dropped > 0) {
+        spdlog::debug("dropped {} undisplayed video frames", dropped);
+      }
+      if (vq <= MAX_VIDEO_FRAME_QUEUE_SIZE) {
         break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(3));
@@ -766,6 +817,9 @@ void videoConvertThreadFunc(std::atomic<bool> &terminateFlag) {
           av_frame_free(&outFrame);
         } else {
           av_frame_copy_props(outFrame, raw);
+          // 下流は time_base が有効である前提で PTS を時刻に直す。
+          // av_frame_copy_props 頼みにせず明示的に移す。
+          outFrame->time_base = raw->time_base;
           sws_scale(swsContext, raw->data, raw->linesize, 0, raw->height,
                     outFrame->data, outFrame->linesize);
         }
@@ -887,6 +941,10 @@ void audioDecoderThreadFunc(std::atomic<bool> &terminateFlag) {
                     frameBufSize(frame, 1), frame->nb_samples,
                     frame->ch_layout.nb_channels);
       frame->time_base = openedStream->time_base;
+      // 映像と同じ理由で、時刻が計算できないフレームは積まない。
+      if (frame->time_base.den == 0 || frame->time_base.num == 0) {
+        continue;
+      }
       // 通常は最初の映像フレームが出るまで音声を積まない(起動時 A/V 同期)。
       // WebCodecs モードは映像を JS 側でデコードするため videoFrameFound が
       // 立たない。この場合は音声がクロックの基準になるので、映像を待たずに
@@ -1561,33 +1619,20 @@ void decoderMainloop() {
     }
   }
 
-  // time_base が 0/0 な不正フレームが入ってたら捨てる
+  // キューに入っているのは time_base が有効なフレームだけ (不正フレームは
+  // デコードスレッド側で捨てている)。
   AVFrame *currentFrame = nullptr;
   {
     std::lock_guard<std::mutex> lock(videoFrameMtx);
-    while (!videoFrameQueue.empty()) {
-      AVFrame *frame = videoFrameQueue.front();
-      if (frame->time_base.den == 0 || frame->time_base.num == 0) {
-        videoFrameQueue.pop_front();
-        av_frame_free(&frame);
-      } else {
-        currentFrame = frame;
-        break;
-      }
+    if (!videoFrameQueue.empty()) {
+      currentFrame = videoFrameQueue.front();
     }
   }
   AVFrame *audioFrame = nullptr;
   {
     std::lock_guard<std::mutex> lock(audioFrameMtx);
-    while (!audioFrameQueue.empty()) {
-      AVFrame *frame = audioFrameQueue.front();
-      if (frame->time_base.den == 0 || frame->time_base.num == 0) {
-        audioFrameQueue.pop_front();
-        av_frame_free(&frame);
-      } else {
-        audioFrame = frame;
-        break;
-      }
+    if (!audioFrameQueue.empty()) {
+      audioFrame = audioFrameQueue.front();
     }
   }
 
@@ -1596,13 +1641,14 @@ void decoderMainloop() {
   // 独立に計算しておき、JS の映像表示同期に使わせる。
   if (audioFrame &&
       currentAudioSampleRate.load(std::memory_order_relaxed) > 0) {
-    currentAudioPlaybackTime =
+    double playTime =
         estimateAudioPlayTime(audioFrame, currentBufferedAudioSamples);
+    currentAudioPlaybackTime.store(playTime, std::memory_order_relaxed);
     // 映像フレームのPTSではなく、この音声クロックを基準にする。
     // WebCodecs モードでは映像フレームが videoFrameQueue を
     // 通らない(JS側でデコードする)ため、映像基準にすると
     // 4K/2K のハードウェアデコード時に再生時刻が進まなくなる。
-    advancePlaybackTime(currentAudioPlaybackTime);
+    advancePlaybackTime(playTime);
   }
 
   if (currentFrame && audioFrame) {
@@ -1637,23 +1683,14 @@ void decoderMainloop() {
     // 残りは捨てる。1 回の呼び出しで 1 枚しか進めないと、メインループが遅く
     // なった間に溜まったフレームを「1枚/呼び出し」で消化することになり、映像が
     // 早送りで音声に追いつく動きになる。
-    //
-    // 特にタブが非表示の間は、fps 指定のメインループが setTimeout で回るため
-    // ブラウザに約 1Hz まで絞られる (音声は AudioWorklet
-    // 側で実時間のまま進む)。
-    // 表示に戻した瞬間に数百フレームの遅れが生じているので、ここで捨てないと
-    // 目に見える早送りになる。
+    // 大量に溜まるぶんは変換スレッド側 (dropUndisplayedVideoFrames) で捨てて
+    // いるので、ここで捨てるのはキュー長ぶんの端数だけ。
     AVFrame *frameToShow = nullptr;
     int droppedFrames = 0;
     {
       std::lock_guard<std::mutex> lock(videoFrameMtx);
       while (!videoFrameQueue.empty()) {
         AVFrame *head = videoFrameQueue.front();
-        if (head->time_base.den == 0 || head->time_base.num == 0) {
-          videoFrameQueue.pop_front();
-          av_frame_free(&head);
-          continue;
-        }
         // まだ再生時刻に達していないフレームはキューに残す。
         if (head->pts * av_q2d(head->time_base) >= estimatedAudioPlayTime) {
           break;
