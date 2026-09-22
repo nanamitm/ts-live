@@ -9,6 +9,7 @@
 #include <emscripten/bind.h>
 #include <emscripten/emscripten.h>
 #include <emscripten/fetch.h>
+#include <emscripten/heap.h>
 #include <emscripten/threading.h>
 #include <emscripten/val.h>
 #include <mutex>
