@@ -93,8 +93,10 @@ list(JOIN FFMPEG_CONFIGURE_COMMAND_LIST " " FFMPEG_CONFIGURE_COMMAND)
 include(ExternalProject)
 ExternalProject_Add(
   ffmpeg
+  # FFmpeg n9.0.1 に MMT/TLV デマルチプレクサ(SuperFashi/FFmpeg 由来)と
+  # その修正を載せたブランチ。
   GIT_REPOSITORY https://github.com/nanamitm/FFmpeg.git
-  GIT_TAG feature/fix-mmttlv-resync
+  GIT_TAG feature/mmttlv-n9.0.1
   # 初回clone後は update(git reset)を再実行しない。再コンフィグのたびにソースが
   # reset されて mtime が変わり ffmpeg 全体が無駄に再コンパイルされるのを防ぐ。
   UPDATE_DISCONNECTED TRUE
@@ -103,8 +105,8 @@ ExternalProject_Add(
   CONFIGURE_COMMAND bash -c "[ -e ${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-done ] || ${FFMPEG_CONFIGURE_COMMAND}"
   BUILD_COMMAND ${CMAKE_COMMAND} -E env emmake make -j24
   INSTALL_COMMAND bash -c "[ -e ${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-done ] || make install"
-  # ffmpeg-wasm.patch は既に fork(feature/fix-mmttlv-resync)へ取り込み済みのため
-  # 適用不要。DRCS 字幕リソース(MMT data_type=6)を字幕ストリームへ流すための
+  # ffmpeg-wasm.patch は不要(n9.0.1 は --arch=wasm に標準で対応している)。
+  # DRCS 字幕リソース(MMT data_type=6)を字幕ストリームへ流すための
   # 追加パッチのみを当てる。
   # 再ビルド/フレッシュclone のどちらでも失敗しないよう冪等に当てる。fork tip が
   # 既に同変更を含む場合は -N で適用済みとみなしスキップし(.rej も作らず)、|| true
@@ -112,7 +114,7 @@ ExternalProject_Add(
   #  - drcs: 字幕リソース(DRCS/SVGフォント, data_type=6)も字幕ストリームへ流す
   #  - skip-tlv: 未対応 TLV パケット種別(0xFE TLV-SI 等)を PATCHWELCOME で中断せず
   #    スキップする(ログ洪水と低頻度な字幕 MFU 取りこぼしの解消)
-  PATCH_COMMAND bash -c "patch -p1 -N -r - < ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-drcs.patch || true; patch -p1 -N -r - < ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-skip-tlv.patch || true"
+  PATCH_COMMAND bash -c "(patch -p1 -N -r - < ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-drcs.patch || true) && (patch -p1 -N -r - < ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-skip-tlv.patch || true)"
 )
 
 
@@ -148,6 +150,12 @@ target_link_options(ts-live PRIVATE
   # スレッド(最大8) を賄える数を確保しつつ、STRICT=0 で不足時の動的生成も許可。
   "SHELL:-s PTHREAD_POOL_SIZE=24"
   "SHELL:-s PTHREAD_POOL_SIZE_STRICT=0"
+  # 既定の 64KiB では FFmpeg 9.0 の mpegts の avformat_open_input (PAT 解析)
+  # がスタックを使い切り、黙ってヒープを壊す(後で free が落ちる)。実測で
+  # 128KiB あれば足りる。メインスレッドは1本なので多めに、ワーカーは本数が
+  # 多いので控えめに取る。
+  "SHELL:-s STACK_SIZE=1048576"
+  "SHELL:-s DEFAULT_PTHREAD_STACK_SIZE=262144"
   "SHELL:-s USE_SDL=0"
   "SHELL:-s USE_WEBGPU=1"
   "SHELL:-s FETCH=1"

@@ -10,5 +10,6 @@ em++ -O2 -std=c++20 -pthread -msimd128 \
   wasm/build/install/lib/libswresample.a -Wl,--end-group \
   -lembind --no-entry -sMODULARIZE=1 -sENVIRONMENT=node \
   -sPTHREAD_POOL_SIZE=2 -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=134217728 \
+  -sSTACK_SIZE=1048576 -sDEFAULT_PTHREAD_STACK_SIZE=262144 \
   -o wasm/build/ts-duration-test.cjs
 node test/wasm/ts-duration.mjs
