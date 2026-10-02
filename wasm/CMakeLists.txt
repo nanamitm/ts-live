@@ -94,9 +94,11 @@ include(ExternalProject)
 ExternalProject_Add(
   ffmpeg
   # FFmpeg n9.0.1 に MMT/TLV デマルチプレクサ(SuperFashi/FFmpeg 由来)と
-  # その修正を載せたブランチ。
+  # その修正を載せたブランチ(feature/mmttlv-n9.0.1)。clone した時期でビルド結果が
+  # 変わらないようコミットで固定する。更新するときはブランチの新しいコミットに
+  # 書き換え、下のパッチがまだ当たることを確認する。
   GIT_REPOSITORY https://github.com/nanamitm/FFmpeg.git
-  GIT_TAG feature/mmttlv-n9.0.1
+  GIT_TAG 4bdda6c4b0b16c7af74a5abcb2455020445f11fe
   # 初回clone後は update(git reset)を再実行しない。再コンフィグのたびにソースが
   # reset されて mtime が変わり ffmpeg 全体が無駄に再コンパイルされるのを防ぐ。
   UPDATE_DISCONNECTED TRUE
@@ -108,13 +110,14 @@ ExternalProject_Add(
   # ffmpeg-wasm.patch は不要(n9.0.1 は --arch=wasm に標準で対応している)。
   # DRCS 字幕リソース(MMT data_type=6)を字幕ストリームへ流すための
   # 追加パッチのみを当てる。
-  # 再ビルド/フレッシュclone のどちらでも失敗しないよう冪等に当てる。fork tip が
-  # 既に同変更を含む場合は -N で適用済みとみなしスキップし(.rej も作らず)、|| true
-  # で PATCH ステップを成功扱いにする。
+  # apply-ffmpeg-patches.sh は既に含まれているパッチ(再ビルドや fork への取り込み)
+  # だけをスキップし、当たらなかった場合はビルドを失敗させる。
   #  - drcs: 字幕リソース(DRCS/SVGフォント, data_type=6)も字幕ストリームへ流す
   #  - skip-tlv: 未対応 TLV パケット種別(0xFE TLV-SI 等)を PATCHWELCOME で中断せず
   #    スキップする(ログ洪水と低頻度な字幕 MFU 取りこぼしの解消)
-  PATCH_COMMAND bash -c "(patch -p1 -N -r - < ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-drcs.patch || true) && (patch -p1 -N -r - < ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-skip-tlv.patch || true)"
+  PATCH_COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/apply-ffmpeg-patches.sh
+    ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-drcs.patch
+    ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-skip-tlv.patch
 )
 
 
