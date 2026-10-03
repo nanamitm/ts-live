@@ -15,7 +15,9 @@ import {
   parsePair,
   parsePx,
   parseOutline,
+  parseCodepointAttribute,
   parseTtmlTiming,
+  ttmlUsesAnyCodepoint,
 } from '../lib/ttml'
 
 type Props = {
@@ -104,34 +106,47 @@ type DrcsGlyph = {
 
 // SVGフォント(<font><glyph unicode d>...)を解析し、コードポイント→グリフの
 // 表に登録する。TTML 本文中の PUA 文字がこの表で置換描画される。
+// 戻り値は今回初めて登録されたコードポイント(リソースの再送で既に持っている
+// グリフは含めない)。表示中の字幕を描き直すかの判定に使う。
 const registerDrcsGlyphs = (
   svg: string,
   map: Map<number, DrcsGlyph>
-): number => {
+): number[] => {
   const doc = new DOMParser().parseFromString(svg, 'image/svg+xml')
-  if (doc.getElementsByTagName('parsererror').length > 0) return 0
-  const fontEl = doc.getElementsByTagName('font')[0]
-  const faceEl = doc.getElementsByTagName('font-face')[0]
-  const unitsPerEm =
-    parseFloat(faceEl?.getAttribute('units-per-em') || '') || 1000
-  const fontAdv =
-    parseFloat(fontEl?.getAttribute('horiz-adv-x') || '') || unitsPerEm
-  let n = 0
-  for (const g of Array.from(doc.getElementsByTagName('glyph'))) {
-    const uni = g.getAttribute('unicode')
-    const d = g.getAttribute('d')
-    if (!uni || !d) continue
-    const cp = uni.codePointAt(0)
-    if (cp === undefined) continue
-    const advance = parseFloat(g.getAttribute('horiz-adv-x') || '') || fontAdv
-    try {
-      map.set(cp, { path: new Path2D(d), unitsPerEm, advance })
-      n++
-    } catch {
-      // 無効なパスは無視
+  if (doc.getElementsByTagName('parsererror').length > 0) return []
+  const added: number[] = []
+  // <font> ごとに font-face(units-per-em, unicode-range)が付く。<font> が
+  // 無い文書は全体を 1 つのフォントとして扱う。
+  const fonts = Array.from(doc.getElementsByTagName('font'))
+  const scopes: Element[] = fonts.length > 0 ? fonts : [doc.documentElement]
+  for (const fontEl of scopes) {
+    const faceEl = fontEl.getElementsByTagName('font-face')[0]
+    const unitsPerEm =
+      parseFloat(faceEl?.getAttribute('units-per-em') || '') || 1000
+    const fontAdv =
+      parseFloat(fontEl.getAttribute('horiz-adv-x') || '') || unitsPerEm
+    // 放送のリソースは 1 フォント 1 グリフで、コードポイントを font-face の
+    // unicode-range にしか書かないことが多い。glyph 側に無ければこれを使う。
+    const faceCp = parseCodepointAttribute(faceEl?.getAttribute('unicode-range'))
+    for (const g of Array.from(fontEl.getElementsByTagName('glyph'))) {
+      const d = g.getAttribute('d')
+      if (!d) continue
+      const cp =
+        parseCodepointAttribute(g.getAttribute('unicode')) ??
+        parseCodepointAttribute(g.getAttribute('unicode-range')) ??
+        faceCp
+      if (cp === undefined) continue
+      const advance = parseFloat(g.getAttribute('horiz-adv-x') || '') || fontAdv
+      try {
+        const isNew = !map.has(cp)
+        map.set(cp, { path: new Path2D(d), unitsPerEm, advance })
+        if (isNew) added.push(cp)
+      } catch {
+        // 無効なパスは無視
+      }
     }
   }
-  return n
+  return added
 }
 
 const renderTtml = (
@@ -303,6 +318,9 @@ const Caption: React.FC<Props> = ({
   // DRCS(外字)グリフ表: コードポイント→SVGパス。字幕リソース(SVGフォント)を
   // 受信するたびに登録し、service 切替でクリアする。
   const glyphMapRef = useRef<Map<number, DrcsGlyph>>(new Map())
+  // いま canvas に出ている TTML(消去済みなら null)。字幕本文より後から外字の
+  // グリフが届いたとき、表示中の字幕をそのグリフで描き直すのに使う。
+  const shownTtmlRef = useRef<string | null>(null)
   // 現在の service を captionCallback(deps 空)から参照するための ref。4K→2K
   // 切替後に遅れて届く 4K(TTML)字幕を破棄する判定に使う。
   const serviceRef = useRef<Service | undefined>(undefined)
@@ -338,7 +356,15 @@ const Caption: React.FC<Props> = ({
           // DRCS 外字リソース(SVGフォント)も同じ字幕ストリームで届く。<svg> を
           // 判別してグリフ表に登録し、字幕本文としては描画しない。
           if (/<svg[\s>]/.test(xml.slice(0, 400))) {
-            registerDrcsGlyphs(xml, glyphMapRef.current)
+            const added = registerDrcsGlyphs(xml, glyphMapRef.current)
+            // 字幕本文がリソースより先に届くと、外字はグリフ無しで描かれて
+            // いる。表示中の字幕がいま届いたグリフを使っていれば描き直す。
+            // TTML は同一内容が再送されないので、次の字幕を待つと外字が
+            // 欠けたまま表示し終わってしまう。
+            const shown = shownTtmlRef.current
+            if (shown && ttmlUsesAnyCodepoint(shown, added)) {
+              renderTtml(context, canvas, shown, glyphMapRef.current)
+            }
             return
           }
 
@@ -353,6 +379,7 @@ const Caption: React.FC<Props> = ({
           const { begin, end } = parseTtmlTiming(xml)
           if (begin == null || !Number.isFinite(now)) {
             // タイミング情報が無ければ従来どおり到着時に即描画する。
+            shownTtmlRef.current = xml
             renderTtml(context, canvas, xml, glyphMapRef.current)
             return
           }
@@ -394,6 +421,7 @@ const Caption: React.FC<Props> = ({
             // 既により新しい字幕が表示済みなら、この古い表示は描かない。
             if (id < ttmlShownIdRef.current) return
             ttmlShownIdRef.current = id
+            shownTtmlRef.current = xml
             renderTtml(context, canvas, xml, glyphMapRef.current)
           }, delayShow * 1000)
           ttmlTimersRef.current.push(showTimer)
@@ -405,6 +433,7 @@ const Caption: React.FC<Props> = ({
                 ttmlTimersRef.current = ttmlTimersRef.current.filter(t => t !== clearTimer)
                 // 後続字幕に置き換わっていれば消去しない(現在の字幕を守る)。
                 if (ttmlShownIdRef.current !== id) return
+                shownTtmlRef.current = null
                 context.clearRect(0, 0, canvas.width, canvas.height)
               }, delayClear * 1000)
               ttmlTimersRef.current.push(clearTimer)
@@ -489,6 +518,7 @@ const Caption: React.FC<Props> = ({
     ttmlStreamRef.current = -1
     ttmlShownIdRef.current = -1
     lastTtmlRef.current = null
+    shownTtmlRef.current = null
     glyphMapRef.current.clear()
   }, [canvasRef, service, resetToken])
 
@@ -511,6 +541,7 @@ const Caption: React.FC<Props> = ({
     if (!canvasRef.current) return
     const context = canvasRef.current.getContext('2d')
     if (!context) return
+    shownTtmlRef.current = lastTtmlRef.current
     renderTtml(context, canvasRef.current, lastTtmlRef.current, glyphMapRef.current)
   }, [canvasRef, show])
 

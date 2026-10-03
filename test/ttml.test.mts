@@ -3,10 +3,12 @@ import assert from 'node:assert/strict'
 import {
   cssColor,
   parseClock,
+  parseCodepointAttribute,
   parseOutline,
   parsePair,
   parsePx,
   parseTtmlTiming,
+  ttmlUsesAnyCodepoint,
 } from '../src/lib/ttml.ts'
 
 test('parsePx は単位付きの値から数値を取り出す', () => {
@@ -75,4 +77,34 @@ test('parseTtmlTiming は begin/end が無ければ null', () => {
     begin: null,
     end: null,
   })
+})
+
+test('parseCodepointAttribute は文字・U+表記・範囲・文字参照を読む', () => {
+  assert.equal(parseCodepointAttribute(''), 0xe001)
+  assert.equal(parseCodepointAttribute('\u{F0001}'), 0xf0001)
+  assert.equal(parseCodepointAttribute('U+E001'), 0xe001)
+  assert.equal(parseCodepointAttribute('u+e001-e0ff'), 0xe001)
+  assert.equal(parseCodepointAttribute('U+E0??'), 0xe000)
+  assert.equal(parseCodepointAttribute('&#xE001;'), 0xe001)
+  assert.equal(parseCodepointAttribute('&#57345;'), 0xe001)
+})
+
+test('parseCodepointAttribute は読めない値で undefined を返す', () => {
+  assert.equal(parseCodepointAttribute(''), undefined)
+  assert.equal(parseCodepointAttribute(null), undefined)
+  assert.equal(parseCodepointAttribute(undefined), undefined)
+  // 文字参照の書き損じを '&'(U+0026)として登録しない
+  assert.equal(parseCodepointAttribute('&#xZZ;'), undefined)
+  assert.equal(parseCodepointAttribute('U+110000'), undefined)
+})
+
+test('ttmlUsesAnyCodepoint は本文の文字と数値文字参照の両方を見る', () => {
+  const literal = '<tt><body><div><p><span>あ</span></p></div></body></tt>'
+  const hexRef = '<tt><body><div><p><span>&#xE001;</span></p></div></body></tt>'
+  const decRef = '<tt><body><div><p><span>&#57345;</span></p></div></body></tt>'
+  assert.equal(ttmlUsesAnyCodepoint(literal, [0xe001]), true)
+  assert.equal(ttmlUsesAnyCodepoint(hexRef, [0xe001]), true)
+  assert.equal(ttmlUsesAnyCodepoint(decRef, [0xe001]), true)
+  assert.equal(ttmlUsesAnyCodepoint(literal, [0xe002]), false)
+  assert.equal(ttmlUsesAnyCodepoint(literal, []), false)
 })

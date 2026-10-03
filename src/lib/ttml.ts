@@ -63,3 +63,47 @@ export const parseTtmlTiming = (
     end: em ? parseClock(em[1]) : null,
   }
 }
+
+// SVG フォント(DRCS 字幕リソース)の unicode / unicode-range 属性値から
+// コードポイントを 1 つ取り出す。受け付ける形式:
+//   - 文字そのもの("")
+//   - "U+E001" や範囲 "U+E001-E0FF"(範囲は先頭を使う)
+//   - 二重にエスケープされて残った文字参照("&#xE001;" / "&#57345;")
+// 文字参照を文字列のまま読むと '&'(U+0026)に登録されてしまうので、
+// 解釈できなければ undefined を返す。
+export const parseCodepointAttribute = (
+  value: string | null | undefined
+): number | undefined => {
+  if (!value) return undefined
+  const ref = value.match(/^&#(x?)([0-9a-fA-F]+);?$/i)
+  if (ref) {
+    const cp = parseInt(ref[2], ref[1] ? 16 : 10)
+    return Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff ? cp : undefined
+  }
+  if (value.startsWith('&#')) return undefined
+  const range = value.match(/^[uU]\+([0-9a-fA-F?]+)/)
+  if (range) {
+    // "U+E0??" のようなワイルドカード範囲は先頭(? を 0 とみなす)を使う。
+    const cp = parseInt(range[1].replace(/\?/g, '0'), 16)
+    return Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff ? cp : undefined
+  }
+  return value.codePointAt(0)
+}
+
+// TTML 文書中に現れるコードポイントのうち、cps に含まれるものがあるか。
+// 本文の文字そのものに加え、数値文字参照(&#xE001; / &#57345;)も見る。
+export const ttmlUsesAnyCodepoint = (
+  xml: string,
+  cps: Iterable<number>
+): boolean => {
+  const wanted = new Set(cps)
+  if (wanted.size === 0) return false
+  for (const ch of xml) {
+    const cp = ch.codePointAt(0)
+    if (cp !== undefined && wanted.has(cp)) return true
+  }
+  for (const m of xml.matchAll(/&#(x?)([0-9a-fA-F]+);/gi)) {
+    if (wanted.has(parseInt(m[2], m[1] ? 16 : 10))) return true
+  }
+  return false
+}
