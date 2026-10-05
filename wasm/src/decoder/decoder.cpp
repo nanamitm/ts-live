@@ -109,7 +109,13 @@ void setInputEnded();
 std::atomic<bool> tlvMode{false};
 
 void setTlvMode(bool isTlv) {
-  tlvMode = isTlv;
+  {
+    // read_packet() の待ち条件はモードで変わるので、待っているスレッドに
+    // 新しいモードで判定し直させる。
+    std::lock_guard<std::mutex> lock(inputBufferMtx);
+    tlvMode = isTlv;
+  }
+  waitCv.notify_all();
   spdlog::info("setTlvMode: {}", isTlv);
 }
 
@@ -478,24 +484,37 @@ static size_t skipToTsSync() {
 int read_packet(void *opaque, uint8_t *buf, int bufSize) {
   std::unique_lock<std::mutex> lock(inputBufferMtx);
 
-  if (tlvMode) {
-    // ffmpeg 側 (mmttlv デマルチプレクサの resync 処理などで
-    // ffio_ensure_seekback を通じて) は状況によって大きめの bufSize を
-    // 要求することがある。TS モードと同じく「bufSize 分たまるまで待つ」
-    // 実装のままだと、ネットワークから小分けに届く BS4K の高ビットレート
-    // データに対してデコーダースレッドが不必要に長くブロックされ、その間
-    // 供給側だけが溜まり続けてリングバッファを溢れさせてしまう
-    // (コマ送り/Buffer overflow の原因)。AVIOContext の read_packet は
-    // 部分読み出し (要求より少ないバイト数を返す) が正式に許容されている
-    // ため、TLV モードでは 1 バイトでも届いていればすぐ返す。
-    waitCv.wait(lock, [&] {
-      return inputBufferWriteIndex > inputBufferReadIndex || resetedDecoder ||
-             inputEnded;
-    });
-    if (resetedDecoder) {
-      spdlog::debug("resetedDecoder detected in read_packet");
-      return AVERROR_EXIT;
+  // TS/TLV の別は待ち終わってから決める。デコードスレッドは再生の合間にも
+  // 次の入力を待って read_packet に入っており、その後で JS が setTlvMode()
+  // してからデータを流す (起動直後の最初の再生や、2K から BS4K への切替)。
+  // 待つ前にモードを決めると、TLV のデータを TS として 0x47 探索に回して
+  // 読み捨て、probe も失敗する。失敗したスレッドは作り直しの resetInternal()
+  // で入力バッファを空にするので、流し込み済みのデータがすべて失われる。
+  //
+  // TLV モードでは 1 バイトでも届いていればすぐ返す。ffmpeg 側 (mmttlv
+  // デマルチプレクサの resync 処理などで ffio_ensure_seekback を通じて) は
+  // 状況によって大きめの bufSize を要求することがある。TS モードと同じく
+  // 「bufSize 分たまるまで待つ」と、ネットワークから小分けに届く BS4K の
+  // 高ビットレートデータに対してデコーダースレッドが不必要に長くブロックされ、
+  // その間供給側だけが溜まり続けてリングバッファを溢れさせてしまう
+  // (コマ送り/Buffer overflow の原因)。AVIOContext の read_packet は部分
+  // 読み出し (要求より少ないバイト数を返す) が正式に許容されている。
+  //
+  // TS モードでも終端に達したら bufSize 分たまるのを待たない。待ち続けると
+  // 末尾の端数が永遠に処理されない。
+  waitCv.wait(lock, [&] {
+    if (resetedDecoder || inputEnded) {
+      return true;
     }
+    const size_t available = inputBufferWriteIndex - inputBufferReadIndex;
+    return tlvMode ? available > 0 : available >= static_cast<size_t>(bufSize);
+  });
+  if (resetedDecoder) {
+    spdlog::debug("resetedDecoder detected in read_packet");
+    return AVERROR_EXIT;
+  }
+
+  if (tlvMode) {
     if (inputBufferWriteIndex <= inputBufferReadIndex) {
       // 終端に達していて、かつ読み切った。
       spdlog::debug("input ended in read_packet (tlv)");
@@ -511,17 +530,6 @@ int read_packet(void *opaque, uint8_t *buf, int bufSize) {
     consumedInputBytes += copySize;
     waitCv.notify_all();
     return copySize;
-  }
-
-  // 終端に達したら bufSize 分たまるのを待たない。待ち続けると末尾の端数が
-  // 永遠に処理されない。
-  waitCv.wait(lock, [&] {
-    return inputBufferWriteIndex - inputBufferReadIndex >= bufSize ||
-           resetedDecoder || inputEnded;
-  });
-  if (resetedDecoder) {
-    spdlog::debug("resetedDecoder detected in read_packet");
-    return AVERROR_EXIT;
   }
 
   const size_t readStart = inputBufferReadIndex;
