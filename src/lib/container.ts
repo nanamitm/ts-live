@@ -14,8 +14,15 @@ export const looksLikeTs = (buf: Uint8Array): boolean => {
     }
     return hit >= 6
   }
-  // 188=通常TS, 192(offset4)=M2TS(4バイトタイムスタンプ付), 192(offset0)も一応
-  return hits(0, 188) || hits(4, 192) || hits(0, 192)
+  // 188=通常TS, 192=M2TS(4バイトタイムスタンプ付なら同期バイトは offset 4)。
+  // 録画の途中から切り出したファイルは先頭がパケット境界に揃っていないので、
+  // 最初のパケット 1 個ぶんのどの位置から並んでいてもよい。
+  for (const stride of [188, 192]) {
+    for (let start = 0; start < stride; start++) {
+      if (hits(start, stride)) return true
+    }
+  }
+  return false
 }
 
 export const looksLikeTlv = (buf: Uint8Array): boolean => !looksLikeTs(buf)

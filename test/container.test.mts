@@ -25,6 +25,16 @@ test('M2TS (192 バイト間隔, offset 4) を判定する', () => {
   assert.equal(looksLikeTs(syncedBuffer(4, 192)), true)
 })
 
+test('パケット境界に揃っていない TS/M2TS も判定する', () => {
+  // 録画の途中から切り出したファイル。先頭は前のパケットの途中から始まる。
+  for (const offset of [1, 100, 187]) {
+    assert.equal(looksLikeTs(syncedBuffer(offset, 188)), true, `TS offset ${offset}`)
+  }
+  for (const offset of [0, 1, 150, 191]) {
+    assert.equal(looksLikeTs(syncedBuffer(offset, 192)), true, `M2TS offset ${offset}`)
+  }
+})
+
 test('同期バイトが並んでいなければ TLV とみなす', () => {
   const random = new Uint8Array(CONTAINER_PROBE_SIZE)
   for (let i = 0; i < random.length; i++) random[i] = (i * 31 + 7) % 251
