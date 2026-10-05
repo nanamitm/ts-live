@@ -1568,8 +1568,12 @@ const Page: NextPage = () => {
                 `}
                 label="Services"
                 labelId="services-label"
-                defaultValue={
-                  activeService ? activeService.id : tvServices.length > 0 ? tvServices[0].id : null
+                // 一覧に無い値を渡すと MUI が範囲外の値として警告するので、
+                // サービス一覧が届くまで(と未選択のとき)は空文字にする。
+                value={
+                  activeService && tvServices.some(s => s.id === activeService.id)
+                    ? activeService.id
+                    : ''
                 }
                 onChange={ev => {
                   if (ev.target.value !== null && typeof ev.target.value === 'number') {
