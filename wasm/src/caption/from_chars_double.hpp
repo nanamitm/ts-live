@@ -14,9 +14,9 @@
 #if !defined(__cpp_lib_to_chars)
 namespace std {
 
-inline from_chars_result
-from_chars(const char *first, const char *last, double &value,
-           chars_format = chars_format::general) {
+inline from_chars_result from_chars(const char *first, const char *last,
+                                    double &value,
+                                    chars_format = chars_format::general) {
   // from_chars は先頭の空白も '+' も受け付けない。strtod はどちらも読むので
   // 先に弾く。
   if (first == last || *first == '+' || *first == ' ' || *first == '\t' ||

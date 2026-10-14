@@ -70,9 +70,9 @@ val toStyle(const ttml::StyleProperties &style) {
                              : "normal");
   }
   if (style.font_weight) {
-    out.set("fontWeight",
-            *style.font_weight == ttml::StyleFontWeightValue::Bold ? "bold"
-                                                                    : "normal");
+    out.set("fontWeight", *style.font_weight == ttml::StyleFontWeightValue::Bold
+                              ? "bold"
+                              : "normal");
   }
   if (style.line_height) {
     // normal は null、数値は px。

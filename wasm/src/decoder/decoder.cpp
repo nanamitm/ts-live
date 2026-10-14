@@ -1877,9 +1877,9 @@ void decoderThreadFunc() {
                 pktCapStream->metadata, "arib_resolution", nullptr, 0)) {
           resolution = atoi(e->value);
         }
-        if (const AVDictionaryEntry *e = av_dict_get(
-                pktCapStream->metadata, "arib_reference_start_time", nullptr,
-                0)) {
+        if (const AVDictionaryEntry *e =
+                av_dict_get(pktCapStream->metadata, "arib_reference_start_time",
+                            nullptr, 0)) {
           referenceStartTime = (double)strtoll(e->value, nullptr, 10) / 1e6;
         }
         bool changed = false;
@@ -1887,10 +1887,9 @@ void decoderThreadFunc() {
           std::lock_guard<std::mutex> lock(ttmlMtx);
           // 同じ本文でも字幕アセットや基準時刻が変われば別の字幕として
           // JS 側へ渡す(時間軸が変わっている)。
-          bool sameReference =
-              (std::isnan(referenceStartTime) &&
-               std::isnan(lastTtmlReferenceStartTime)) ||
-              referenceStartTime == lastTtmlReferenceStartTime;
+          bool sameReference = (std::isnan(referenceStartTime) &&
+                                std::isnan(lastTtmlReferenceStartTime)) ||
+                               referenceStartTime == lastTtmlReferenceStartTime;
           if (ttml != lastTtml || pktCapStream->index != lastTtmlStreamIndex ||
               tmd != lastTtmlTmd || !sameReference) {
             lastTtml = ttml;
