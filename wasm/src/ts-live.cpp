@@ -12,6 +12,7 @@
 
 #include "../../misc-wasm/src/grabber/grabber.hpp"
 #include "audio/audioworklet.hpp"
+#include "caption/ttml.hpp"
 #include "decoder/decoder.hpp"
 #include "decoder/ts-duration.hpp"
 #include "video/webgpu.hpp"
@@ -78,6 +79,7 @@ EMSCRIPTEN_BINDINGS(ts_live_module) {
   emscripten::function("getExceptionMsg", &getExceptionMsg);
   emscripten::function("showVersionInfo", &showVersionInfo);
   emscripten::function("setCaptionCallback", &setCaptionCallback);
+  emscripten::function("parseTtml", &parseTtml);
   emscripten::function("setStatsCallback", &setStatsCallback);
   emscripten::function("playFile", &playFile);
   emscripten::function("getNextInputBuffer", &getNextInputBuffer);

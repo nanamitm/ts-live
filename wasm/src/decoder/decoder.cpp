@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdlib>
@@ -134,6 +135,12 @@ struct CaptionData {
   int streamIndex = -1;
   AVRational timeBase = {0, 1};
   bool isTtml = false;
+  // TTML のみ。字幕アセットの TMD(不明なら -1)、reference_start_time
+  // (Unix 秒、TMD=0010 で送られていなければ NaN)と表示解像度の符号
+  // (ARIB STD-B60 の resolution。不明なら -1)。
+  int tmd = -1;
+  double referenceStartTime = NAN;
+  int resolution = -1;
   std::vector<uint8_t> data;
 };
 std::deque<CaptionData> captionDataQueue;
@@ -145,6 +152,8 @@ std::mutex videoFrameMtx, audioFrameMtx, captionDataMtx;
 std::mutex ttmlMtx;
 std::string lastTtml;
 int lastTtmlStreamIndex = -1;
+int lastTtmlTmd = -1;
+double lastTtmlReferenceStartTime = NAN;
 std::atomic<bool> videoFrameFound{false};
 
 // 10bit→8bit 変換を専用スレッドに分離するための中間キュー。
@@ -695,6 +704,8 @@ void resetInternal() {
     std::lock_guard<std::mutex> lock(ttmlMtx);
     lastTtml.clear();
     lastTtmlStreamIndex = -1;
+    lastTtmlTmd = -1;
+    lastTtmlReferenceStartTime = NAN;
   }
   streamsReady = false;
   currentAudioSampleRate = 0;
@@ -1839,6 +1850,8 @@ void decoderThreadFunc() {
           std::lock_guard<std::mutex> lock(ttmlMtx);
           lastTtml.clear();
           lastTtmlStreamIndex = -1;
+          lastTtmlTmd = -1;
+          lastTtmlReferenceStartTime = NAN;
         }
         captionStream = pktCapStream;
         captionIsTtml = pktIsTtml;
@@ -1846,20 +1859,44 @@ void decoderThreadFunc() {
                      avcodec_get_name(pktCapStream->codecpar->codec_id));
       }
       if (pktIsTtml) {
-        // 4K/8K の ARIB-TTML 字幕。PTS を持たない(AV_NOPTS_VALUE)ため 0 を
-        // 積み、表示タイミングは当面 JS 側で到着時に描画する(精密な
-        // begin/end 同期は後段で対応)。放送は同一 TTML を繰り返し送るので
+        // 4K/8K の ARIB-TTML 字幕。PTS を持たない(AV_NOPTS_VALUE)。表示時刻は
+        // 字幕アセットの TMD と reference_start_time(FFmpeg のパッチが
+        // ストリームのメタデータに出す)を起点にした begin/end で表され、
+        // JS 側で再生時刻に合わせる。放送は同一 TTML を繰り返し送るので
         // 直前と同一のものは間引く。
         std::string ttml(reinterpret_cast<const char *>(ppacket->data),
                          ppacket->size);
+        int tmd = -1;
+        int resolution = -1;
+        double referenceStartTime = NAN;
+        if (const AVDictionaryEntry *e =
+                av_dict_get(pktCapStream->metadata, "arib_tmd", nullptr, 0)) {
+          tmd = atoi(e->value);
+        }
+        if (const AVDictionaryEntry *e = av_dict_get(
+                pktCapStream->metadata, "arib_resolution", nullptr, 0)) {
+          resolution = atoi(e->value);
+        }
+        if (const AVDictionaryEntry *e = av_dict_get(
+                pktCapStream->metadata, "arib_reference_start_time", nullptr,
+                0)) {
+          referenceStartTime = (double)strtoll(e->value, nullptr, 10) / 1e6;
+        }
         bool changed = false;
         {
           std::lock_guard<std::mutex> lock(ttmlMtx);
-          // 同じ本文でも字幕アセットが変われば、JS 側へ streamIndex を通知して
-          // 時刻オフセットを再校正する必要がある。
-          if (ttml != lastTtml || pktCapStream->index != lastTtmlStreamIndex) {
+          // 同じ本文でも字幕アセットや基準時刻が変われば別の字幕として
+          // JS 側へ渡す(時間軸が変わっている)。
+          bool sameReference =
+              (std::isnan(referenceStartTime) &&
+               std::isnan(lastTtmlReferenceStartTime)) ||
+              referenceStartTime == lastTtmlReferenceStartTime;
+          if (ttml != lastTtml || pktCapStream->index != lastTtmlStreamIndex ||
+              tmd != lastTtmlTmd || !sameReference) {
             lastTtml = ttml;
             lastTtmlStreamIndex = pktCapStream->index;
+            lastTtmlTmd = tmd;
+            lastTtmlReferenceStartTime = referenceStartTime;
             changed = true;
           }
         }
@@ -1867,9 +1904,9 @@ void decoderThreadFunc() {
           std::vector<uint8_t> buffer(ppacket->data,
                                       ppacket->data + ppacket->size);
           std::lock_guard<std::mutex> lock(captionDataMtx);
-          captionDataQueue.push_back(CaptionData{0, pktCapStream->index,
-                                                 pktCapStream->time_base, true,
-                                                 std::move(buffer)});
+          captionDataQueue.push_back(CaptionData{
+              0, pktCapStream->index, pktCapStream->time_base, true, tmd,
+              referenceStartTime, resolution, std::move(buffer)});
         }
       } else {
         // 16進ダンプの生成は debug 出力時だけに限定する (毎字幕パケットで
@@ -1891,9 +1928,9 @@ void decoderThreadFunc() {
                                       ppacket->data + ppacket->size);
           {
             std::lock_guard<std::mutex> lock(captionDataMtx);
-            captionDataQueue.push_back(
-                CaptionData{ppacket->pts, pktCapStream->index,
-                            pktCapStream->time_base, false, std::move(buffer)});
+            captionDataQueue.push_back(CaptionData{
+                ppacket->pts, pktCapStream->index, pktCapStream->time_base,
+                false, -1, NAN, -1, std::move(buffer)});
           }
         }
       }
@@ -2421,13 +2458,16 @@ void decoderMainloop() {
           emscripten::typed_memory_view<uint8_t>(buffer.size(), &buffer[0]));
       if (p.isTtml) {
         // TTML(4K/8K)は PTS を持たず、表示時刻は TTML 内の begin/end で表現
-        // される。JS 側で同期できるよう、ここでは現在の再生メディア時刻
-        // (音声再生時刻・秒)を ptsTime として渡す。あわせて字幕アセットの
-        // stream index を渡し、JS 側が時間軸の乗り換えを検出できるようにする。
-        captionCallback((double)0, estimatedAudioPlayTime, data, p.streamIndex);
+        // される。pts には begin/end の起点(reference_start_time, Unix 秒。
+        // 無ければ NaN)を、ptsTime には同じ時計での現在の再生メディア時刻
+        // (音声再生時刻・秒)を渡す。あわせて字幕アセットの stream index、
+        // TMD と解像度を渡し、JS 側が時間軸の乗り換え・時刻制御の有無・
+        // 座標系を判断できるようにする。
+        captionCallback(p.referenceStartTime, estimatedAudioPlayTime, data,
+                        p.streamIndex, p.tmd, p.resolution);
       } else {
         captionCallback(pts, ptsTime - estimatedAudioPlayTime, data,
-                        p.streamIndex);
+                        p.streamIndex, -1, -1);
       }
     }
   }

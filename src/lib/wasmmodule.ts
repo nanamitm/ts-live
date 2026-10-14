@@ -1,3 +1,5 @@
+import type { TtmlDocument } from './ttml'
+
 // decoderMainloop() が statsCallback へ渡す 1 サンプル。キー名は WASM 側の
 // data.set(...) と一致させること。
 export declare interface StatsData {
@@ -41,14 +43,24 @@ export declare interface WasmModule extends EmscriptenModule {
   showVersionInfo(): void
   setCaptionCallback(
     callback: (
+      // B24: PTS。TTML: begin/end の起点の reference_start_time(Unix 秒、
+      // 送られていなければ NaN)。
       pts: number,
+      // B24: 表示までの秒数。TTML: 同じ時計での現在の再生時刻(秒)。
       ptsTime: number,
       captionData: Uint8Array,
       // 字幕が届いたアセットの stream index。番組内で字幕アセットが乗り換わる
       // (=時間軸が変わりうる)ことの検出に使う。
-      streamIndex: number
+      streamIndex: number,
+      // TTML: 字幕アセットの TMD(ARIB STD-B60)。B24 と不明は -1。
+      tmd: number,
+      // TTML: 字幕の表示解像度の符号(ARIB STD-B60)。B24 と不明は -1。
+      resolution: number
     ) => void
   ): void
+  // ARIB-TTML を dantto4k の parser/resolver で解析する。ignoreTiming は
+  // TMD=1111(時刻制御なし)用。
+  parseTtml(xml: string, ignoreTiming: boolean): TtmlDocument
   setStatsCallback(
     callback: ((statsDataList: Array<StatsData>) => void) | null
   ): void
