@@ -1,0 +1,72 @@
+diff --git a/libavformat/mmtp.c b/libavformat/mmtp.c
+index 45ddc1d..95d0788 100644
+--- a/libavformat/mmtp.c
++++ b/libavformat/mmtp.c
+@@ -557,7 +557,9 @@ parse_additional_arib_subtitle_info(AVStream *stream, GetByteContext *gbc)
+ {
+     bool    start_mpu_sequence_number_flag;
+     char    language_code[4];
+-    uint8_t subtitle_format;
++    char    value[32];
++    uint8_t subtitle_format, tmd, resolution, byte;
++    int     err;
+ 
+     if (bytestream2_get_bytes_left(gbc) <
+         (8 + 4 + 1 + 3 + 24 + 2 + 4 + 2 + 4 + 4 + 4 + 4) / 8)
+@@ -568,17 +570,15 @@ parse_additional_arib_subtitle_info(AVStream *stream, GetByteContext *gbc)
+     bytestream2_get_bufferu(gbc, language_code, 3);
+     language_code[3] = '\0';
+     subtitle_format = (bytestream2_get_byteu(gbc) >> 2) & 0b1111;
+-    /*
+-     * skip:
+-     * - TMD
+-     * - DMF
+-     * - resolution
+-     * - compression_type
+-     */
+-    bytestream2_skipu(gbc, (4 + 4 + 4 + 4) / 8);
++    // TMD and DMF, then resolution and compression_type (skipped: DMF and
++    // compression_type).
++    byte       = bytestream2_get_byteu(gbc);
++    tmd        = byte >> 4;
++    byte       = bytestream2_get_byteu(gbc);
++    resolution = byte >> 4;
+ 
+     if (start_mpu_sequence_number_flag)
+-        bytestream2_skip(gbc, 32);
++        bytestream2_skip(gbc, 32 / 8);
+ 
+     switch (subtitle_format) {
+     case 0b0000:
+@@ -586,6 +586,31 @@ parse_additional_arib_subtitle_info(AVStream *stream, GetByteContext *gbc)
+         break;
+     }
+ 
++    /*
++     * The caption timing of ARIB-TTML (ARIB STD-B60 Table 7-74, ARIB TR-B39
++     * 8.5.9.1) for the player: begin/end count from reference_start_time when
++     * TMD is 0010, and a TMD of 1111 has no time control at all. The time is
++     * given in microseconds since the Unix epoch, on the clock the MPU
++     * timestamps of the audio and video are converted to.
++     */
++    snprintf(value, sizeof(value), "%d", tmd);
++    if ((err = av_dict_set(&stream->metadata, "arib_tmd", value, 0)) < 0)
++        return err;
++    snprintf(value, sizeof(value), "%d", resolution);
++    if ((err = av_dict_set(&stream->metadata, "arib_resolution", value, 0)) < 0)
++        return err;
++    value[0] = '\0';
++    if (tmd == 0b0010 && bytestream2_get_bytes_left(gbc) >= (64 + 2 + 6) / 8) {
++        uint64_t ntp = bytestream2_get_be64u(gbc);
++        // A zero timestamp is no reference time, not the NTP epoch.
++        if (ntp >> 32)
++            snprintf(value, sizeof(value), "%" PRId64,
++                     (int64_t)(ff_parse_ntp_time(ntp) - NTP_OFFSET_US));
++    }
++    if ((err = av_dict_set(&stream->metadata, "arib_reference_start_time",
++                           value[0] ? value : NULL, 0)) < 0)
++        return err;
++
+     return av_dict_set(&stream->metadata, "language", language_code, 0);
+ }
+ 

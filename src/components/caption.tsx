@@ -10,13 +10,19 @@ import { WasmModule } from '../lib/wasmmodule'
 import { CanvasProvider } from 'aribb24.js'
 import { Service } from 'mirakurun/api'
 import {
-  TtmlOutline,
-  cssColor,
-  parsePair,
-  parsePx,
-  parseOutline,
+  TtmlClock,
+  TtmlDocument,
+  TtmlGlyph,
+  TtmlPair,
+  TMD_NO_TIME_CONTROL,
+  initialTtmlClock,
+  layoutTtml,
   parseCodepointAttribute,
-  parseTtmlTiming,
+  placeTtml,
+  ttmlBoundaries,
+  ttmlColor,
+  ttmlFirstBegin,
+  ttmlPlaneSize,
   ttmlUsesAnyCodepoint,
 } from '../lib/ttml'
 
@@ -37,64 +43,9 @@ type Props = {
 
 // --- ARIB-TTML (4K/8K MMT 字幕) レンダラ -----------------------------------
 // 2K の ARIB STD-B24 は aribb24.js が描画するが、4K/8K の MMT 字幕は TTML
-// (STD-B62) で符号体系が異なり aribb24.js では描画できない。ここでは実放送で
-// 観測した TTML サブセット(tt/head/styling+layout/body/div/p/span, 3840x2160
-// 座標系)を DOMParser でパースして Canvas に描画する。DRCS・ルビ・精密な
-// begin/end 同期は未対応(将来対応)。
-const TTML_PLANE_W = 3840
-const TTML_PLANE_H = 2160
-
-// <style> 1個から、定義されているプロパティだけを取り出した部分スタイル。
-// span の style 属性は複数 id の空白区切りで、これらを合成して使う。
-type TtmlStyleProps = {
-  fontFamily?: string
-  fontW?: number // fontSize の横px(セル幅)
-  fontH?: number // fontSize の縦px(セル高=描画サイズ)
-  color?: string
-  background?: string | null
-  lineHeight?: number
-  outline?: TtmlOutline | null
-  letterSpacing?: number
-}
-
-const parseStyleProps = (el: Element): TtmlStyleProps => {
-  const p: TtmlStyleProps = {}
-  const ff = el.getAttribute('tts:fontFamily')
-  if (ff) p.fontFamily = ff
-  const fs = el.getAttribute('tts:fontSize')
-  if (fs) {
-    const [w, h] = parsePair(fs)
-    if (h > 0) {
-      p.fontH = h
-      p.fontW = w > 0 ? w : h
-    }
-  }
-  const c = el.getAttribute('tts:color')
-  if (c) p.color = cssColor(c) || undefined
-  const bg = el.getAttribute('tts:backgroundColor')
-  if (bg) p.background = cssColor(bg)
-  const lh = el.getAttribute('tts:lineHeight')
-  if (lh) p.lineHeight = parsePx(lh)
-  const ol = el.getAttribute('tts:textOutline')
-  if (ol) p.outline = parseOutline(ol)
-  const ls = el.getAttribute('arib-tt:letter-spacing')
-  if (ls) p.letterSpacing = parsePx(ls)
-  return p
-}
-
-// span/p の style 属性(空白区切りの id リスト)を解決して合成する。
-const resolveStyle = (
-  ids: string | null,
-  table: Record<string, TtmlStyleProps>
-): TtmlStyleProps => {
-  const out: TtmlStyleProps = {}
-  if (!ids) return out
-  for (const id of ids.trim().split(/\s+/)) {
-    const s = table[id]
-    if (s) Object.assign(out, s)
-  }
-  return out
-}
+// (STD-B62 / TR-B39) で符号体系が異なり aribb24.js では描画できない。TTML の
+// 解析は WASM に組み込んだ dantto4k の parser/resolver が行い(parseTtml)、
+// ここでは解決済みの文書を ttml.ts の layoutTtml で配置して Canvas に描く。
 
 // DRCS(外字)グリフ。MMT の字幕リソース(SVGフォント)由来。unitsPerEm 座標系
 // (y-up, ベースライン=0)の SVG パスを保持する。
@@ -149,138 +100,111 @@ const registerDrcsGlyphs = (
   return added
 }
 
+// 表示中の TTML。外字のグリフが後から届いたときや OFF→ON で描き直すのに使う。
+type ShownTtml = {
+  doc: TtmlDocument
+  plane: TtmlPair
+  // 描いた時点の文書の時刻(秒)。
+  at: number
+}
+
+const fontOf = (g: TtmlGlyph): string => {
+  const family = g.style.fontFamily || 'sans-serif'
+  const italic = g.style.fontStyle === 'italic' ? 'italic ' : ''
+  const bold = g.style.fontWeight === 'bold' ? 'bold ' : ''
+  return `${italic}${bold}${g.h}px "${family}", sans-serif`
+}
+
+// 字形を (g.x, g.y) の g.w×g.h の枠に描く。stroke は縁取りだけを描く
+// パス(全文字の縁取りを先に描き、本体が隣の縁取りに隠れないようにする)。
+const drawGlyph = (
+  ctx: CanvasRenderingContext2D,
+  g: TtmlGlyph,
+  glyphs: Map<number, DrcsGlyph>,
+  stroke: boolean
+) => {
+  const drcs = glyphs.get(g.ch.codePointAt(0) as number)
+  const sx = g.w / g.h
+  ctx.save()
+  if (drcs) {
+    if (stroke) {
+      ctx.restore()
+      return
+    }
+    // SVGフォントは y-up/ベースライン=0。枠の上端に合わせて反転配置する。
+    const s = g.h / drcs.unitsPerEm
+    ctx.translate(g.x, g.y)
+    ctx.scale(s * sx, -s)
+    ctx.translate(0, -drcs.unitsPerEm)
+    ctx.fillStyle = ttmlColor(g.style.color) ?? 'white'
+    ctx.fill(drcs.path)
+    ctx.restore()
+    return
+  }
+  ctx.font = fontOf(g)
+  ctx.textBaseline = 'top'
+  // 全角の字形は枠いっぱい、それより狭い字形(英数字など)は枠の中央に置く。
+  const width = ctx.measureText(g.ch).width * sx
+  ctx.translate(g.x + Math.max(0, (g.w - width) / 2), g.y)
+  ctx.scale(sx, 1)
+  if (stroke) {
+    const outline = g.style.textOutline
+    if (outline && outline.width > 0) {
+      // textOutline の太さは字形の外側の幅。stroke は線の半分が外に出る。
+      ctx.lineWidth = outline.width * 2
+      ctx.strokeStyle = ttmlColor(outline.color ?? g.style.color) ?? 'black'
+      ctx.lineJoin = 'round'
+      ctx.strokeText(g.ch, 0, 0)
+    }
+  } else {
+    ctx.fillStyle = ttmlColor(g.style.color) ?? 'white'
+    ctx.fillText(g.ch, 0, 0)
+  }
+  ctx.restore()
+}
+
+// 下線と囲み(arib-tt:border)。文字の色で描く。
+const drawDecorations = (ctx: CanvasRenderingContext2D, g: TtmlGlyph) => {
+  const st = g.style
+  if (
+    !st.underline &&
+    !st.borderTop &&
+    !st.borderRight &&
+    !st.borderBottom &&
+    !st.borderLeft
+  ) {
+    return
+  }
+  const lw = Math.max(1, g.h / 24)
+  ctx.fillStyle = ttmlColor(st.color) ?? 'white'
+  if (st.underline || st.borderBottom) ctx.fillRect(g.x, g.y + g.h - lw, g.w, lw)
+  if (st.borderTop) ctx.fillRect(g.x, g.y, g.w, lw)
+  if (st.borderLeft) ctx.fillRect(g.x, g.y, lw, g.h)
+  if (st.borderRight) ctx.fillRect(g.x + g.w - lw, g.y, lw, g.h)
+}
+
 const renderTtml = (
   ctx: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
-  xml: string,
+  shown: ShownTtml,
   glyphs: Map<number, DrcsGlyph>
 ) => {
-  const scaleX = canvas.width / TTML_PLANE_W
-  const scaleY = canvas.height / TTML_PLANE_H
   ctx.clearRect(0, 0, canvas.width, canvas.height)
-
-  const doc = new DOMParser().parseFromString(xml, 'application/xml')
-  if (doc.getElementsByTagName('parsererror').length > 0) return
-
-  const styleTable: Record<string, TtmlStyleProps> = {}
-  for (const s of Array.from(doc.getElementsByTagName('style'))) {
-    const id = s.getAttribute('xml:id')
-    if (id) styleTable[id] = parseStyleProps(s)
+  const layout = layoutTtml(shown.doc, shown.at)
+  if (layout.glyphs.length === 0 && layout.backgrounds.length === 0) return
+  ctx.save()
+  // TTML の座標系(4K なら 3840x2160)のまま描く。
+  ctx.scale(canvas.width / shown.plane[0], canvas.height / shown.plane[1])
+  for (const r of layout.backgrounds) {
+    ctx.fillStyle = ttmlColor(r.color) as string
+    ctx.fillRect(r.x, r.y, r.w, r.h)
   }
-
-  const regions: Record<
-    string,
-    { ox: number; oy: number; ew: number; eh: number }
-  > = {}
-  for (const r of Array.from(doc.getElementsByTagName('region'))) {
-    const id = r.getAttribute('xml:id')
-    if (!id) continue
-    const [ox, oy] = parsePair(r.getAttribute('tts:origin'))
-    const [ew, eh] = parsePair(r.getAttribute('tts:extent'))
-    regions[id] = { ox, oy, ew, eh }
+  for (const g of layout.glyphs) drawGlyph(ctx, g, glyphs, true)
+  for (const g of layout.glyphs) {
+    drawGlyph(ctx, g, glyphs, false)
+    drawDecorations(ctx, g)
   }
-
-  const ctxAny = ctx as CanvasRenderingContext2D & { letterSpacing?: string }
-
-  // ルビは「小さいフォントの別 <p>」で、専用 region が本文の上に配置されている。
-  // 各 <p> をその region 原点から span 単位で順に描くことで、ルビ・本文・半角
-  // 約物(横幅が縦幅より小さい fontSize)を正しく配置できる。
-  for (const p of Array.from(doc.getElementsByTagName('p'))) {
-    const regId = p.getAttribute('region')
-    const region = regId ? regions[regId] : undefined
-    if (!region) continue
-
-    const spanEls = Array.from(p.getElementsByTagName('span'))
-    const items: Array<{ text: string; st: TtmlStyleProps }> = []
-    if (spanEls.length > 0) {
-      for (const span of spanEls) {
-        const text = span.textContent || ''
-        if (!text) continue
-        items.push({ text, st: resolveStyle(span.getAttribute('style'), styleTable) })
-      }
-    } else {
-      const text = p.textContent || ''
-      if (text) items.push({ text, st: resolveStyle(p.getAttribute('style'), styleTable) })
-    }
-    if (items.length === 0) continue
-
-    const ox = region.ox * scaleX
-    const oy = region.oy * scaleY
-
-    // 背景(あれば region の extent 全体を塗る)
-    const bg = items.find(i => i.st.background)?.st.background
-    if (bg && region.ew > 0 && region.eh > 0) {
-      ctx.fillStyle = bg
-      ctx.fillRect(ox, oy, region.ew * scaleX, region.eh * scaleY)
-    }
-
-    // region(背景帯)の高さに対して本文はベースライン top で上寄せになるため、
-    // 行の高さ(そのpの最大フォントセル高)を使い region 内で縦方向にセンタリング
-    // する。extent が本文より低い/未指定の場合はオフセットしない。
-    const lineH = Math.max(...items.map(i => i.st.fontH ?? 128))
-    const baseY = region.eh > lineH ? oy + ((region.eh - lineH) / 2) * scaleY : oy
-
-    let cursorX = ox
-    for (const { text, st } of items) {
-      const fontH = st.fontH ?? 128
-      const fontW = st.fontW ?? fontH
-      const fontPx = fontH * scaleY
-      const sx = fontH > 0 ? fontW / fontH : 1
-      const family = st.fontFamily || 'sans-serif'
-      const color = st.color || 'rgba(255,255,255,1)'
-
-      ctx.font = `${fontPx}px "${family}", sans-serif`
-      ctx.textBaseline = 'top'
-      ctxAny.letterSpacing = `${(st.letterSpacing ?? 0) * scaleX}px`
-
-      // 本文を「通常文字の連なり」と「DRCS外字(登録済みコードポイント)」に
-      // 分割し、前者は fillText、後者は SVG グリフのパスで描く。
-      const segs: Array<{ drcs: boolean; text: string }> = []
-      for (const ch of Array.from(text)) {
-        const cp = ch.codePointAt(0)
-        const isDrcs = cp !== undefined && glyphs.has(cp)
-        const last = segs[segs.length - 1]
-        if (last && last.drcs === isDrcs) last.text += ch
-        else segs.push({ drcs: isDrcs, text: ch })
-      }
-
-      for (const seg of segs) {
-        if (seg.drcs) {
-          for (const ch of Array.from(seg.text)) {
-            const g = glyphs.get(ch.codePointAt(0) as number)
-            if (!g) continue
-            const s = fontPx / g.unitsPerEm
-            ctx.save()
-            ctx.translate(cursorX, baseY)
-            if (sx !== 1) ctx.scale(sx, 1)
-            // SVGフォントは y-up/ベースライン=0。セル上端に合わせて反転配置。
-            ctx.scale(s, -s)
-            ctx.translate(0, -g.unitsPerEm)
-            ctx.fillStyle = color
-            ctx.fill(g.path)
-            ctx.restore()
-            cursorX += g.advance * s * sx
-          }
-        } else {
-          const drawW = ctx.measureText(seg.text).width * sx
-          ctx.save()
-          ctx.translate(cursorX, baseY)
-          if (sx !== 1) ctx.scale(sx, 1) // 半角約物などを横方向に圧縮
-          if (st.outline) {
-            ctx.lineWidth = st.outline.width * scaleY
-            ctx.strokeStyle = st.outline.color
-            ctx.lineJoin = 'round'
-            ctx.strokeText(seg.text, 0, 0)
-          }
-          ctx.fillStyle = color
-          ctx.fillText(seg.text, 0, 0)
-          ctx.restore()
-          cursorX += drawW
-        }
-      }
-    }
-  }
-  ctxAny.letterSpacing = '0px'
+  ctx.restore()
 }
 
 // ---------------------------------------------------------------------------
@@ -294,43 +218,39 @@ const Caption: React.FC<Props> = ({
   show,
   resetToken
 }) => {
-  const lastTtmlRef = useRef<string | null>(null)
   // 2K B24 字幕も複数キューが先読みされるため、表示中の世代と予約タイマーを
   // ref で管理する。古い字幕の消去タイマーが後続字幕を消すことを防ぐ。
   const b24TimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([])
   const b24SeqRef = useRef(0)
   const b24ShownIdRef = useRef(-1)
-  // TTML begin/end 同期用の状態。offset は「TTML 時刻 → 再生メディア時刻」の
-  // 差分(秒)で、最初のキュー観測時に確定し番組境界で取り直す。timers は表示/
-  // 消去の予約(setTimeout)一覧で service 切替時にまとめて解除する。
-  const ttmlOffsetRef = useRef<number | null>(null)
-  const ttmlLastBeginRef = useRef<number>(-1)
+  // TTML の時刻合わせの状態(reference_start_time が無いときに使う)と、
+  // 表示/消去の予約(setTimeout)一覧。service 切替時にまとめて解除する。
+  const ttmlClockRef = useRef<TtmlClock>(initialTtmlClock())
   const ttmlTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([])
-  // 世代トークン。各キューに単調増加 id を振り、「今表示中の id」を追跡する。
-  // これにより、後続キューに置き換わった古いキューの表示/消去タイマーが
+  // 世代トークン。各文書に単調増加 id を振り、「今表示中の id」を追跡する。
+  // これにより、後続の文書に置き換わった古い文書の表示/消去タイマーが
   // 現在の字幕を上書き・消去してしまうのを防ぐ(字幕が重なる/すぐ消える対策)。
   const ttmlSeqRef = useRef(0)
   const ttmlShownIdRef = useRef(-1)
-  // 直前に字幕が届いたアセットの stream index。番組境界で放送局が字幕アセット
-  // を別のソースへ引き継ぐことがあり、そのソースは自前の時間軸を持つので
-  // offset を取り直す必要がある。
-  const ttmlStreamRef = useRef<number>(-1)
   // DRCS(外字)グリフ表: コードポイント→SVGパス。字幕リソース(SVGフォント)を
   // 受信するたびに登録し、service 切替でクリアする。
   const glyphMapRef = useRef<Map<number, DrcsGlyph>>(new Map())
-  // いま canvas に出ている TTML(消去済みなら null)。字幕本文より後から外字の
-  // グリフが届いたとき、表示中の字幕をそのグリフで描き直すのに使う。
-  const shownTtmlRef = useRef<string | null>(null)
-  // 現在の service を captionCallback(deps 空)から参照するための ref。4K→2K
-  // 切替後に遅れて届く 4K(TTML)字幕を破棄する判定に使う。
+  // いま canvas に出ている TTML。字幕本文より後から外字のグリフが届いたときや
+  // 字幕表示を OFF→ON したときに描き直すのに使う。
+  const shownTtmlRef = useRef<ShownTtml | null>(null)
   const serviceRef = useRef<Service | undefined>(undefined)
+  // TTML の解析(parseTtml)に使う。captionCallback(deps 空)から参照する。
+  const wasmModuleRef = useRef<WasmModule | undefined>(wasmModule)
+  wasmModuleRef.current = wasmModule
 
   const captionCallback = useCallback(
     (
       pts: number,
       ptsTime: number,
       captionData: Uint8Array,
-      streamIndex: number
+      streamIndex: number,
+      tmd: number,
+      resolution: number
     ) => {
       const canvas = canvasRef.current
       if (!canvas) return
@@ -347,6 +267,8 @@ const Caption: React.FC<Props> = ({
         if (svc && (svc.channel?.type as string) !== 'BS4K') {
           return
         }
+        const wasm = wasmModuleRef.current
+        if (!wasm) return
         try {
           // captionData は WASM の共有メモリ(SharedArrayBuffer)上のビューで、
           // TextDecoder は共有バッファを拒否するため、非共有バッファへコピー
@@ -362,82 +284,75 @@ const Caption: React.FC<Props> = ({
             // TTML は同一内容が再送されないので、次の字幕を待つと外字が
             // 欠けたまま表示し終わってしまう。
             const shown = shownTtmlRef.current
-            if (shown && ttmlUsesAnyCodepoint(shown, added)) {
+            if (shown && ttmlUsesAnyCodepoint(shown.doc, added)) {
               renderTtml(context, canvas, shown, glyphMapRef.current)
             }
             return
           }
 
-          // OFF→ON 直後に再描画できるよう直近の TTML を保持する。
-          lastTtmlRef.current = xml
-
-          // TTML は PTS を持たず、表示時刻は begin/end(clock-time)で表す。WASM
-          // からは ptsTime に現在の再生メディア時刻(秒)が渡ってくるので、最初の
-          // キューで offset=begin-now を確定し、以後は begin-offset の時刻に表示
-          // する(SubtitleTimingResolver の簡約版)。
+          // TMD=1111 は時刻制御なしで、begin/end を読まない(ARIB TR-B39
+          // 8.5.9.2)。
+          const doc = wasm.parseTtml(xml, tmd === TMD_NO_TIME_CONTROL)
+          if (doc.error) {
+            console.warn('TTML rejected:', doc.error)
+            return
+          }
+          const plane = ttmlPlaneSize(resolution)
           const now = ptsTime
-          const { begin, end } = parseTtmlTiming(xml)
-          if (begin == null || !Number.isFinite(now)) {
-            // タイミング情報が無ければ従来どおり到着時に即描画する。
-            shownTtmlRef.current = xml
-            renderTtml(context, canvas, xml, glyphMapRef.current)
+          ttmlSeqRef.current += 1
+          const id = ttmlSeqRef.current
+          const show = (at: number) => {
+            // 既により新しい字幕が表示済みなら、この古い文書は描かない。
+            if (id < ttmlShownIdRef.current) return
+            ttmlShownIdRef.current = id
+            const shown = { doc, plane, at }
+            shownTtmlRef.current = shown
+            renderTtml(context, canvas, shown, glyphMapRef.current)
+          }
+          if (!Number.isFinite(now)) {
+            // 再生時刻が分からなければ届いた時点の状態を描く。
+            show(ttmlFirstBegin(doc) ?? 0)
             return
           }
 
-          const ROLLBACK_TOL = 5 // 秒。begin の巻き戻り=番組境界とみなす閾値
-          const MAX_LEAD = 30 // 秒。offset 破綻時のフェイルセーフ
-          // 別アセットは別の字幕ソース、つまり別の時間軸でありうる。巻き戻りの
-          // 閾値と MAX_LEAD の間(=数秒〜30秒の食い違い)はどちらの再校正にも
-          // 引っかからないので、アセットの乗り換えそのものを契機にする。
-          const streamChanged =
-            ttmlStreamRef.current >= 0 && streamIndex !== ttmlStreamRef.current
-          ttmlStreamRef.current = streamIndex
-          if (
-            ttmlOffsetRef.current == null ||
-            streamChanged ||
-            begin + ROLLBACK_TOL < ttmlLastBeginRef.current
-          ) {
-            // 初回、番組境界、またはアセット乗り換え: offset を取り直し
-            // 予約済みの表示を破棄する。
-            ttmlOffsetRef.current = begin - now
+          // 文書の時刻 0 を再生時刻に置く。reference_start_time があれば
+          // それを起点にし(TMD=0010)、無ければ到着時の再生時刻に合わせる。
+          const prevBase = ttmlClockRef.current.base
+          const placement = placeTtml(
+            doc,
+            { tmd, referenceStartTime: pts, now, streamIndex },
+            ttmlClockRef.current
+          )
+          ttmlClockRef.current = placement.clock
+          if (placement.immediate) {
+            show(0)
+            return
+          }
+          if (prevBase !== null && placement.clock.base !== prevBase) {
+            // 時間軸を取り直した(番組境界・アセット乗り換え): 古い時間軸で
+            // 予約した表示を破棄する。
             for (const t of ttmlTimersRef.current) clearTimeout(t)
             ttmlTimersRef.current = []
           }
-          ttmlLastBeginRef.current = begin
 
-          let delayShow = begin - ttmlOffsetRef.current - now
-          if (delayShow < 0) delayShow = 0
-          if (delayShow > MAX_LEAD) {
-            // offset がずれている可能性。再校正して即時表示。
-            ttmlOffsetRef.current = begin - now
-            delayShow = 0
+          // 今の状態をすぐ(最初の字幕がまだ先ならその時刻に)描き、以後は
+          // begin/end の各時刻に描き直す。表示するものが無くなれば消える。
+          const current = now - placement.base
+          const first = ttmlFirstBegin(doc) ?? -Infinity
+          const times = ttmlBoundaries(doc).filter(t => t > current)
+          if (first <= current) {
+            show(current)
+          } else if (!times.includes(first)) {
+            times.unshift(first)
           }
-
-          ttmlSeqRef.current += 1
-          const id = ttmlSeqRef.current
-
-          const showTimer = setTimeout(() => {
-            ttmlTimersRef.current = ttmlTimersRef.current.filter(t => t !== showTimer)
-            // 既により新しい字幕が表示済みなら、この古い表示は描かない。
-            if (id < ttmlShownIdRef.current) return
-            ttmlShownIdRef.current = id
-            shownTtmlRef.current = xml
-            renderTtml(context, canvas, xml, glyphMapRef.current)
-          }, delayShow * 1000)
-          ttmlTimersRef.current.push(showTimer)
-
-          if (end != null) {
-            const delayClear = end - ttmlOffsetRef.current - now
-            if (delayClear > delayShow) {
-              const clearTimer = setTimeout(() => {
-                ttmlTimersRef.current = ttmlTimersRef.current.filter(t => t !== clearTimer)
-                // 後続字幕に置き換わっていれば消去しない(現在の字幕を守る)。
-                if (ttmlShownIdRef.current !== id) return
-                shownTtmlRef.current = null
-                context.clearRect(0, 0, canvas.width, canvas.height)
-              }, delayClear * 1000)
-              ttmlTimersRef.current.push(clearTimer)
-            }
+          for (const at of times) {
+            const timer = setTimeout(() => {
+              ttmlTimersRef.current = ttmlTimersRef.current.filter(
+                t => t !== timer
+              )
+              show(at)
+            }, (placement.base + at - now) * 1000)
+            ttmlTimersRef.current.push(timer)
           }
         } catch (e) {
           console.error('TTML render error', e)
@@ -513,11 +428,8 @@ const Caption: React.FC<Props> = ({
     // OFF→ON しても前番組(4K)の字幕が復活しないようにする。
     for (const t of ttmlTimersRef.current) clearTimeout(t)
     ttmlTimersRef.current = []
-    ttmlOffsetRef.current = null
-    ttmlLastBeginRef.current = -1
-    ttmlStreamRef.current = -1
+    ttmlClockRef.current = initialTtmlClock()
     ttmlShownIdRef.current = -1
-    lastTtmlRef.current = null
     shownTtmlRef.current = null
     glyphMapRef.current.clear()
   }, [canvasRef, service, resetToken])
@@ -532,17 +444,21 @@ const Caption: React.FC<Props> = ({
     }
   }, [])
 
-  // 字幕表示が OFF→ON になったら、直近の TTML 字幕を即座に再描画する。TTML は
+  // 字幕表示が OFF→ON になったら、表示中の TTML 字幕を即座に再描画する。TTML は
   // 同一内容が間引かれ再送されないため、これが無いと ON にしても次に内容が
   // 変わるまで何も表示されない。
   useEffect(() => {
     if (!show) return
-    if (!lastTtmlRef.current) return
+    if (!shownTtmlRef.current) return
     if (!canvasRef.current) return
     const context = canvasRef.current.getContext('2d')
     if (!context) return
-    shownTtmlRef.current = lastTtmlRef.current
-    renderTtml(context, canvasRef.current, lastTtmlRef.current, glyphMapRef.current)
+    renderTtml(
+      context,
+      canvasRef.current,
+      shownTtmlRef.current,
+      glyphMapRef.current
+    )
   }, [canvasRef, show])
 
   return (

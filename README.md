@@ -82,6 +82,15 @@ TLV は FFmpeg で作れないため、録画した .mmts を指定したとき�
 TS_DURATION_TLV_SAMPLE=/path/to/sample.mmts bash scripts/test-ts-duration.sh
 ```
 
+4K/8K 字幕 (ARIB-TTML) の解析は dantto4k の parser/resolver を wasm に組み込んで
+いるので (`wasm/src/caption/`)、ここも wasm をビルドしてから手動で確かめます。
+`wasm/build` に dantto4k のソースが取得済みであることと、Node 22.6 以降
+(`--experimental-strip-types`) が必要です。
+
+```
+bash scripts/test-ttml.sh
+```
+
 ## TS-Live を Docker で使う方法
 
 TS-Live の Docker コンテナは、TS-Live の html/js/wasm ファイルを https で配信すると共に、/api 以下を別ホストの mirakurun にリバースプロキシする nginx を起動します。

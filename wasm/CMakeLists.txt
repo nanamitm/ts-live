@@ -28,6 +28,30 @@ set(CMAKE_CXX_FLAGS "-matomics -mbulk-memory -msimd128 -funroll-loops")
 set(EXTRA_CFLAGS "-Wno-error=declaration-after-statement")
 FetchContent_MakeAvailable(fmt spdlog tsreadex)
 
+# 4K/8K の ARIB-TTML 字幕は dantto4k の parser/resolver で解析する(スタイル
+# 継承・入れ子 span・xml:space・タイミングの合成を TR-B39 どおりに扱うため)。
+# dantto4k は CMake プロジェクトではないので、必要なソースだけをここで
+# ライブラリにする。サブモジュール(tsduck など)は使わないので取得しない。
+FetchContent_Declare(
+  dantto4k
+  GIT_REPOSITORY https://github.com/nanamitm/dantto4k.git
+  GIT_TAG v20261014
+  GIT_SHALLOW TRUE
+  GIT_SUBMODULES ""
+)
+FetchContent_MakeAvailable(dantto4k)
+add_library(dantto4k_ttml STATIC
+  ${dantto4k_SOURCE_DIR}/src/ttml/parser.cpp
+  ${dantto4k_SOURCE_DIR}/src/ttml/resolver.cpp
+  ${dantto4k_SOURCE_DIR}/src/ttml/style.cpp
+  ${dantto4k_SOURCE_DIR}/src/pugixml.cpp
+)
+target_include_directories(dantto4k_ttml PUBLIC ${dantto4k_SOURCE_DIR}/src)
+target_compile_features(dantto4k_ttml PUBLIC cxx_std_20)
+# emscripten の libc++ に無い浮動小数点版 std::from_chars を補う。
+target_compile_options(dantto4k_ttml PRIVATE
+  "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/src/caption/from_chars_double.hpp")
+
 set(FFMPEG_CONFIGURE_COMMAND_LIST
   emconfigure ./configure
     --prefix=${CMAKE_CURRENT_BINARY_DIR}/install
@@ -115,9 +139,13 @@ ExternalProject_Add(
   #  - drcs: 字幕リソース(DRCS/SVGフォント, data_type=6)も字幕ストリームへ流す
   #  - skip-tlv: 未対応 TLV パケット種別(0xFE TLV-SI 等)を PATCHWELCOME で中断せず
   #    スキップする(ログ洪水と低頻度な字幕 MFU 取りこぼしの解消)
+  #  - subtitle-timing: 字幕アセットの TMD と reference_start_time を
+  #    ストリームのメタデータ(arib_tmd / arib_reference_start_time)に出す
+  #    (TTML の begin/end を再生時刻に合わせるため)
   PATCH_COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/apply-ffmpeg-patches.sh
     ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-drcs.patch
     ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-skip-tlv.patch
+    ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-subtitle-timing.patch
 )
 
 
@@ -142,7 +170,7 @@ add_dependencies(ts-live ffmpeg)
 target_compile_options(ts-live PUBLIC -matomics -mbulk-memory)
 target_compile_features(ts-live PRIVATE cxx_std_20)
 target_include_directories(ts-live PRIVATE ${CMAKE_BINARY_DIR}/install/include ${CMAKE_BINARY_DIR}/ffmpeg-prefix/src/ffmpeg)
-target_link_libraries(ts-live fmt::fmt spdlog::spdlog ${FFMPEG_LIBRARIES} embind tsreadex::lib)
+target_link_libraries(ts-live fmt::fmt spdlog::spdlog ${FFMPEG_LIBRARIES} embind tsreadex::lib dantto4k_ttml)
 target_link_options(ts-live PRIVATE
   "-Wno-pthreads-mem-growth"
   "SHELL:-s ALLOW_MEMORY_GROWTH=1"
