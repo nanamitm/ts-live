@@ -27,6 +27,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # バージョン表示 (git describe --tags) のため履歴とタグを取得する
+          fetch-depth: 0
 
       - uses: actions/setup-node@v7.0.0
         with:

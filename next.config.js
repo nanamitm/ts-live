@@ -1,3 +1,33 @@
+const { execFileSync } = require('child_process')
+
+const git = (...args) =>
+  execFileSync('git', args, {
+    cwd: __dirname,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore']
+  }).trim()
+
+// ビルドしたコミット (git describe --tags --always --dirty 相当)。TVTest の
+// TVTestVersionHashGen.bat と同じく、ビルドのたびに取得して埋め込む。git が
+// 無ければ unknown。public/wasm はコミットしてあるが CI がビルドし直して
+// 上書きするので、未コミットの変更 (-dirty) には数えない。
+const describeCommit = () => {
+  try {
+    const described = git('describe', '--tags', '--always')
+    const changes = git(
+      'status',
+      '--porcelain',
+      '--untracked-files=no',
+      '--',
+      '.',
+      ':(exclude)public/wasm'
+    )
+    return changes ? `${described}-dirty` : described
+  } catch {
+    return 'unknown'
+  }
+}
+
 /** @type {import('next').NextConfig} */
 module.exports = {
   // target: 'serverless',
@@ -10,7 +40,8 @@ module.exports = {
   //   ]
   // },
   env: {
-    VERSION: process.env.VERSION
+    VERSION: process.env.VERSION,
+    COMMIT: describeCommit()
   },
   // NOTE: 静的エクスポート(next export)では headers/rewrites は反映されない。
   // 本番(Cloudflare Pages)のヘッダーは public/_headers が正となるので、両者を
