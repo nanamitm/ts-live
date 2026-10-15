@@ -1527,7 +1527,7 @@ const Page: NextPage = () => {
           >
             {'TS-Live!'} {debug ? 'Debug' : ''}
           </div>
-          <div>{`version: ${process.env.VERSION}`}</div>
+          <div>{`version: ${process.env.VERSION} (${process.env.COMMIT})`}</div>
           <Divider
             css={css`
               margin: 10px 0px;
