@@ -7,7 +7,7 @@ import React, {
   useRef
 } from 'react'
 import { WasmModule } from '../lib/wasmmodule'
-import { CanvasProvider } from 'aribb24.js'
+import { B24Caption } from '../lib/b24-caption'
 import { Service } from 'mirakurun/api'
 import {
   TtmlClock,
@@ -218,11 +218,7 @@ const Caption: React.FC<Props> = ({
   show,
   resetToken
 }) => {
-  // 2K B24 字幕も複数キューが先読みされるため、表示中の世代と予約タイマーを
-  // ref で管理する。古い字幕の消去タイマーが後続字幕を消すことを防ぐ。
-  const b24TimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([])
-  const b24SeqRef = useRef(0)
-  const b24ShownIdRef = useRef(-1)
+  const b24Ref = useRef<{ streamIndex: number; caption: B24Caption } | null>(null)
   // TTML の時刻合わせの状態(reference_start_time が無いときに使う)と、
   // 表示/消去の予約(setTimeout)一覧。service 切替時にまとめて解除する。
   const ttmlClockRef = useRef<TtmlClock>(initialTtmlClock())
@@ -269,6 +265,11 @@ const Caption: React.FC<Props> = ({
         }
         const wasm = wasmModuleRef.current
         if (!wasm) return
+        if (b24Ref.current) {
+          b24Ref.current.caption.destroy()
+          b24Ref.current = null
+          context.clearRect(0, 0, canvas.width, canvas.height)
+        }
         try {
           // captionData は WASM の共有メモリ(SharedArrayBuffer)上のビューで、
           // TextDecoder は共有バッファを拒否するため、非共有バッファへコピー
@@ -360,44 +361,17 @@ const Caption: React.FC<Props> = ({
         return
       }
 
-      const data = captionData.slice()
-
-      // if (!aribSubtitleData) {
-      //   context.clearRect(0, 0, canvas.width, canvas.height)
-      //   setDisplayingAribSubtitleData(null)
-      //   return
-      // }
-
-      const provider = new CanvasProvider(data, ptsTime)
-      const estimate = provider.render()
-      if (!estimate) return
-      b24SeqRef.current += 1
-      const id = b24SeqRef.current
-      // const font = setting.font || SUBTITLE_DEFAULT_FONT
-      // const font = `"Rounded M+ 1m for ARIB"`
-      const renderId = setTimeout(() => {
-        b24TimersRef.current = b24TimersRef.current.filter(t => t !== renderId)
-        // 既に後続字幕が表示済みなら、遅れて発火した古い字幕を描かない。
-        if (id < b24ShownIdRef.current) return
-        b24ShownIdRef.current = id
-        provider.render({
-          canvas,
-          useStroke: true,
-          keepAspectRatio: true,
-          // normalFont: font,
-          // gaijiFont: font,
-          drcsReplacement: true
-        })
-        if (estimate.endTime === Number.POSITIVE_INFINITY) return
-        const clearId = setTimeout(() => {
-          b24TimersRef.current = b24TimersRef.current.filter(t => t !== clearId)
-          // 後続字幕に置き換わっていれば、現在の字幕を消さない。
-          if (b24ShownIdRef.current !== id) return
-          context.clearRect(0, 0, canvas.width, canvas.height)
-        }, (estimate.endTime - estimate.startTime) * 1000)
-        b24TimersRef.current.push(clearId)
-      }, estimate.startTime * 1000)
-      b24TimersRef.current.push(renderId)
+      const wasm = wasmModuleRef.current
+      if (!wasm) return
+      if (b24Ref.current?.streamIndex !== streamIndex) {
+        b24Ref.current?.caption.destroy()
+        context.clearRect(0, 0, canvas.width, canvas.height)
+        b24Ref.current = {
+          streamIndex,
+          caption: new B24Caption(canvas, () => wasm.getAudioPlaybackTime())
+        }
+      }
+      b24Ref.current.caption.feed(captionData.slice(), ptsTime)
     },
     [canvasRef]
   )
@@ -413,6 +387,8 @@ const Caption: React.FC<Props> = ({
   useEffect(() => {
     // captionCallback(deps 空)から参照する現在 service を常に最新へ。
     serviceRef.current = service
+    b24Ref.current?.caption.destroy()
+    b24Ref.current = null
     // 番組切替(service 変化)に加え、resetToken 変化(ローカルファイル切替など
     // service が変わらない再生の開始)でも字幕をクリアする。service 未定義でも
     // クリアが必要なので早期 return しない。
@@ -421,9 +397,6 @@ const Caption: React.FC<Props> = ({
     const context = canvas.getContext('2d')
     if (!context) return
     context.clearRect(0, 0, canvas.width, canvas.height)
-    for (const t of b24TimersRef.current) clearTimeout(t)
-    b24TimersRef.current = []
-    b24ShownIdRef.current = -1
     // TTML 同期状態もリセットする。直近 TTML キャッシュも破棄し、切替後に
     // OFF→ON しても前番組(4K)の字幕が復活しないようにする。
     for (const t of ttmlTimersRef.current) clearTimeout(t)
@@ -432,14 +405,14 @@ const Caption: React.FC<Props> = ({
     ttmlShownIdRef.current = -1
     shownTtmlRef.current = null
     glyphMapRef.current.clear()
-  }, [canvasRef, service, resetToken])
+  }, [canvasRef, service, resetToken, wasmModule])
 
   // アンマウント時にも遅延描画を残さない。
   useEffect(() => {
     return () => {
-      for (const t of b24TimersRef.current) clearTimeout(t)
+      b24Ref.current?.caption.destroy()
+      b24Ref.current = null
       for (const t of ttmlTimersRef.current) clearTimeout(t)
-      b24TimersRef.current = []
       ttmlTimersRef.current = []
     }
   }, [])
