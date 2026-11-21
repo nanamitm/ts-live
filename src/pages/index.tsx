@@ -3,7 +3,7 @@ import { css } from '@emotion/react'
 import { NextPage } from 'next'
 import dynamic from 'next/dynamic'
 import { EventHandler, useCallback, useEffect, useRef, useState } from 'react'
-import { useAsync, useKey, useLocalStorage } from 'react-use'
+import { useKey, useLocalStorage } from 'react-use'
 import {
   Box,
   Button,
@@ -668,12 +668,6 @@ const Page: NextPage = () => {
     }
   }, [wasmMod, debugLog])
 
-  // const canvasProviderState = useAsync(async () => {
-  //   const CanvasProvider = await import('aribb24.js').then(
-  //     mod => mod.CanvasProvider
-  //   )
-  //   return CanvasProvider
-  // })
   // 直近 CHART_HISTORY 点だけを保持する。state 配列を直接書き換えると React の
   // 再レンダー判定が壊れるので、必ず新しい配列を返す。
   const statsCallback = useCallback(function statsCallbackFunc(statsDataList: StatsData[]) {

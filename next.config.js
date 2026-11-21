@@ -1,4 +1,5 @@
 const { execFileSync } = require('child_process')
+const path = require('path')
 
 const git = (...args) =>
   execFileSync('git', args, {
@@ -87,7 +88,14 @@ module.exports = {
       }
     ]
   },
-  webpack: (config, { webpack }) => {
+  webpack: (config, { defaultLoaders }) => {
+    // aribb24.js 2.x ships class static blocks that Next 12's minifier cannot
+    // parse. Run the library through the same compiler as application code.
+    config.module.rules.push({
+      test: /\.m?js$/,
+      include: path.resolve(__dirname, 'node_modules/aribb24.js'),
+      use: defaultLoaders.babel
+    })
     const experiments = config.experiments || {}
     config.experiments = {
       ...experiments,
