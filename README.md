@@ -6,6 +6,8 @@
 
 MIT-License（内部で利用している ffmpeg は LGPL です。他にも多数のライブラリを使っているので個別に確認してください）
 
+`wasm/ffmpeg-mmttlv/` の MMT/TLV デマルチプレクサ（SuperFashi/FFmpeg 由来）は FFmpeg の一部として LGPL-2.1-or-later です。ビルド時に上流 FFmpeg のソースツリーへコピーして組み込みます。
+
 ## 対応ブラウザ
 
 Chrome / Edge 113 以降、その時点の最新版（適宜対応していきます）

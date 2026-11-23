@@ -116,16 +116,16 @@ list(JOIN FFMPEG_CONFIGURE_COMMAND_LIST " " FFMPEG_CONFIGURE_COMMAND)
 
 include(ExternalProject)
 # FFmpeg のバージョン更新時は既存の clone と完了スタンプを再利用しない。
-set(FFMPEG_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-n9.1")
+set(FFMPEG_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-upstream-n9.1")
 ExternalProject_Add(
   ffmpeg
-  # FFmpeg n9.1 に MMT/TLV デマルチプレクサ(SuperFashi/FFmpeg 由来)と
-  # その修正を載せたブランチ(tlvmmt)。clone した時期でビルド結果が
-  # 変わらないようコミットで固定する。更新するときはブランチの新しいコミットに
-  # 書き換え、下のパッチがまだ当たることを確認する。
+  # 上流 FFmpeg の n9.1。clone した時期でビルド結果が変わらないよう
+  # タグの指すコミットで固定する。更新するときは新しいリリースタグの
+  # コミットに書き換え(FFMPEG_PREFIX も変える)、ffmpeg-mmttlv/ の
+  # ソースがそのバージョンでコンパイルできることを確認する。
   PREFIX "${FFMPEG_PREFIX}"
-  GIT_REPOSITORY https://github.com/nanamitm/FFmpeg.git
-  GIT_TAG 2bab9d22e422d2450523ea86bdf24191ac2d3bfc
+  GIT_REPOSITORY https://github.com/FFmpeg/FFmpeg.git
+  GIT_TAG 74e4393595cf2b5857f0da925c4e0dd74ea306e5
   # 初回clone後は update(git reset)を再実行しない。再コンフィグのたびにソースが
   # reset されて mtime が変わり ffmpeg 全体が無駄に再コンパイルされるのを防ぐ。
   UPDATE_DISCONNECTED TRUE
@@ -134,21 +134,19 @@ ExternalProject_Add(
   CONFIGURE_COMMAND bash -c "[ -e \"${FFMPEG_PREFIX}/src/ffmpeg-stamp/ffmpeg-done\" ] || ${FFMPEG_CONFIGURE_COMMAND}"
   BUILD_COMMAND ${CMAKE_COMMAND} -E env emmake make -j24
   INSTALL_COMMAND bash -c "[ -e \"${FFMPEG_PREFIX}/src/ffmpeg-stamp/ffmpeg-done\" ] || make install"
-  # ffmpeg-wasm.patch は不要(n9.1 は --arch=wasm に標準で対応している)。
-  # DRCS 字幕リソース(MMT data_type=6)を字幕ストリームへ流すための
-  # 追加パッチのみを当てる。
-  # apply-ffmpeg-patches.sh は既に含まれているパッチ(再ビルドや fork への取り込み)
-  # だけをスキップし、当たらなかった場合はビルドを失敗させる。
-  #  - drcs: 字幕リソース(DRCS/SVGフォント, data_type=6)も字幕ストリームへ流す
-  #  - skip-tlv: 未対応 TLV パケット種別(0xFE TLV-SI 等)を PATCHWELCOME で中断せず
+  # 上流には MMT/TLV デマルチプレクサが無いので、ffmpeg-mmttlv/ に置いた
+  # ソース(SuperFashi/FFmpeg 由来)をソースツリーへコピーして登録する。
+  # ts-live 側で次の修正を取り込み済み:
+  #  - 字幕リソース(DRCS/SVGフォント, data_type=6)も字幕ストリームへ流す
+  #  - 未対応 TLV パケット種別(0xFE TLV-SI 等)を PATCHWELCOME で中断せず
   #    スキップする(ログ洪水と低頻度な字幕 MFU 取りこぼしの解消)
-  #  - subtitle-timing: 字幕アセットの TMD と reference_start_time を
-  #    ストリームのメタデータ(arib_tmd / arib_reference_start_time)に出す
+  #  - 字幕アセットの TMD と reference_start_time をストリームのメタデータ
+  #    (arib_tmd / arib_reference_start_time)に出す
   #    (TTML の begin/end を再生時刻に合わせるため)
-  PATCH_COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/apply-ffmpeg-patches.sh
-    ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-drcs.patch
-    ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-skip-tlv.patch
-    ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv-subtitle-timing.patch
+  # ffmpeg-mmttlv/ のソースを変更したときは、次の再ビルドに反映されるよう
+  # ${FFMPEG_PREFIX}/src/ffmpeg-stamp/ を消してから再ビルドする。
+  PATCH_COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/install-ffmpeg-mmttlv.sh
+    ${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-mmttlv
 )
 
 
