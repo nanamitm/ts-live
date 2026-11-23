@@ -270,7 +270,7 @@ std::vector<emscripten::val> statsBuffer;
 emscripten::val statsCallback = emscripten::val::null();
 
 const size_t donwloadRangeSize = 2 * 1024 * 1024;
-size_t downloadCount = 0;
+uint64_t downloadCount = 0;
 
 // Callback register
 void setCaptionCallback(emscripten::val callback) {
