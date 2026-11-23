@@ -2627,6 +2627,9 @@ static bool downloadNextRange(const std::string &url, uint64_t &downloadCount) {
                                   downloadCount + donwloadRangeSize - 1);
   const char *headers[] = {"Range", range.c_str(), NULL};
   attr.requestHeaders = headers;
+  // 同期 fetch は中断できない。応答が止まると reset() の join が終わらず、
+  // JS 側のリセット完了待ちも次の再生も止まったままになるので上限を置く。
+  attr.timeoutMSecs = 30 * 1000;
 
   spdlog::debug("request {} Range: {}", url, range);
   emscripten_fetch_t *fetch = emscripten_fetch(&attr, url.c_str());
