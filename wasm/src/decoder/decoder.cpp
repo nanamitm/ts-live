@@ -2644,8 +2644,7 @@ static bool downloadNextRange(const std::string &url, uint64_t &downloadCount) {
   bool hasMore = true;
   if (fetch->status == 416) {
     // Range が範囲外 = ちょうど読み切っていた。
-    spdlog::info("fetch reached the end of {} ({} bytes)", url,
-                 downloadCount);
+    spdlog::info("fetch reached the end of {} ({} bytes)", url, downloadCount);
     emscripten_fetch_close(fetch);
     return false;
   }
@@ -2683,8 +2682,7 @@ static bool downloadNextRange(const std::string &url, uint64_t &downloadCount) {
       hasMore = false;
     }
   } else {
-    spdlog::error("fetch failed URL: {} status code: {}", url,
-                  fetch->status);
+    spdlog::error("fetch failed URL: {} status code: {}", url, fetch->status);
     hasMore = false;
   }
   emscripten_fetch_close(fetch);
