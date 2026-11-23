@@ -25,7 +25,7 @@ import { Pause, PlayArrow, VolumeMute, VolumeUp } from '@mui/icons-material'
 import { CartesianGrid, LineChart, XAxis, YAxis, Line, Legend } from 'recharts'
 import Head from 'next/head'
 import { WasmModule, StatsData, VideoStreamInfo } from '../lib/wasmmodule'
-import { CONTAINER_PROBE_SIZE, looksLikeTlv } from '../lib/container'
+import { CONTAINER_PROBE_SIZE, findTsPacketLayout, m2tsSyncAtOrAfter, stripM2tsTimestamps } from '../lib/container'
 import { buildWebCodecsConfig } from '../lib/webcodecs'
 import { LocalPositionEstimator } from '../lib/local-position'
 import { readTlvDuration, readTsDuration } from '../lib/ts-duration'
@@ -1063,15 +1063,6 @@ const Page: NextPage = () => {
     localLoopRef.current = !!localLoop
   }, [localLoop])
 
-  // ファイル先頭を読み、MPEG-TS(同期バイト 0x47 が 188/192 バイト間隔で並ぶ)なら
-  // 2K(TS)=false、それ以外は BS4K TLV とみなす。'auto' モードで使う。
-  const detectTlvFromHeader = async (file: File): Promise<boolean> => {
-    const buf = new Uint8Array(
-      await file.slice(0, CONTAINER_PROBE_SIZE).arrayBuffer()
-    )
-    return looksLikeTlv(buf)
-  }
-
   const playLocalFile = (file: File, startOffset = 0, pauseAtStart = false) => {
     if (!wasmMod) {
       console.error('WasmModule not loaded')
@@ -1146,8 +1137,11 @@ const Page: NextPage = () => {
         }
       }
       // 再生モード(TLV=BS4K / TS=2K)を確定する。auto は先頭バイトで判定。
-      const tlv =
-        localMode === 'tlv' ? true : localMode === 'ts' ? false : await detectTlvFromHeader(src)
+      const layout = localMode === 'tlv' ? undefined : findTsPacketLayout(
+        new Uint8Array(await src.slice(0, CONTAINER_PROBE_SIZE).arrayBuffer())
+      )
+      const tlv = localMode === 'tlv' || (localMode !== 'ts' && !layout)
+      const m2ts = layout?.stride === 192
       console.log('local file mode', file.name, { localMode, tlv })
       // 直前の再生停止(reset)の後片付けが終わるのを待つ
       await waitForDecoderReset(Module, () => aborted)
@@ -1232,7 +1226,9 @@ const Page: NextPage = () => {
       {
         // 指定バイト位置から供給する。TS は read_packet 側が 0x47 を探し直し、
         // TLV は mmttlv の resync が効くので、パケット境界に合っていなくてよい。
-        const reader = src.slice(startOffset).stream().getReader()
+        const offset = m2ts ? m2tsSyncAtOrAfter(startOffset, layout.syncOffset) : startOffset
+        const input = src.slice(offset).stream()
+        const reader = (m2ts ? input.pipeThrough(stripM2tsTimestamps()) : input).getReader()
         let ret = await reader.read()
         while (!ret.done) {
           if (aborted) {
