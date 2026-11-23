@@ -1,11 +1,12 @@
-import { CanvasMainThreadRenderer, MPEGTSFeeder } from 'aribb24.js'
+import { CanvasMainThreadRenderer } from 'aribb24.js'
+import { B24LiveFeeder } from './b24-live-feeder'
 import drcs from './b24-drcs'
 
-type Cue = NonNullable<ReturnType<MPEGTSFeeder['content']>>
+type Cue = NonNullable<ReturnType<B24LiveFeeder['content']>>
 
 // FFmpeg gives us B24 PES payloads and WASM supplies the audio clock.
 export class B24Caption {
-  private readonly feeder = new MPEGTSFeeder()
+  private readonly feeder = new B24LiveFeeder()
   private readonly renderer = new CanvasMainThreadRenderer({ replace: { drcs } })
   private frame: number | null = null
   private shown: Cue | null = null
