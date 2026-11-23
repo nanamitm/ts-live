@@ -115,23 +115,26 @@ set(FFMPEG_CONFIGURE_COMMAND_LIST
 list(JOIN FFMPEG_CONFIGURE_COMMAND_LIST " " FFMPEG_CONFIGURE_COMMAND)
 
 include(ExternalProject)
+# FFmpeg のバージョン更新時は既存の clone と完了スタンプを再利用しない。
+set(FFMPEG_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-n9.1")
 ExternalProject_Add(
   ffmpeg
-  # FFmpeg n9.0.1 に MMT/TLV デマルチプレクサ(SuperFashi/FFmpeg 由来)と
-  # その修正を載せたブランチ(feature/mmttlv-n9.0.1)。clone した時期でビルド結果が
+  # FFmpeg n9.1 に MMT/TLV デマルチプレクサ(SuperFashi/FFmpeg 由来)と
+  # その修正を載せたブランチ(feature/mmttlv-n9.1)。clone した時期でビルド結果が
   # 変わらないようコミットで固定する。更新するときはブランチの新しいコミットに
   # 書き換え、下のパッチがまだ当たることを確認する。
+  PREFIX "${FFMPEG_PREFIX}"
   GIT_REPOSITORY https://github.com/nanamitm/FFmpeg.git
-  GIT_TAG 4bdda6c4b0b16c7af74a5abcb2455020445f11fe
+  GIT_TAG 2bab9d22e422d2450523ea86bdf24191ac2d3bfc
   # 初回clone後は update(git reset)を再実行しない。再コンフィグのたびにソースが
   # reset されて mtime が変わり ffmpeg 全体が無駄に再コンパイルされるのを防ぐ。
   UPDATE_DISCONNECTED TRUE
   BUILD_IN_SOURCE TRUE
   INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/install
-  CONFIGURE_COMMAND bash -c "[ -e ${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-done ] || ${FFMPEG_CONFIGURE_COMMAND}"
+  CONFIGURE_COMMAND bash -c "[ -e \"${FFMPEG_PREFIX}/src/ffmpeg-stamp/ffmpeg-done\" ] || ${FFMPEG_CONFIGURE_COMMAND}"
   BUILD_COMMAND ${CMAKE_COMMAND} -E env emmake make -j24
-  INSTALL_COMMAND bash -c "[ -e ${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-done ] || make install"
-  # ffmpeg-wasm.patch は不要(n9.0.1 は --arch=wasm に標準で対応している)。
+  INSTALL_COMMAND bash -c "[ -e \"${FFMPEG_PREFIX}/src/ffmpeg-stamp/ffmpeg-done\" ] || make install"
+  # ffmpeg-wasm.patch は不要(n9.1 は --arch=wasm に標準で対応している)。
   # DRCS 字幕リソース(MMT data_type=6)を字幕ストリームへ流すための
   # 追加パッチのみを当てる。
   # apply-ffmpeg-patches.sh は既に含まれているパッチ(再ビルドや fork への取り込み)
@@ -169,7 +172,8 @@ add_executable(ts-live ${SOURCES} ${HEADERS} ${SHADERS} src/audio/processor.js)
 add_dependencies(ts-live ffmpeg)
 target_compile_options(ts-live PUBLIC -matomics -mbulk-memory)
 target_compile_features(ts-live PRIVATE cxx_std_20)
-target_include_directories(ts-live PRIVATE ${CMAKE_BINARY_DIR}/install/include ${CMAKE_BINARY_DIR}/ffmpeg-prefix/src/ffmpeg)
+ExternalProject_Get_Property(ffmpeg SOURCE_DIR)
+target_include_directories(ts-live PRIVATE ${CMAKE_BINARY_DIR}/install/include ${SOURCE_DIR})
 target_link_libraries(ts-live fmt::fmt spdlog::spdlog ${FFMPEG_LIBRARIES} embind tsreadex::lib dantto4k_ttml)
 target_link_options(ts-live PRIVATE
   "-Wno-pthreads-mem-growth"
