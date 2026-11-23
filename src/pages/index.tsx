@@ -25,7 +25,7 @@ import { Pause, PlayArrow, VolumeMute, VolumeUp } from '@mui/icons-material'
 import { CartesianGrid, LineChart, XAxis, YAxis, Line, Legend } from 'recharts'
 import Head from 'next/head'
 import { WasmModule, StatsData, VideoStreamInfo } from '../lib/wasmmodule'
-import { CONTAINER_PROBE_SIZE, looksLikeTlv } from '../lib/container'
+import { CONTAINER_PROBE_SIZE, findTsPacketLayout, m2tsSyncAtOrAfter, stripM2tsTimestamps } from '../lib/container'
 import { buildWebCodecsConfig } from '../lib/webcodecs'
 import { LocalPositionEstimator } from '../lib/local-position'
 import { readTlvDuration, readTsDuration } from '../lib/ts-duration'
@@ -510,18 +510,14 @@ const Page: NextPage = () => {
 
   // Module.reset() の後片付けはデコードスレッドで進むので、完了フラグが立つのを
   // 待ってから次の再生データを流し込む。固定の待ち時間だと短すぎれば前の再生の
-  // 状態が残り、長すぎれば切替が遅くなる。フラグが来ない場合に備えて上限を置く。
+  // 新しい再生が前のダウンローダーや入力バッファを上書きしないよう、
+  // リセット完了か、この開始要求のキャンセルを待つ。
   const waitForDecoderReset = async (
     Module: WasmModule,
     isAborted: () => boolean
   ) => {
-    const deadline = performance.now() + 3000
-    while (!isAborted() && performance.now() < deadline) {
-      if (Module.isResetCompleted()) return
+    while (!isAborted() && !Module.isResetCompleted()) {
       await new Promise(resolve => setTimeout(resolve, 20))
-    }
-    if (!isAborted() && !Module.isResetCompleted()) {
-      console.warn('decoder reset did not complete in time; starting anyway')
     }
   }
 
@@ -854,10 +850,11 @@ const Page: NextPage = () => {
     // ローカルファイル再生は playLocalFile() がライフサイクルを管理する。
     // playMode の更新でこの effect が再実行されても、新しいローカル再生を止めない。
     if (playMode === 'localfile') return
-    if (!mirakurunOk || !mirakurunServer || !activeService) {
-      console.log('mirakurunServer or activeService', mirakurunOk, mirakurunServer, activeService)
-      return
-    }
+    const liveService = playMode === 'live' && mirakurunOk && mirakurunServer ? activeService : undefined
+    const recordedUrl = playMode === 'file' && epgStationOk && epgStationServer && activeRecordedFileId !== undefined
+      ? `${epgStationServer}/api/videos/${activeRecordedFileId}`
+      : undefined
+    if (!liveService && !recordedUrl) return
     if (!wasmMod) {
       console.log('WasmModule not loaded', wasmMod)
       return
@@ -913,9 +910,9 @@ const Page: NextPage = () => {
       await waitForDecoderReset(Module, () => stopped)
       if (stopped) return
       // 再生スタート
-      if (playMode === 'live') {
+      if (liveService) {
         ac = new AbortController()
-        const channelType = activeService.channel?.type as string
+        const channelType = liveService.channel?.type as string
         const isBS4K = channelType === 'BS4K'
         // WebCodecs (ハードウェアデコード) を試みる対象: BS4K (HEVC) と
         // SKY=スカパープレミアム (H.264)。実際に使うかは WASM が probe 後に
@@ -924,7 +921,7 @@ const Page: NextPage = () => {
         const wantWebCodecs =
           (isBS4K || channelType === 'SKY') &&
           typeof VideoDecoder !== 'undefined' &&
-          liveForceSoftwareServiceRef.current !== activeService.id
+          liveForceSoftwareServiceRef.current !== liveService.id
         if (wantWebCodecs) {
           Module.setVideoStreamInfoCallback((info: VideoStreamInfo) => {
             console.log('videoStreamInfo:', info)
@@ -932,7 +929,7 @@ const Page: NextPage = () => {
               startWebCodecs(Module, wcCanvasRef.current, info, () => {
                 // 現在の effect の cleanup がストリームを停止・reset し、同じ
                 // service を WASM ソフトウェアデコードで再起動する。
-                liveForceSoftwareServiceRef.current = activeService.id
+                liveForceSoftwareServiceRef.current = liveService.id
                 setWebCodecsRetryToken(t => t + 1)
               })
             }
@@ -948,11 +945,11 @@ const Page: NextPage = () => {
         }
         Module.setTlvMode(isBS4K)
         Module.setWebCodecsMode(wantWebCodecs)
-        const url = `${mirakurunServer}/api/services/${activeService.id}/stream?decode=1`
+        const url = `${mirakurunServer}/api/services/${liveService.id}/stream?decode=1`
         console.log('start fetch', url, Module)
         const reconnect = liveReconnectRef.current
-        if (reconnect.serviceId !== activeService.id) {
-          reconnect.serviceId = activeService.id
+        if (reconnect.serviceId !== liveService.id) {
+          reconnect.serviceId = liveService.id
           reconnect.attempts = 0
         }
         // ストリームが終わった・切れたときに再生し直す。デコーダーは途中から
@@ -1028,15 +1025,14 @@ const Page: NextPage = () => {
             console.error('stream fetch failed:', ex)
             scheduleReconnect(ex)
           })
-      } else if (playMode === 'file') {
+      } else if (recordedUrl) {
         // 直前の再生のモードが残らないよう明示的にリセットする(EPGStation の
         // 録画は 2K TS 前提で WASM ソフトデコード)。
         Module.setVideoStreamInfoCallback(null as any)
         Module.setTlvMode(false)
         Module.setWebCodecsMode(false)
         showWasmCanvasOnFirstFrame(Module, () => stopped)
-        const url = `${epgStationServer}/api/videos/${activeRecordedFileId}`
-        Module.playFile(url)
+        Module.playFile(recordedUrl)
       }
     })()
 
@@ -1066,15 +1062,6 @@ const Page: NextPage = () => {
   useEffect(() => {
     localLoopRef.current = !!localLoop
   }, [localLoop])
-
-  // ファイル先頭を読み、MPEG-TS(同期バイト 0x47 が 188/192 バイト間隔で並ぶ)なら
-  // 2K(TS)=false、それ以外は BS4K TLV とみなす。'auto' モードで使う。
-  const detectTlvFromHeader = async (file: File): Promise<boolean> => {
-    const buf = new Uint8Array(
-      await file.slice(0, CONTAINER_PROBE_SIZE).arrayBuffer()
-    )
-    return looksLikeTlv(buf)
-  }
 
   const playLocalFile = (file: File, startOffset = 0, pauseAtStart = false) => {
     if (!wasmMod) {
@@ -1150,8 +1137,11 @@ const Page: NextPage = () => {
         }
       }
       // 再生モード(TLV=BS4K / TS=2K)を確定する。auto は先頭バイトで判定。
-      const tlv =
-        localMode === 'tlv' ? true : localMode === 'ts' ? false : await detectTlvFromHeader(src)
+      const layout = localMode === 'tlv' ? undefined : findTsPacketLayout(
+        new Uint8Array(await src.slice(0, CONTAINER_PROBE_SIZE).arrayBuffer())
+      )
+      const tlv = localMode === 'tlv' || (localMode !== 'ts' && !layout)
+      const m2ts = layout?.stride === 192
       console.log('local file mode', file.name, { localMode, tlv })
       // 直前の再生停止(reset)の後片付けが終わるのを待つ
       await waitForDecoderReset(Module, () => aborted)
@@ -1236,7 +1226,9 @@ const Page: NextPage = () => {
       {
         // 指定バイト位置から供給する。TS は read_packet 側が 0x47 を探し直し、
         // TLV は mmttlv の resync が効くので、パケット境界に合っていなくてよい。
-        const reader = src.slice(startOffset).stream().getReader()
+        const offset = m2ts ? m2tsSyncAtOrAfter(startOffset, layout.syncOffset) : startOffset
+        const input = src.slice(offset).stream()
+        const reader = (m2ts ? input.pipeThrough(stripM2tsTimestamps()) : input).getReader()
         let ret = await reader.read()
         while (!ret.done) {
           if (aborted) {
@@ -1790,6 +1782,8 @@ const Page: NextPage = () => {
                       if (ev.target.value !== null && typeof ev.target.value === 'number') {
                         setActiveRecordedFileId(ev.target.value)
                         setPlayMode('file')
+                        setTouched(true)
+                        setDrawer(false)
                       }
                     }}
                   >
