@@ -854,10 +854,11 @@ const Page: NextPage = () => {
     // ローカルファイル再生は playLocalFile() がライフサイクルを管理する。
     // playMode の更新でこの effect が再実行されても、新しいローカル再生を止めない。
     if (playMode === 'localfile') return
-    if (!mirakurunOk || !mirakurunServer || !activeService) {
-      console.log('mirakurunServer or activeService', mirakurunOk, mirakurunServer, activeService)
-      return
-    }
+    const liveService = playMode === 'live' && mirakurunOk && mirakurunServer ? activeService : undefined
+    const recordedUrl = playMode === 'file' && epgStationOk && epgStationServer && activeRecordedFileId !== undefined
+      ? `${epgStationServer}/api/videos/${activeRecordedFileId}`
+      : undefined
+    if (!liveService && !recordedUrl) return
     if (!wasmMod) {
       console.log('WasmModule not loaded', wasmMod)
       return
@@ -913,9 +914,9 @@ const Page: NextPage = () => {
       await waitForDecoderReset(Module, () => stopped)
       if (stopped) return
       // 再生スタート
-      if (playMode === 'live') {
+      if (liveService) {
         ac = new AbortController()
-        const channelType = activeService.channel?.type as string
+        const channelType = liveService.channel?.type as string
         const isBS4K = channelType === 'BS4K'
         // WebCodecs (ハードウェアデコード) を試みる対象: BS4K (HEVC) と
         // SKY=スカパープレミアム (H.264)。実際に使うかは WASM が probe 後に
@@ -924,7 +925,7 @@ const Page: NextPage = () => {
         const wantWebCodecs =
           (isBS4K || channelType === 'SKY') &&
           typeof VideoDecoder !== 'undefined' &&
-          liveForceSoftwareServiceRef.current !== activeService.id
+          liveForceSoftwareServiceRef.current !== liveService.id
         if (wantWebCodecs) {
           Module.setVideoStreamInfoCallback((info: VideoStreamInfo) => {
             console.log('videoStreamInfo:', info)
@@ -932,7 +933,7 @@ const Page: NextPage = () => {
               startWebCodecs(Module, wcCanvasRef.current, info, () => {
                 // 現在の effect の cleanup がストリームを停止・reset し、同じ
                 // service を WASM ソフトウェアデコードで再起動する。
-                liveForceSoftwareServiceRef.current = activeService.id
+                liveForceSoftwareServiceRef.current = liveService.id
                 setWebCodecsRetryToken(t => t + 1)
               })
             }
@@ -948,11 +949,11 @@ const Page: NextPage = () => {
         }
         Module.setTlvMode(isBS4K)
         Module.setWebCodecsMode(wantWebCodecs)
-        const url = `${mirakurunServer}/api/services/${activeService.id}/stream?decode=1`
+        const url = `${mirakurunServer}/api/services/${liveService.id}/stream?decode=1`
         console.log('start fetch', url, Module)
         const reconnect = liveReconnectRef.current
-        if (reconnect.serviceId !== activeService.id) {
-          reconnect.serviceId = activeService.id
+        if (reconnect.serviceId !== liveService.id) {
+          reconnect.serviceId = liveService.id
           reconnect.attempts = 0
         }
         // ストリームが終わった・切れたときに再生し直す。デコーダーは途中から
@@ -1028,15 +1029,14 @@ const Page: NextPage = () => {
             console.error('stream fetch failed:', ex)
             scheduleReconnect(ex)
           })
-      } else if (playMode === 'file') {
+      } else if (recordedUrl) {
         // 直前の再生のモードが残らないよう明示的にリセットする(EPGStation の
         // 録画は 2K TS 前提で WASM ソフトデコード)。
         Module.setVideoStreamInfoCallback(null as any)
         Module.setTlvMode(false)
         Module.setWebCodecsMode(false)
         showWasmCanvasOnFirstFrame(Module, () => stopped)
-        const url = `${epgStationServer}/api/videos/${activeRecordedFileId}`
-        Module.playFile(url)
+        Module.playFile(recordedUrl)
       }
     })()
 
@@ -1790,6 +1790,8 @@ const Page: NextPage = () => {
                       if (ev.target.value !== null && typeof ev.target.value === 'number') {
                         setActiveRecordedFileId(ev.target.value)
                         setPlayMode('file')
+                        setTouched(true)
+                        setDrawer(false)
                       }
                     }}
                   >
