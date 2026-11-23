@@ -510,18 +510,14 @@ const Page: NextPage = () => {
 
   // Module.reset() の後片付けはデコードスレッドで進むので、完了フラグが立つのを
   // 待ってから次の再生データを流し込む。固定の待ち時間だと短すぎれば前の再生の
-  // 状態が残り、長すぎれば切替が遅くなる。フラグが来ない場合に備えて上限を置く。
+  // 新しい再生が前のダウンローダーや入力バッファを上書きしないよう、
+  // リセット完了か、この開始要求のキャンセルを待つ。
   const waitForDecoderReset = async (
     Module: WasmModule,
     isAborted: () => boolean
   ) => {
-    const deadline = performance.now() + 3000
-    while (!isAborted() && performance.now() < deadline) {
-      if (Module.isResetCompleted()) return
+    while (!isAborted() && !Module.isResetCompleted()) {
       await new Promise(resolve => setTimeout(resolve, 20))
-    }
-    if (!isAborted() && !Module.isResetCompleted()) {
-      console.warn('decoder reset did not complete in time; starting anyway')
     }
   }
 

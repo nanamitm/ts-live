@@ -260,7 +260,6 @@ double getAudioPlaybackTime() {
   return currentAudioPlaybackTime.load(std::memory_order_relaxed);
 }
 
-std::string playFileUrl;
 std::thread downloaderThread;
 
 std::atomic<bool> resetedDownloader{false};
@@ -270,7 +269,6 @@ std::vector<emscripten::val> statsBuffer;
 emscripten::val statsCallback = emscripten::val::null();
 
 const size_t donwloadRangeSize = 2 * 1024 * 1024;
-uint64_t downloadCount = 0;
 
 // Callback register
 void setCaptionCallback(emscripten::val callback) {
@@ -624,11 +622,9 @@ void commitInputData(size_t nextSize) {
 
 // reset
 void resetInternal() {
-  downloadCount = 0;
-  playFileUrl = std::string("");
-
   spdlog::info("downloaderThread joinable: {}", downloaderThread.joinable());
   if (downloaderThread.joinable()) {
+    resetedDownloader = true;
     spdlog::info("join to downloader thread");
     downloaderThread.join();
     spdlog::info("done.");
@@ -2621,7 +2617,7 @@ void decoderMainloop() {
 }
 
 // 戻り値: まだ続きがあるなら true、終端に達したら false。
-bool downloadNextRange() {
+static bool downloadNextRange(const std::string &url, uint64_t &downloadCount) {
   emscripten_fetch_attr_t attr;
   emscripten_fetch_attr_init(&attr);
   strcpy(attr.requestMethod, "GET");
@@ -2632,12 +2628,20 @@ bool downloadNextRange() {
   const char *headers[] = {"Range", range.c_str(), NULL};
   attr.requestHeaders = headers;
 
-  spdlog::debug("request {} Range: {}", playFileUrl, range);
-  emscripten_fetch_t *fetch = emscripten_fetch(&attr, playFileUrl.c_str());
+  spdlog::debug("request {} Range: {}", url, range);
+  emscripten_fetch_t *fetch = emscripten_fetch(&attr, url.c_str());
+  if (!fetch) {
+    spdlog::error("could not start fetch for {}", url);
+    return false;
+  }
+  if (resetedDownloader) {
+    emscripten_fetch_close(fetch);
+    return false;
+  }
   bool hasMore = true;
   if (fetch->status == 416) {
     // Range が範囲外 = ちょうど読み切っていた。
-    spdlog::info("fetch reached the end of {} ({} bytes)", playFileUrl,
+    spdlog::info("fetch reached the end of {} ({} bytes)", url,
                  downloadCount);
     emscripten_fetch_close(fetch);
     return false;
@@ -2671,12 +2675,12 @@ bool downloadNextRange() {
     }
     // 要求より短いチャンクが返ってきたら、それが最後のチャンク。
     if (fetch->numBytes < donwloadRangeSize) {
-      spdlog::info("fetch reached the end of {} ({} bytes)", playFileUrl,
+      spdlog::info("fetch reached the end of {} ({} bytes)", url,
                    downloadCount);
       hasMore = false;
     }
   } else {
-    spdlog::error("fetch failed URL: {} status code: {}", playFileUrl,
+    spdlog::error("fetch failed URL: {} status code: {}", url,
                   fetch->status);
     hasMore = false;
   }
@@ -2684,8 +2688,8 @@ bool downloadNextRange() {
   return hasMore;
 }
 
-void downloaderThraedFunc() {
-  resetedDownloader = false;
+static void downloadFile(const std::string &url) {
+  uint64_t downloadCount = 0;
   while (!resetedDownloader) {
     size_t remainSize;
     {
@@ -2693,10 +2697,12 @@ void downloaderThraedFunc() {
       remainSize = inputBufferWriteIndex - inputBufferReadIndex;
     }
     if (remainSize < donwloadRangeSize / 2) {
-      if (!downloadNextRange()) {
+      if (!downloadNextRange(url, downloadCount)) {
         // 全部落とし終えた。デマルチプレクサへ終端を伝えて、このスレッドは
         // 役目を終える (残りはバッファから再生される)。
-        setInputEnded();
+        if (!resetedDownloader) {
+          setInputEnded();
+        }
         return;
       }
     } else {
@@ -2707,6 +2713,6 @@ void downloaderThraedFunc() {
 
 void playFile(std::string url) {
   spdlog::info("playFile: {}", url);
-  playFileUrl = url;
-  downloaderThread = std::thread([]() { downloaderThraedFunc(); });
+  resetedDownloader = false;
+  downloaderThread = std::thread([url = std::move(url)] { downloadFile(url); });
 }
